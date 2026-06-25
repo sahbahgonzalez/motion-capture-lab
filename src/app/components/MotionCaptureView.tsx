@@ -9,7 +9,8 @@ import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
 import { Badge } from './ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
-import { Circle, Square, Download, Trash2, Play, Pause, BarChart3, Cloud, CloudUpload, RefreshCw, Database, AlertCircle } from 'lucide-react';
+import { Circle, Square, Download, Trash2, Play, Pause, BarChart3, Cloud, CloudUpload, RefreshCw, Database, AlertCircle, Video } from 'lucide-react';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { LivePoseOverlay } from './LivePoseOverlay';
 import { MotionDataVisualizer } from './MotionDataVisualizer';
 import { toast } from 'sonner';
@@ -30,6 +31,8 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
   const [playbackFrame, setPlaybackFrame] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [visualizerRecording, setVisualizerRecording] = useState<MotionRecording | null>(null);
+  const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('default');
 
   const {
     isRecording,
@@ -49,6 +52,19 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
     isSyncing,
     isLoadingCloud,
   } = useMotionRecorderWithSync();
+
+  // Enumerate cameras once permissions are granted
+  useEffect(() => {
+    const enumerate = async () => {
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        setAvailableCameras(devices.filter(d => d.kind === 'videoinput'));
+      } catch { /* permissions not yet granted */ }
+    };
+    enumerate();
+    navigator.mediaDevices?.addEventListener('devicechange', enumerate);
+    return () => navigator.mediaDevices?.removeEventListener('devicechange', enumerate);
+  }, [cameraReady]); // re-enumerate after camera starts (labels become available)
 
   // Sync video ref from CameraFeed - wrap in useCallback to prevent re-renders
   const handleCameraReady = useCallback(() => {
@@ -178,12 +194,32 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
           {/* Live Camera Feed */}
           <Card className="bg-gray-800 border-gray-700 p-6">
             <h2 className="text-xl font-semibold mb-4 text-white">Live Feed</h2>
-            
+
+            {availableCameras.length > 1 && (
+              <div className="flex items-center gap-2 mb-4">
+                <Video className="h-4 w-4 text-gray-400 shrink-0" />
+                <Select value={selectedDeviceId} onValueChange={setSelectedDeviceId} disabled={isRecording}>
+                  <SelectTrigger className="bg-gray-700 border-gray-600 text-white">
+                    <SelectValue placeholder="Default camera" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="default">Default camera</SelectItem>
+                    {availableCameras.map((cam, i) => (
+                      <SelectItem key={cam.deviceId} value={cam.deviceId}>
+                        {cam.label || `Camera ${i + 1}`}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+            )}
+
             <div className="relative aspect-[3/4] bg-black rounded-lg overflow-hidden mb-4">
               <CameraFeed
                 ref={cameraFeedRef}
                 onCameraReady={handleCameraReady}
                 className="w-full h-full"
+                deviceId={selectedDeviceId !== 'default' ? selectedDeviceId : undefined}
               />
               <canvas
                 ref={canvasRef}

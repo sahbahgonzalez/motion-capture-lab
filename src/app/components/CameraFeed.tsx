@@ -9,6 +9,7 @@ interface CameraFeedProps {
   enableTestMode?: boolean; // Allow manual test mode
   facingMode?: 'user' | 'environment'; // Front or rear camera
   onCameraSwitch?: (newMode: 'user' | 'environment') => void;
+  deviceId?: string; // specific camera to use
 }
 
 export interface CameraFeedHandle {
@@ -17,7 +18,7 @@ export interface CameraFeedHandle {
 }
 
 const CameraFeedComponent = forwardRef<CameraFeedHandle, CameraFeedProps>(
-  ({ onCameraReady, className = '', enableTestMode = false, facingMode = 'user', onCameraSwitch }, ref) => {
+  ({ onCameraReady, className = '', enableTestMode = false, facingMode = 'user', onCameraSwitch, deviceId }, ref) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -67,12 +68,12 @@ const CameraFeedComponent = forwardRef<CameraFeedHandle, CameraFeedProps>(
       console.log('Requesting camera access...');
 
       // Request camera access with specific constraints
+      const videoConstraints: MediaTrackConstraints = deviceId
+        ? { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        : { facingMode: currentFacingMode, width: { ideal: 1280 }, height: { ideal: 720 } };
+
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: currentFacingMode,
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
+        video: videoConstraints,
         audio: false,
       });
 
@@ -150,7 +151,7 @@ const CameraFeedComponent = forwardRef<CameraFeedHandle, CameraFeedProps>(
         tracks.forEach(track => track.stop());
       }
     };
-  }, [retryCount, useTestMode, currentFacingMode]);
+  }, [retryCount, useTestMode, currentFacingMode, deviceId]);
 
   const handleRetry = () => {
     console.log('Retry button clicked');
