@@ -34,8 +34,8 @@ interface UseMediaPipePoseOptions {
 }
 
 export function useMediaPipePose(
-  videoRef: React.RefObject<HTMLVideoElement | null>,
-  canvasRef: React.RefObject<HTMLCanvasElement | null>,
+  videoRef: React.RefObject<HTMLVideoElement>,
+  canvasRef: React.RefObject<HTMLCanvasElement>,
   options: UseMediaPipePoseOptions = {}
 ) {
   const [isReady, setIsReady] = useState(false);
@@ -47,6 +47,7 @@ export function useMediaPipePose(
   const lastVideoTimeRef = useRef<number>(-1);
   const isDetectingRef = useRef<boolean>(false);
   const optionsRef = useRef(options);
+  const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   // Update options ref when options change
   useEffect(() => {
@@ -160,15 +161,29 @@ export function useMediaPipePose(
 
       try {
         const startTimeMs = performance.now();
-        
+
         // Skip if same frame as last time
         if (video.currentTime === lastVideoTimeRef.current) {
           animationFrameRef.current = requestAnimationFrame(detectPose);
           return;
         }
         lastVideoTimeRef.current = video.currentTime;
-        
-        const results = poseLandmarker.detectForVideo(video, startTimeMs);
+
+        // Draw to offscreen canvas before detection so detectForVideo never
+        // acquires the video element's GPU texture directly — without this,
+        // any other <video> showing the same MediaStream goes black.
+        if (!offscreenCanvasRef.current ||
+            offscreenCanvasRef.current.width !== video.videoWidth ||
+            offscreenCanvasRef.current.height !== video.videoHeight) {
+          const oc = document.createElement('canvas');
+          oc.width = video.videoWidth;
+          oc.height = video.videoHeight;
+          offscreenCanvasRef.current = oc;
+        }
+        const octx = offscreenCanvasRef.current.getContext('2d');
+        if (octx) octx.drawImage(video, 0, 0);
+
+        const results = poseLandmarker.detectForVideo(offscreenCanvasRef.current, startTimeMs);
 
         // Clear canvas
         const ctx = canvas.getContext('2d');

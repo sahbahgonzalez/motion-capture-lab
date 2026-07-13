@@ -28,9 +28,10 @@ const CameraFeedComponent = forwardRef<CameraFeedHandle, CameraFeedProps>(
   const [permissionState, setPermissionState] = useState<string>('unknown');
   const [currentFacingMode, setCurrentFacingMode] = useState<'user' | 'environment'>(facingMode);
 
-  // Expose video element and switch camera function via ref
+  // Expose video element via a getter so callers always get the live DOM node,
+  // not the value captured at mount time (which would be null).
   useImperativeHandle(ref, () => ({
-    videoElement: videoRef.current,
+    get videoElement() { return videoRef.current; },
     switchCamera: () => {
       const newMode = currentFacingMode === 'user' ? 'environment' : 'user';
       setCurrentFacingMode(newMode);

@@ -5,10 +5,43 @@ import { PoseLandmarks, LandmarkPoint } from '../hooks/useMediaPipePose';
 
 export interface JitterMetrics {
   jointName: keyof PoseLandmarks;
+  /**
+   * Mean frame-to-frame speed normalised by shoulder width.
+   * Units: body-widths / second — dimensionless and comparable across labs.
+   */
+  relativeVelocity: number;
+  /**
+   * Variance of frame-to-frame velocity, normalised by shoulder width.
+   * Units: (body-widths / second)^2 — dimensionless and comparable across labs.
+   */
   velocityVariance: number;
+  /** Position std dev in the recording's native units (mm or [0,1]). */
   positionStdDev: { x: number; y: number; z: number };
   smoothnessScore: number; // 0-100, higher is smoother
-  highFrequencyNoise: number; // Average of rapid changes
+  highFrequencyNoise: number;
+  /** Shoulder width used as body-scale reference (native units). null if not available. */
+  shoulderWidthRef: number | null;
+  /** Per-frame normalised speeds (body-widths/s). */
+  velocitySamples: number[];
+}
+
+/**
+ * Compute shoulder width for a single frame. Returns null if either shoulder
+ * is missing or below the visibility threshold.
+ */
+const SHOULDER_VISIBILITY_THRESHOLD = 0.5;
+
+function frameShoulderWidth(frame: MotionFrame): number | null {
+  const ls = frame.landmarks.leftShoulder;
+  const rs = frame.landmarks.rightShoulder;
+  if (!ls || !rs) return null;
+  if ((ls.visibility ?? 1) < SHOULDER_VISIBILITY_THRESHOLD) return null;
+  if ((rs.visibility ?? 1) < SHOULDER_VISIBILITY_THRESHOLD) return null;
+  const dx = ls.x - rs.x;
+  const dy = ls.y - rs.y;
+  const dz = (ls.z ?? 0) - (rs.z ?? 0);
+  const w = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  return w > 0 ? w : null;
 }
 
 export function calculateJitterMetrics(
@@ -19,67 +52,101 @@ export function calculateJitterMetrics(
   if (frames.length < 3) {
     return {
       jointName,
+      relativeVelocity: 0,
       velocityVariance: 0,
       positionStdDev: { x: 0, y: 0, z: 0 },
       smoothnessScore: 100,
       highFrequencyNoise: 0,
+      shoulderWidthRef: null,
+      velocitySamples: [],
     };
   }
 
-  // Calculate velocities (frame-to-frame displacement)
+  // Pre-compute per-frame shoulder width. Using per-frame width means the
+  // normalisation adapts as the person moves toward/away from the camera,
+  // keeping the body-scale reference geometrically consistent across depths.
+  // Falls back to the nearest valid frame's width when shoulders are occluded.
+  const perFrameWidth: number[] = new Array(frames.length);
+  let lastValid: number | null = null;
+  for (let i = 0; i < frames.length; i++) {
+    const w = frameShoulderWidth(frames[i]);
+    if (w !== null) lastValid = w;
+    perFrameWidth[i] = lastValid ?? 0;
+  }
+  // Forward-fill from the first valid frame for any leading nulls
+  let firstValid: number | null = null;
+  for (let i = 0; i < frames.length; i++) {
+    if (perFrameWidth[i] > 0) { firstValid = perFrameWidth[i]; break; }
+  }
+  if (firstValid === null) {
+    // No shoulder data at all — fall back to un-normalised (scale = 1)
+    perFrameWidth.fill(1);
+  } else {
+    for (let i = 0; i < frames.length; i++) {
+      if (perFrameWidth[i] === 0) perFrameWidth[i] = firstValid;
+    }
+  }
+
+  // Mean shoulder width across the recording — reported in the UI for reference
+  const shoulderWidthRef = firstValid !== null
+    ? perFrameWidth.reduce((a, b) => a + b, 0) / perFrameWidth.length
+    : null;
+
+  const positions = frames.map(f => f.landmarks[jointName]);
+
+  // Frame-to-frame velocities — each interval normalised by the mean of the
+  // two adjacent frames' shoulder widths for smooth interpolation at boundaries.
   const velocities: number[] = [];
   for (let i = 1; i < frames.length; i++) {
     const prev = frames[i - 1].landmarks[jointName];
     const curr = frames[i].landmarks[jointName];
     const timeDelta = (frames[i].timestamp - frames[i - 1].timestamp) / 1000;
+    const bodyScale = (perFrameWidth[i - 1] + perFrameWidth[i]) / 2;
 
-    const dx = curr.x - prev.x;
-    const dy = curr.y - prev.y;
-    const dz = curr.z - prev.z;
-    const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const velocity = timeDelta > 0 ? distance / timeDelta : 0;
-    velocities.push(velocity);
+    const dx = (curr.x - prev.x) / bodyScale;
+    const dy = (curr.y - prev.y) / bodyScale;
+    const dz = ((curr.z ?? 0) - (prev.z ?? 0)) / bodyScale;
+    const speed = timeDelta > 0 ? Math.sqrt(dx * dx + dy * dy + dz * dz) / timeDelta : 0;
+    velocities.push(speed);
   }
 
-  // Calculate velocity variance
+  // Velocity variance in (body-widths/s)^2
   const meanVelocity = velocities.reduce((a, b) => a + b, 0) / velocities.length;
   const velocityVariance =
     velocities.reduce((sum, v) => sum + Math.pow(v - meanVelocity, 2), 0) / velocities.length;
 
-  // Calculate position standard deviation
-  const positions = frames.map(f => f.landmarks[jointName]);
+  // Position std dev in native units (mm or [0,1]) — for display only, not compared across labs
   const meanPos = {
     x: positions.reduce((sum, p) => sum + p.x, 0) / positions.length,
     y: positions.reduce((sum, p) => sum + p.y, 0) / positions.length,
-    z: positions.reduce((sum, p) => sum + p.z, 0) / positions.length,
+    z: positions.reduce((sum, p) => sum + (p.z ?? 0), 0) / positions.length,
   };
-
   const positionStdDev = {
     x: Math.sqrt(positions.reduce((sum, p) => sum + Math.pow(p.x - meanPos.x, 2), 0) / positions.length),
     y: Math.sqrt(positions.reduce((sum, p) => sum + Math.pow(p.y - meanPos.y, 2), 0) / positions.length),
-    z: Math.sqrt(positions.reduce((sum, p) => sum + Math.pow(p.z - meanPos.z, 2), 0) / positions.length),
+    z: Math.sqrt(positions.reduce((sum, p) => sum + Math.pow((p.z ?? 0) - meanPos.z, 2), 0) / positions.length),
   };
 
-  // Calculate high-frequency noise (rapid direction changes)
+  // High-frequency noise: fraction of frames where acceleration > 2× mean velocity
   let rapidChanges = 0;
   for (let i = 2; i < velocities.length; i++) {
-    const accel = Math.abs(velocities[i] - velocities[i - 1]);
-    if (accel > meanVelocity * 2) {
-      rapidChanges++;
-    }
+    if (Math.abs(velocities[i] - velocities[i - 1]) > meanVelocity * 2) rapidChanges++;
   }
   const highFrequencyNoise = rapidChanges / velocities.length;
 
-  // Smoothness score (inverse of jitter, scaled to 0-100)
+  // Smoothness score — thresholds calibrated for body-width-normalised velocity units
   const jitterScore = velocityVariance + highFrequencyNoise * 10;
   const smoothnessScore = Math.max(0, Math.min(100, 100 - jitterScore * 1000));
 
   return {
     jointName,
+    relativeVelocity: meanVelocity,
     velocityVariance,
     positionStdDev,
     smoothnessScore,
     highFrequencyNoise,
+    shoulderWidthRef,
+    velocitySamples: velocities,
   };
 }
 

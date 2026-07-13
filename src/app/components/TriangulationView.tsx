@@ -167,7 +167,7 @@ export function TriangulationView({
   const cam2W = videoEl2?.videoWidth ?? 1280;
   const cam2H = videoEl2?.videoHeight ?? 720;
 
-  const pose3D = useTriangulation(
+  const { pose: pose3D, backProjected2D } = useTriangulation(
     calibration, camera1Landmarks, camera2Landmarks,
     cam1W, cam1H, cam2W, cam2H,
   );

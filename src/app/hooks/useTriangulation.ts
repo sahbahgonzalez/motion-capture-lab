@@ -84,6 +84,27 @@ function svdSolve(A: number[][]): number[] | null {
   return X;
 }
 
+export interface TriangulationResult {
+  /**
+   * Stereo-triangulated 3D position in mm.
+   * Use this for the 3D lab jitter metrics.
+   */
+  pose: TriangulatedPose;
+  /**
+   * Camera 1's 2D MediaPipe detection back-projected to mm in 3D space,
+   * using the triangulated Z depth and K1 intrinsics:
+   *
+   *   x_mm = (px - cx) * Z / fx
+   *   y_mm = (py - cy) * Z / fy
+   *   z_mm = Z  (same depth as triangulated)
+   *
+   * This puts the 2D detection into the same mm coordinate space as `pose`,
+   * so jitter variance is directly comparable between the 2D and 3D labs
+   * without any domain shift or arbitrary scale factors.
+   */
+  backProjected2D: TriangulatedPose;
+}
+
 export function useTriangulation(
   calibration: StereoCalibration | null,
   cam1Landmarks: PoseLandmarks | null,
@@ -92,31 +113,55 @@ export function useTriangulation(
   cam1Height: number,
   cam2Width: number,
   cam2Height: number,
-): TriangulatedPose {
+): TriangulationResult {
   return useMemo(() => {
     const empty = Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as TriangulatedPose;
+    const emptyResult: TriangulationResult = { pose: empty, backProjected2D: empty };
 
-    if (!calibration || !cam1Landmarks || !cam2Landmarks) return empty;
-    if (!cam1Width || !cam1Height || !cam2Width || !cam2Height) return empty;
+    if (!calibration || !cam1Landmarks || !cam2Landmarks) return emptyResult;
+    if (!cam1Width || !cam1Height || !cam2Width || !cam2Height) return emptyResult;
 
     const P1 = calibration.P1;
     const P2 = calibration.P2;
-    if (!P1 || !P2) return empty;
+    const K1 = calibration.camera1.K;
+    if (!P1 || !P2 || !K1) return emptyResult;
 
-    const result = { ...empty };
+    // K1 = [[fx, 0, cx], [0, fy, cy], [0, 0, 1]]
+    const fx = K1[0][0];
+    const fy = K1[1][1];
+    const cx = K1[0][2];
+    const cy = K1[1][2];
+
+    const pose = { ...empty };
+    const backProjected2D = { ...empty };
 
     for (const key of LANDMARK_KEYS) {
       const lm1 = cam1Landmarks[key];
       const lm2 = cam2Landmarks[key];
       if (!lm1 || !lm2) continue;
       if ((lm1.visibility ?? 1) < 0.5 || (lm2.visibility ?? 1) < 0.5) continue;
-      result[key] = triangulatePoint(
+
+      const px1 = lm1.x * cam1Width;
+      const py1 = lm1.y * cam1Height;
+
+      const pt = triangulatePoint(
         P1, P2,
-        lm1.x * cam1Width, lm1.y * cam1Height,
+        px1, py1,
         lm2.x * cam2Width, lm2.y * cam2Height,
       );
+
+      pose[key] = pt;
+
+      // Back-project the 2D camera-1 detection to mm at the triangulated depth
+      if (pt && pt.z > 0) {
+        backProjected2D[key] = {
+          x: (px1 - cx) * pt.z / fx,
+          y: (py1 - cy) * pt.z / fy,
+          z: pt.z,
+        };
+      }
     }
 
-    return result;
+    return { pose, backProjected2D };
   }, [calibration, cam1Landmarks, cam2Landmarks, cam1Width, cam1Height, cam2Width, cam2Height]);
 }

@@ -5,7 +5,7 @@ import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Badge } from './ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, BarChart, Bar, ScatterChart, Scatter } from 'recharts';
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ScatterChart, Scatter } from 'recharts';
 import {
   calculateJitterMetrics,
   calculateOcclusionMetrics,
@@ -23,16 +23,36 @@ interface MotionDataVisualizerProps {
 export function MotionDataVisualizer({ recording, onClose }: MotionDataVisualizerProps) {
   const [selectedJoint, setSelectedJoint] = useState<keyof PoseLandmarks>('nose');
 
-  // Prepare chart data
-  const chartData = recording.frames.map((frame, index) => ({
-    frameNumber: frame.frameNumber,
-    time: (frame.timestamp / 1000).toFixed(2),
-    x: frame.landmarks[selectedJoint].x,
-    y: frame.landmarks[selectedJoint].y,
-    z: frame.landmarks[selectedJoint].z,
-  }));
+  // Prepare chart data — null out coordinates below the occlusion visibility threshold
+  // so Recharts renders a gap instead of a spike to origin for missing/failed joints.
+  const VISIBILITY_THRESHOLD = 0.5;
+  const chartData = recording.frames.map((frame) => {
+    const lm = frame.landmarks[selectedJoint];
+    const visible = lm && (lm.visibility ?? 1) >= VISIBILITY_THRESHOLD;
+    return {
+      frameNumber: frame.frameNumber,
+      time: (frame.timestamp / 1000).toFixed(2),
+      x: visible ? lm.x : null,
+      y: visible ? lm.y : null,
+      z: visible ? lm.z : null,
+    };
+  });
 
   const joints = Object.keys(recording.frames[0]?.landmarks || {}) as Array<keyof PoseLandmarks>;
+
+  // Detect if recording is in mm (3D lab) or normalised [0,1] (2D lab)
+  // Read directly from frames (not chartData) to avoid nulls, skip low-visibility frames
+  const maxAbsX = Math.max(0, ...recording.frames
+    .filter(f => (f.landmarks[selectedJoint]?.visibility ?? 1) >= VISIBILITY_THRESHOLD)
+    .map(f => Math.abs(f.landmarks[selectedJoint].x)));
+  const isMillimetres = maxAbsX > 2;
+
+  // Tick formatter: abbreviate large mm values to avoid axis overflow
+  const fmtTick = (v: number) => {
+    if (!isMillimetres) return v.toFixed(3);
+    if (Math.abs(v) >= 1000) return (v / 1000).toFixed(1) + 'm';
+    return Math.round(v) + 'mm';
+  };
 
 
   return (
@@ -197,9 +217,20 @@ export function MotionDataVisualizer({ recording, onClose }: MotionDataVisualize
                   <div className="space-y-6">
                     <Card className="bg-gray-900 border-gray-700 p-4">
                       <h4 className="text-white font-semibold mb-3">Joint Jitter Analysis: {selectedJoint}</h4>
+                      {jitterMetrics.shoulderWidthRef !== null && (
+                        <div className="text-xs text-gray-500 mb-3">
+                          Body-scale ref (shoulder width): {jitterMetrics.shoulderWidthRef.toFixed(4)} — metrics normalised, dimensionless
+                        </div>
+                      )}
                       <div className="grid grid-cols-2 gap-4">
                         <div>
-                          <div className="text-sm text-gray-400">Velocity Variance</div>
+                          <div className="text-sm text-gray-400">Mean Velocity <span className="text-gray-600">(body-widths/s)</span></div>
+                          <div className="text-2xl font-bold text-blue-400">
+                            {jitterMetrics.relativeVelocity.toFixed(4)}
+                          </div>
+                        </div>
+                        <div>
+                          <div className="text-sm text-gray-400">Velocity Variance <span className="text-gray-600">(body-widths/s)²</span></div>
                           <div className="text-2xl font-bold text-white">
                             {jitterMetrics.velocityVariance.toFixed(4)}
                           </div>
@@ -227,19 +258,13 @@ export function MotionDataVisualizer({ recording, onClose }: MotionDataVisualize
 
                     {/* Position X Chart */}
                     <div>
-                      <h4 className="text-white font-semibold mb-2">X Position Over Time</h4>
+                      <h4 className="text-white font-semibold mb-2">X Position Over Time {isMillimetres && <span className="text-xs text-gray-500 font-normal">(mm)</span>}</h4>
                       <ResponsiveContainer width="100%" height={200}>
                         <LineChart data={chartData}>
                           <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                          <XAxis
-                            dataKey="frameNumber"
-                            stroke="#9CA3AF"
-                            label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
-                          />
-                          <YAxis stroke="#9CA3AF" domain={[0, 1]} />
-                          <Tooltip
-                            contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }}
-                          />
+                          <XAxis dataKey="frameNumber" stroke="#9CA3AF" label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }} />
+                          <YAxis stroke="#9CA3AF" domain={['auto', 'auto']} tickFormatter={fmtTick} width={isMillimetres ? 60 : 40} />
+                          <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }} formatter={(v) => [fmtTick(Number(v)), 'X']} />
                           <Line type="monotone" isAnimationActive={false} dataKey="x" stroke="#3B82F6" strokeWidth={2} dot={false} name="X Position" />
                         </LineChart>
                       </ResponsiveContainer>
@@ -247,19 +272,13 @@ export function MotionDataVisualizer({ recording, onClose }: MotionDataVisualize
 
                     {/* Position Y Chart */}
                     <div>
-                      <h4 className="text-white font-semibold mb-2">Y Position Over Time</h4>
+                      <h4 className="text-white font-semibold mb-2">Y Position Over Time {isMillimetres && <span className="text-xs text-gray-500 font-normal">(mm)</span>}</h4>
                       <ResponsiveContainer width="100%" height={200}>
                         <LineChart data={chartData}>
                           <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                          <XAxis
-                            dataKey="frameNumber"
-                            stroke="#9CA3AF"
-                            label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
-                          />
-                          <YAxis stroke="#9CA3AF" domain={[0, 1]} />
-                          <Tooltip
-                            contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }}
-                          />
+                          <XAxis dataKey="frameNumber" stroke="#9CA3AF" label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }} />
+                          <YAxis stroke="#9CA3AF" domain={['auto', 'auto']} tickFormatter={fmtTick} width={isMillimetres ? 60 : 40} />
+                          <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }} formatter={(v) => [fmtTick(Number(v)), 'Y']} />
                           <Line type="monotone" isAnimationActive={false} dataKey="y" stroke="#10B981" strokeWidth={2} dot={false} name="Y Position" />
                         </LineChart>
                       </ResponsiveContainer>
@@ -267,19 +286,13 @@ export function MotionDataVisualizer({ recording, onClose }: MotionDataVisualize
 
                     {/* Position Z Chart */}
                     <div>
-                      <h4 className="text-white font-semibold mb-2">Z Position Over Time</h4>
+                      <h4 className="text-white font-semibold mb-2">Z Position Over Time {isMillimetres && <span className="text-xs text-gray-500 font-normal">(mm)</span>}</h4>
                       <ResponsiveContainer width="100%" height={200}>
                         <LineChart data={chartData}>
                           <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                          <XAxis
-                            dataKey="frameNumber"
-                            stroke="#9CA3AF"
-                            label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
-                          />
-                          <YAxis stroke="#9CA3AF" />
-                          <Tooltip
-                            contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }}
-                          />
+                          <XAxis dataKey="frameNumber" stroke="#9CA3AF" label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }} />
+                          <YAxis stroke="#9CA3AF" domain={['auto', 'auto']} tickFormatter={fmtTick} width={isMillimetres ? 60 : 40} />
+                          <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }} formatter={(v) => [fmtTick(Number(v)), 'Z']} />
                           <Line type="monotone" isAnimationActive={false} dataKey="z" stroke="#F59E0B" strokeWidth={2} dot={false} name="Z Position" />
                         </LineChart>
                       </ResponsiveContainer>
