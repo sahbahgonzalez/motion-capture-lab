@@ -67,9 +67,27 @@ function matToDistCoeffs(mat: any): number[] {
   return result;
 }
 
+const CALIBRATION_STORAGE_KEY = 'stereo_calibration_v1';
+
+function loadFromStorage(): StereoCalibration | null {
+  try {
+    const raw = localStorage.getItem(CALIBRATION_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed.camera1 || !parsed.camera2 || !parsed.P1 || !parsed.P2) return null;
+    return parsed as StereoCalibration;
+  } catch {
+    return null;
+  }
+}
+
+function saveToStorage(cal: StereoCalibration) {
+  try { localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(cal)); } catch {}
+}
+
 export function useCameraCalibration() {
   const [captures, setCaptures] = useState<CalibrationCapture[]>([]);
-  const [calibrationResult, setCalibrationResult] = useState<StereoCalibration | null>(null);
+  const [calibrationResult, setCalibrationResult] = useState<StereoCalibration | null>(loadFromStorage);
   const [isCalibrating, setIsCalibrating] = useState(false);
 
   const addCapture = useCallback((capture: CalibrationCapture) => {
@@ -279,6 +297,7 @@ export function useCameraCalibration() {
 
         cleanup();
         setCalibrationResult(result);
+        saveToStorage(result);
         setIsCalibrating(false);
         return result;
       } catch (err) {
@@ -337,6 +356,7 @@ export function useCameraCalibration() {
 
       const calibration: StereoCalibration = parsed;
       setCalibrationResult(calibration);
+      saveToStorage(calibration);
       console.log('📂 Loaded calibration from file');
       console.log('  Calibration date:', calibration.calibrationDate);
       console.log('  Stereo error:', calibration.stereoReprojectionError);

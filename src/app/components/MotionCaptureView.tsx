@@ -9,7 +9,7 @@ import { Input } from './ui/input';
 import { Textarea } from './ui/textarea';
 import { Badge } from './ui/badge';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
-import { Circle, Square, Download, Trash2, Play, Pause, BarChart3, Cloud, CloudUpload, RefreshCw, Database, AlertCircle, Video } from 'lucide-react';
+import { Circle, Square, Download, Trash2, Play, Pause, BarChart3, Cloud, CloudUpload, RefreshCw, Database, AlertCircle, Video, Film, RotateCcw } from 'lucide-react';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { LivePoseOverlay } from './LivePoseOverlay';
 import { MotionDataVisualizer } from './MotionDataVisualizer';
@@ -33,6 +33,14 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
   const [visualizerRecording, setVisualizerRecording] = useState<MotionRecording | null>(null);
   const [availableCameras, setAvailableCameras] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('default');
+
+  // Video file mode
+  const [mode, setMode] = useState<'live' | 'file'>('live');
+  const fileVideoRef = useRef<HTMLVideoElement | null>(null);
+  const [fileVideoUrl, setFileVideoUrl] = useState<string | null>(null);
+  const [fileIsPlaying, setFileIsPlaying] = useState(false);
+  const [fileDuration, setFileDuration] = useState(0);
+  const [fileCurrentTime, setFileCurrentTime] = useState(0);
 
   const {
     isRecording,
@@ -68,10 +76,36 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
 
   // Sync video ref from CameraFeed - wrap in useCallback to prevent re-renders
   const handleCameraReady = useCallback(() => {
-    if (cameraFeedRef.current?.videoElement) {
+    if (mode === 'live' && cameraFeedRef.current?.videoElement) {
       (videoRef as any).current = cameraFeedRef.current.videoElement;
     }
     setCameraReady(true);
+  }, [mode]);
+
+  const handleFileLoad = useCallback((file: File) => {
+    const url = URL.createObjectURL(file);
+    if (fileVideoUrl) URL.revokeObjectURL(fileVideoUrl);
+    setFileVideoUrl(url);
+    setFileIsPlaying(false);
+    setFileCurrentTime(0);
+    setCameraReady(false); // will be re-set when video metadata loads
+  }, [fileVideoUrl]);
+
+  const handleFileVideoReady = useCallback((el: HTMLVideoElement) => {
+    fileVideoRef.current = el;
+    (videoRef as any).current = el;
+    setFileDuration(el.duration);
+    setCameraReady(true);
+  }, []);
+
+  const switchMode = useCallback((next: 'live' | 'file') => {
+    setMode(next);
+    setCameraReady(false);
+    setFileIsPlaying(false);
+    if (next === 'live' && cameraFeedRef.current?.videoElement) {
+      (videoRef as any).current = cameraFeedRef.current.videoElement;
+      setCameraReady(true);
+    }
   }, []);
 
   const { isReady, startDetection, stopDetection, currentLandmarks } = useMediaPipePose(
@@ -191,11 +225,31 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-          {/* Live Camera Feed */}
+          {/* Live Camera / Video File Feed */}
           <Card className="bg-gray-800 border-gray-700 p-6">
-            <h2 className="text-xl font-semibold mb-4 text-white">Live Feed</h2>
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-xl font-semibold text-white">
+                {mode === 'live' ? 'Live Feed' : 'Video File'}
+              </h2>
+              {/* Mode toggle */}
+              <div className="flex rounded-lg overflow-hidden border border-gray-600 text-xs">
+                <button
+                  onClick={() => switchMode('live')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 transition-colors ${mode === 'live' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
+                >
+                  <Video className="h-3 w-3" /> Live
+                </button>
+                <button
+                  onClick={() => switchMode('file')}
+                  className={`flex items-center gap-1.5 px-3 py-1.5 transition-colors ${mode === 'file' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-400 hover:bg-gray-600'}`}
+                >
+                  <Film className="h-3 w-3" /> Video File
+                </button>
+              </div>
+            </div>
 
-            {availableCameras.length > 1 && (
+            {/* ── Live mode controls ── */}
+            {mode === 'live' && availableCameras.length > 1 && (
               <div className="flex items-center gap-2 mb-4">
                 <Video className="h-4 w-4 text-gray-400 shrink-0" />
                 <Select value={selectedDeviceId} onValueChange={setSelectedDeviceId} disabled={isRecording}>
@@ -214,13 +268,80 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
               </div>
             )}
 
+            {/* ── File mode: file picker + playback controls ── */}
+            {mode === 'file' && (
+              <div className="mb-4 space-y-3">
+                <label className={`flex items-center gap-2 px-3 py-2 rounded border cursor-pointer text-sm transition-colors
+                  ${fileVideoUrl ? 'border-green-600 bg-green-900/20 text-green-300 hover:bg-green-900/40' : 'border-gray-600 bg-gray-700 text-gray-300 hover:bg-gray-600'}`}>
+                  <Film className="h-4 w-4 shrink-0" />
+                  {fileVideoUrl ? 'Video loaded — choose another' : 'Choose video file (cam1.webm or cam2.webm)'}
+                  <input type="file" accept="video/*" className="hidden"
+                    onChange={e => { const f = e.target.files?.[0]; if (f) handleFileLoad(f); e.target.value = ''; }} />
+                </label>
+
+                {/* Hidden video element for file playback */}
+                {fileVideoUrl && (
+                  <video
+                    ref={el => { if (el && el !== fileVideoRef.current) handleFileVideoReady(el); }}
+                    src={fileVideoUrl}
+                    className="hidden"
+                    playsInline
+                    muted
+                    onTimeUpdate={e => setFileCurrentTime(e.currentTarget.currentTime)}
+                    onEnded={() => setFileIsPlaying(false)}
+                    onLoadedMetadata={e => setFileDuration(e.currentTarget.duration)}
+                  />
+                )}
+
+                {fileVideoUrl && cameraReady && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Button size="sm" variant="outline"
+                        onClick={() => { fileVideoRef.current!.currentTime = 0; setFileCurrentTime(0); setFileIsPlaying(false); }}
+                        className="border-gray-600 text-gray-300 hover:bg-gray-700 h-8 w-8 p-0">
+                        <RotateCcw className="h-3 w-3" />
+                      </Button>
+                      <Button size="sm"
+                        onClick={() => {
+                          if (fileIsPlaying) { fileVideoRef.current?.pause(); setFileIsPlaying(false); }
+                          else { fileVideoRef.current?.play(); setFileIsPlaying(true); }
+                        }}
+                        className={`h-8 px-4 ${fileIsPlaying ? 'bg-gray-600 hover:bg-gray-700' : 'bg-blue-600 hover:bg-blue-700'}`}>
+                        {fileIsPlaying ? <Pause className="h-3 w-3" /> : <Play className="h-3 w-3" />}
+                      </Button>
+                      <input type="range" min={0} max={fileDuration || 1} step={0.05}
+                        value={fileCurrentTime}
+                        onChange={e => { const t = parseFloat(e.target.value); if (fileVideoRef.current) fileVideoRef.current.currentTime = t; setFileCurrentTime(t); }}
+                        className="flex-1 accent-blue-500" />
+                      <span className="text-xs text-gray-400 tabular-nums w-20 text-right">
+                        {fileCurrentTime.toFixed(1)}s / {fileDuration.toFixed(1)}s
+                      </span>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ── Video viewport ── */}
             <div className="relative aspect-[3/4] bg-black rounded-lg overflow-hidden mb-4">
-              <CameraFeed
-                ref={cameraFeedRef}
-                onCameraReady={handleCameraReady}
-                className="w-full h-full"
-                deviceId={selectedDeviceId !== 'default' ? selectedDeviceId : undefined}
-              />
+              {/* Camera feed — only mounted in live mode */}
+              {mode === 'live' && (
+                <CameraFeed
+                  ref={cameraFeedRef}
+                  onCameraReady={handleCameraReady}
+                  className="w-full h-full"
+                  deviceId={selectedDeviceId !== 'default' ? selectedDeviceId : undefined}
+                />
+              )}
+
+              {/* File mode preview canvas / placeholder */}
+              {mode === 'file' && !fileVideoUrl && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center text-gray-600 text-sm gap-2">
+                  <Film className="h-10 w-10" />
+                  <span>Load a video file above</span>
+                </div>
+              )}
+
               <canvas
                 ref={canvasRef}
                 className="absolute inset-0 w-full h-full pointer-events-none"
@@ -233,21 +354,12 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
                 videoElement={videoRef.current}
                 className="z-10"
               />
-              
-              {/* Debug info */}
-              <div className="absolute top-2 right-2 bg-black/70 text-white text-xs p-2 rounded">
-                <div>Video: {videoDimensions.width}x{videoDimensions.height}</div>
-                <div>Landmarks: {currentLandmarks ? '✓' : '✗'}</div>
-                <div>Ready: {isReady ? '✓' : '✗'}</div>
-              </div>
-              
+
               {isRecording && (
                 <div className="absolute top-4 left-4 flex items-center gap-2 bg-red-600 px-3 py-1.5 rounded-full">
                   <Circle className="h-3 w-3 fill-white animate-pulse" />
                   <span className="text-sm font-bold">REC</span>
-                  <span className="text-sm font-mono">
-                    {formatDuration(currentRecording?.duration || 0)}
-                  </span>
+                  <span className="text-sm font-mono">{formatDuration(currentRecording?.duration || 0)}</span>
                 </div>
               )}
 
@@ -277,22 +389,20 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
                   />
                 </>
               )}
-              
+
               <div className="flex gap-2">
                 {!isRecording ? (
                   <Button
                     onClick={handleStartRecording}
-                    disabled={!cameraReady || !isReady}
+                    disabled={!cameraReady || !isReady || (mode === 'file' && !fileIsPlaying)}
                     className="flex-1 bg-red-600 hover:bg-red-700"
+                    title={mode === 'file' && !fileIsPlaying ? 'Press Play on the video first' : ''}
                   >
                     <Circle className="mr-2 h-4 w-4" />
-                    Start Recording
+                    {mode === 'file' ? 'Record (play video first)' : 'Start Recording'}
                   </Button>
                 ) : (
-                  <Button
-                    onClick={handleStopRecording}
-                    className="flex-1 bg-gray-600 hover:bg-gray-700"
-                  >
+                  <Button onClick={handleStopRecording} className="flex-1 bg-gray-600 hover:bg-gray-700">
                     <Square className="mr-2 h-4 w-4" />
                     Stop Recording
                   </Button>

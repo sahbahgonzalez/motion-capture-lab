@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Badge } from './ui/badge';
@@ -5,9 +6,11 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useDualCamera } from '../hooks/useDualCamera';
 import { useCameraCalibration } from '../hooks/useCameraCalibration';
+import { useStereoVideoRecorder } from '../hooks/useStereoVideoRecorder';
 import { CalibrationView } from './CalibrationView';
 import { TriangulationView } from './TriangulationView';
-import { Video, VideoOff, AlertCircle, RefreshCw } from 'lucide-react';
+import { StereoVideoPlayback } from './StereoVideoPlayback';
+import { Video, VideoOff, AlertCircle, RefreshCw, Circle, Square, Download } from 'lucide-react';
 
 export function ThreeDMotionCaptureView() {
   const {
@@ -33,6 +36,35 @@ export function ThreeDMotionCaptureView() {
   const { calibrationResult } = useCameraCalibration();
 
   const bothCamerasActive = isCamera1Active && isCamera2Active;
+
+  const {
+    isRecording: isVideoRecording,
+    recordings: videoRecordings,
+    error: videoRecordError,
+    startRecording: startVideoRecording,
+    stopRecording: stopVideoRecording,
+    downloadRecording: downloadVideoRecording,
+    deleteRecording: deleteVideoRecording,
+  } = useStereoVideoRecorder(camera1Stream, camera2Stream);
+
+  const [videoRecordingMs, setVideoRecordingMs] = useState(0);
+  const videoRecordStartRef = useRef<number>(0);
+
+  useEffect(() => {
+    if (!isVideoRecording) { setVideoRecordingMs(0); return; }
+    videoRecordStartRef.current = Date.now();
+    const interval = setInterval(() => {
+      setVideoRecordingMs(Date.now() - videoRecordStartRef.current);
+    }, 100);
+    return () => clearInterval(interval);
+  }, [isVideoRecording]);
+
+  const formatVideoDuration = (ms: number) => {
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const cs = Math.floor((ms % 1000) / 10);
+    return `${m.toString().padStart(2,'0')}:${(s%60).toString().padStart(2,'0')}.${cs.toString().padStart(2,'0')}`;
+  };
 
   return (
     <div className="min-h-screen bg-gray-950 text-white p-6">
@@ -61,9 +93,9 @@ export function ThreeDMotionCaptureView() {
           <TabsList className="bg-gray-800 mb-6">
             <TabsTrigger value="cameras">Camera Setup</TabsTrigger>
             <TabsTrigger value="calibration">Calibration</TabsTrigger>
-            <TabsTrigger value="reconstruction">
-              3D Reconstruction
-            </TabsTrigger>
+            <TabsTrigger value="reconstruction">3D Reconstruction</TabsTrigger>
+            <TabsTrigger value="video-record">Video Recording</TabsTrigger>
+            <TabsTrigger value="playback">Playback</TabsTrigger>
           </TabsList>
 
           {/* ── Camera Setup ─────────────────────────────────────── */}
@@ -282,6 +314,114 @@ export function ThreeDMotionCaptureView() {
               isBothCamerasActive={bothCamerasActive}
               preloadedCalibration={calibrationResult}
             />
+          </TabsContent>
+
+          {/* ── Video Recording ─────────────────────────────────── */}
+          <TabsContent value="video-record" className="space-y-6">
+            {/* Status / controls */}
+            <Card className="bg-gray-900 border-gray-700 p-6">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-lg font-semibold">Synchronized Dual-Camera Recording</h3>
+                  <p className="text-sm text-gray-400 mt-1">
+                    Both streams start in the same JS tick — sub-millisecond synchronization.
+                  </p>
+                </div>
+                {isVideoRecording && (
+                  <div className="flex items-center gap-2 text-red-400 font-mono text-sm">
+                    <Circle className="h-3 w-3 fill-red-500 text-red-500 animate-pulse" />
+                    {formatVideoDuration(videoRecordingMs)}
+                  </div>
+                )}
+              </div>
+
+              {videoRecordError && (
+                <div className="flex items-center gap-2 text-red-400 text-sm mb-4 p-3 bg-red-900/20 rounded border border-red-800">
+                  <AlertCircle className="h-4 w-4 shrink-0" />
+                  {videoRecordError}
+                </div>
+              )}
+
+              {!bothCamerasActive && (
+                <div className="p-3 bg-yellow-900/20 border border-yellow-700 rounded text-yellow-300 text-sm mb-4">
+                  Both cameras must be active (Camera Setup tab) before recording.
+                </div>
+              )}
+
+              <div className="flex gap-3">
+                {!isVideoRecording ? (
+                  <Button
+                    onClick={startVideoRecording}
+                    disabled={!bothCamerasActive}
+                    className="bg-red-600 hover:bg-red-700 text-white"
+                  >
+                    <Circle className="h-4 w-4 mr-2 fill-white" />
+                    Start Recording
+                  </Button>
+                ) : (
+                  <Button
+                    onClick={stopVideoRecording}
+                    className="bg-gray-600 hover:bg-gray-700 text-white"
+                  >
+                    <Square className="h-4 w-4 mr-2 fill-white" />
+                    Stop Recording
+                  </Button>
+                )}
+              </div>
+            </Card>
+
+            {/* Recordings list */}
+            {videoRecordings.length > 0 && (
+              <Card className="bg-gray-900 border-gray-700 p-6">
+                <h3 className="text-lg font-semibold mb-4">Recordings</h3>
+                <div className="space-y-3">
+                  {videoRecordings.map(rec => {
+                    const dur = Math.round(rec.duration / 1000);
+                    const size1 = (rec.cam1Blob.size / 1e6).toFixed(1);
+                    const size2 = (rec.cam2Blob.size / 1e6).toFixed(1);
+                    return (
+                      <div key={rec.id} className="flex items-center justify-between p-3 bg-gray-800 rounded-lg">
+                        <div>
+                          <p className="font-medium text-sm text-white">{rec.name}</p>
+                          <p className="text-xs text-gray-400 mt-0.5">
+                            {dur}s &nbsp;·&nbsp; Cam1: {size1} MB &nbsp;·&nbsp; Cam2: {size2} MB
+                          </p>
+                        </div>
+                        <div className="flex gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="border-gray-600 text-gray-300 hover:text-white"
+                            onClick={() => downloadVideoRecording(rec)}
+                          >
+                            <Download className="h-4 w-4 mr-1" />
+                            Download Both
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="destructive"
+                            onClick={() => deleteVideoRecording(rec.id)}
+                          >
+                            Delete
+                          </Button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </Card>
+            )}
+
+            {videoRecordings.length === 0 && !isVideoRecording && (
+              <div className="text-center text-gray-500 py-12 text-sm">
+                No recordings yet. Start both cameras and press Record.
+              </div>
+            )}
+          </TabsContent>
+
+          {/* ── Playback ────────────────────────────────────────── */}
+          <TabsContent value="playback">
+            <StereoVideoPlayback calibration={calibrationResult} />
           </TabsContent>
         </Tabs>
       </div>
