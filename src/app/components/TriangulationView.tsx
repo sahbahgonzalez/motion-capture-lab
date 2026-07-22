@@ -4,7 +4,7 @@ import { Button } from './ui/button';
 import { Badge } from './ui/badge';
 import { Input } from './ui/input';
 import { useDualMediaPipePose } from '../hooks/useDualMediaPipePose';
-import { useTriangulation, LANDMARK_KEYS, SKELETON_CONNECTIONS, type TriangulatedPose } from '../hooks/useTriangulation';
+import { triangulateAllLandmarks, LANDMARK_KEYS, SKELETON_CONNECTIONS, type TriangulatedPose } from '../hooks/useTriangulation';
 import { useCameraCalibration } from '../hooks/useCameraCalibration';
 import { useStereoMotionRecorder } from '../hooks/useStereoMotionRecorder';
 import { MotionDataVisualizer } from './MotionDataVisualizer';
@@ -51,9 +51,9 @@ function SkeletonView({ pose3D, view, width, height }: SkeletonViewProps) {
   const project = (key: keyof PoseLandmarks) => {
     const pt = pose3D[key];
     if (!pt) return null;
-    if (view === 'front') return { px: pt.x, py: pt.y };   // X right, Y down
-    if (view === 'side')  return { px: pt.z, py: pt.y };   // Z right (depth), Y down
-    return { px: pt.x, py: pt.z };                          // top: X right, Z down
+    if (view === 'front') return { px: pt.x, py: -pt.y };   // X right, Y up→down (invert for SVG)
+    if (view === 'side')  return { px: pt.z, py: -pt.y };   // Z right (depth), Y up→down (invert for SVG)
+    return { px: pt.x, py: pt.z };                           // top: X right, Z forward (no Y inversion)
   };
 
   const projected = LANDMARK_KEYS.map(k => ({ key: k, pt: project(k) })).filter(d => d.pt !== null) as
@@ -156,21 +156,6 @@ export function TriangulationView({
   }, [camera2Stream]);
 
   const calibration = calibrationResult ?? preloadedCalibration ?? null;
-  const videoEl1 = camera1Ref.current;
-  const videoEl2 = camera2Ref.current;
-
-  const { camera1Landmarks, camera2Landmarks, isLoaded: poseLoaded, error: poseError } =
-    useDualMediaPipePose(videoEl1, videoEl2, isBothCamerasActive);
-
-  const cam1W = videoEl1?.videoWidth ?? 1280;
-  const cam1H = videoEl1?.videoHeight ?? 720;
-  const cam2W = videoEl2?.videoWidth ?? 1280;
-  const cam2H = videoEl2?.videoHeight ?? 720;
-
-  const { pose: pose3D, backProjected2D } = useTriangulation(
-    calibration, camera1Landmarks, camera2Landmarks,
-    cam1W, cam1H, cam2W, cam2H,
-  );
 
   const {
     isRecording,
@@ -184,10 +169,56 @@ export function TriangulationView({
     exportRecording,
   } = useStereoMotionRecorder();
 
-  useEffect(() => {
-    if (isRecording && camera1Landmarks)
-      recordStereoFrame(pose3D, camera1Landmarks);
-  }, [pose3D, isRecording, camera1Landmarks, recordStereoFrame]);
+  // pose3D is updated once per stereo frame inside the video-frame callback,
+  // not via useMemo/useTriangulation, so triangulation runs exactly once per
+  // processed frame rather than once for recording + once for display.
+  const emptyPose = () =>
+    Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as TriangulatedPose;
+  const [pose3D, setPose3D] = useState<TriangulatedPose>(emptyPose);
+
+  // Stable refs — always hold the latest values so the rVFC callback can read
+  // them without being listed as a dependency (which would restart the loop).
+  const calibrationRef = useRef(calibration);
+  const isRecordingRef = useRef(isRecording);
+  const recordStereoFrameRef = useRef(recordStereoFrame);
+  useEffect(() => { calibrationRef.current = calibration; }, [calibration]);
+  useEffect(() => { isRecordingRef.current = isRecording; }, [isRecording]);
+  useEffect(() => { recordStereoFrameRef.current = recordStereoFrame; }, [recordStereoFrame]);
+
+  // This ref is reassigned every render so it always closes over the latest
+  // setPose3D and camera refs without ever being a processing-loop dependency.
+  const onStereoFrameRef = useRef<
+    ((lm1: PoseLandmarks | null, lm2: PoseLandmarks | null) => void) | null
+  >(null);
+
+  onStereoFrameRef.current = (lm1: PoseLandmarks | null, lm2: PoseLandmarks | null) => {
+    if (!lm1 || !lm2 || !calibrationRef.current) return;
+
+    const w1 = camera1Ref.current?.videoWidth  ?? 1280;
+    const h1 = camera1Ref.current?.videoHeight ?? 720;
+    const w2 = camera2Ref.current?.videoWidth  ?? 1280;
+    const h2 = camera2Ref.current?.videoHeight ?? 720;
+
+    // Single triangulation per stereo frame — result goes to both recording and UI.
+    const newPose = triangulateAllLandmarks(calibrationRef.current, lm1, lm2, w1, h1, w2, h2);
+
+    if (isRecordingRef.current) {
+      recordStereoFrameRef.current(newPose, lm1);
+    }
+
+    setPose3D(newPose);
+  };
+
+  const { camera1Landmarks, camera2Landmarks, isLoaded: poseLoaded, error: poseError } =
+    useDualMediaPipePose(
+      camera1Ref.current, camera2Ref.current,
+      isBothCamerasActive, onStereoFrameRef,
+    );
+
+  const cam1W = camera1Ref.current?.videoWidth  ?? 1280;
+  const cam1H = camera1Ref.current?.videoHeight ?? 720;
+  const cam2W = camera2Ref.current?.videoWidth  ?? 1280;
+  const cam2H = camera2Ref.current?.videoHeight ?? 720;
 
   const handleStartRecording = useCallback(() => {
     startRecording({ notes: '3D stereo recording', deviceInfo: navigator.userAgent });

@@ -110,6 +110,30 @@ See `SUPABASE_SETUP.md` for detailed instructions.
 - **Supabase** - Cloud storage (optional)
 - **Motion/Framer Motion** - Animations
 
+## Performance Optimizations (Stereo 3D Lab)
+
+### Recording State Batching
+The 3D stereo pipeline uses optimized recording that avoids excessive React state updates:
+
+**useDualMediaPipePose.ts:**
+- Recording buffer moved to `useRef` (`recordedDataRef`) instead of React state
+- All landmark rows for one stereo frame batched into a single append operation
+- State updates reduced from ~26 per stereo frame (one per landmark × 2 cameras) to ~2 (one per camera for UI)
+- Result: Eliminates growing memory allocations and full buffer copies on every frame
+
+**useMotionRecorder.ts:**
+- Frames buffer in `useRef`; only lightweight UI state (`currentFrameCount`, `currentDuration`)
+- Replaces per-frame full array copies with single counter updates
+- Result: Significantly reduced React reconciliation overhead in the hot path
+
+### Impact
+These changes move the performance bottleneck from recording logic to **MediaPipe inference and stereo triangulation**, where it belongs. The 3D lab now processes frames at rates closer to the 2D lab.
+
+### Backward Compatibility
+- Both hooks maintain the same API signatures
+- `recordedData` still exposed (returns `ref.current`)
+- Existing components require no changes
+
 ## Data Format
 
 Recordings are stored as JSON with this structure:

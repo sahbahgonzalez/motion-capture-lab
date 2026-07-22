@@ -44,7 +44,6 @@ export function useMediaPipePose(
   const [error, setError] = useState<string | null>(null);
   const poseLandmarkerRef = useRef<PoseLandmarker | null>(null);
   const animationFrameRef = useRef<number | null>(null);
-  const lastVideoTimeRef = useRef<number>(-1);
   const isDetectingRef = useRef<boolean>(false);
   const optionsRef = useRef(options);
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -138,7 +137,7 @@ export function useMediaPipePose(
     setIsDetecting(true);
     isDetectingRef.current = true;
 
-    const detectPose = async () => {
+    const detectPose = () => {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       const poseLandmarker = poseLandmarkerRef.current;
@@ -161,13 +160,6 @@ export function useMediaPipePose(
 
       try {
         const startTimeMs = performance.now();
-
-        // Skip if same frame as last time
-        if (video.currentTime === lastVideoTimeRef.current) {
-          animationFrameRef.current = requestAnimationFrame(detectPose);
-          return;
-        }
-        lastVideoTimeRef.current = video.currentTime;
 
         // Draw to offscreen canvas before detection so detectForVideo never
         // acquires the video element's GPU texture directly — without this,

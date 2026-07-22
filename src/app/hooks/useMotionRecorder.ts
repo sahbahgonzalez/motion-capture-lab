@@ -23,55 +23,61 @@ export interface MotionRecording {
 
 export function useMotionRecorder() {
   const [isRecording, setIsRecording] = useState(false);
-  const [currentRecording, setCurrentRecording] = useState<MotionRecording | null>(null);
+  const [currentRecordingMetadata, setCurrentRecordingMetadata] = useState<{ id: string; name: string; startTime: number } | null>(null);
   const [recordings, setRecordings] = useState<MotionRecording[]>([]);
+  const [currentFrameCount, setCurrentFrameCount] = useState(0);
+  const [currentDuration, setCurrentDuration] = useState(0);
   
   const recordingStartTime = useRef<number>(0);
   const frameCounter = useRef<number>(0);
   const framesBuffer = useRef<MotionFrame[]>([]);
+  const currentMetadataRef = useRef<MotionRecording['metadata']>({});
+  const lastDisplayUpdateRef = useRef<number>(0);
 
   const startRecording = useCallback((metadata?: MotionRecording['metadata']) => {
     const startTime = Date.now();
     recordingStartTime.current = startTime;
     frameCounter.current = 0;
     framesBuffer.current = [];
+    currentMetadataRef.current = metadata || {};
+    lastDisplayUpdateRef.current = 0;
     
-    setIsRecording(true);
-    setCurrentRecording({
+    setCurrentRecordingMetadata({
       id: `recording_${startTime}`,
       name: `Motion_${new Date(startTime).toLocaleString()}`,
       startTime,
-      duration: 0,
-      frames: [],
-      frameRate: 0,
-      metadata: metadata || {},
     });
+    setCurrentFrameCount(0);
+    setCurrentDuration(0);
+    setIsRecording(true);
   }, []);
 
   const stopRecording = useCallback(() => {
-    if (!isRecording) return null;
+    if (!isRecording || !currentRecordingMetadata) return null;
 
     const endTime = Date.now();
     const duration = endTime - recordingStartTime.current;
     const frameRate = framesBuffer.current.length / (duration / 1000);
 
     const completedRecording: MotionRecording = {
-      id: currentRecording!.id,
-      name: currentRecording!.name,
+      id: currentRecordingMetadata.id,
+      name: currentRecordingMetadata.name,
       startTime: recordingStartTime.current,
       duration,
       frames: [...framesBuffer.current],
       frameRate,
-      metadata: currentRecording!.metadata,
+      metadata: currentMetadataRef.current,
     };
 
     setRecordings(prev => [...prev, completedRecording]);
     setIsRecording(false);
-    setCurrentRecording(null);
+    setCurrentRecordingMetadata(null);
+    setCurrentFrameCount(0);
+    setCurrentDuration(0);
     framesBuffer.current = [];
     
     return completedRecording;
-  }, [isRecording, currentRecording]);
+  }, [isRecording, currentRecordingMetadata]);
 
   const recordFrame = useCallback((landmarks: PoseLandmarks) => {
     if (!isRecording) return;
@@ -84,14 +90,16 @@ export function useMotionRecorder() {
     };
 
     framesBuffer.current.push(frame);
-    
-    // Update current recording preview
-    setCurrentRecording(prev => prev ? {
-      ...prev,
-      duration: timestamp,
-      frames: [...framesBuffer.current],
-      frameRate: framesBuffer.current.length / (timestamp / 1000),
-    } : null);
+
+    // Throttle display updates to ~4Hz — the frame data is already in the ref.
+    // Calling setState every frame triggers a full re-render of the consumer
+    // component on every detection cycle, cutting throughput roughly in half.
+    const now = Date.now();
+    if (now - lastDisplayUpdateRef.current > 250) {
+      lastDisplayUpdateRef.current = now;
+      setCurrentFrameCount(framesBuffer.current.length);
+      setCurrentDuration(timestamp);
+    }
   }, [isRecording]);
 
   const deleteRecording = useCallback((id: string) => {
@@ -130,10 +138,23 @@ export function useMotionRecorder() {
     URL.revokeObjectURL(url);
   }, [recordings]);
 
+  // Compute current recording info from refs for consumers that need it
+  const currentRecording: MotionRecording | null = currentRecordingMetadata && isRecording ? {
+    id: currentRecordingMetadata.id,
+    name: currentRecordingMetadata.name,
+    startTime: recordingStartTime.current,
+    duration: currentDuration,
+    frames: framesBuffer.current,
+    frameRate: currentDuration > 0 ? framesBuffer.current.length / (currentDuration / 1000) : 0,
+    metadata: currentMetadataRef.current,
+  } : null;
+
   return {
     isRecording,
     currentRecording,
     recordings,
+    currentFrameCount,
+    currentDuration,
     startRecording,
     stopRecording,
     recordFrame,

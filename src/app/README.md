@@ -559,6 +559,49 @@ overallScore = smoothnessScore × 0.3
 
 ---
 
+# Stereo 3D Lab Recording Performance Optimization
+
+## Changes Applied
+
+### useDualMediaPipePose.ts
+- **Moved recording buffer to `useRef`**: `recordedDataRef` now stores the full growing buffer
+- **Removed React state for full data**: Replaced `[recordedData, setRecordedData]` with lightweight `[recordedRowCount, setRecordedRowCount]`
+- **Batched landmark appends**: Both `processFrame1` and `processFrame2` now:
+  - Build all landmark rows for a frame into a `frameRows` array
+  - Append them all at once to `recordedDataRef.current` using `push(...frameRows)`
+  - Update `recordedRowCount` state only once per frame
+- **Updated export to read from ref**: `exportRecordedData` now reads from `recordedDataRef.current`
+- **Fixed missing landmarks**: Added eye and ear landmarks (leftEye, rightEye, leftEar, rightEar) to `convertToLandmarks` function
+
+**Result**: Reduced from ~26 state updates per stereo frame (one per landmark across both cameras) to ~2 state updates per stereo frame (one per camera for UI count).
+
+### useMotionRecorder.ts
+- **Moved frames buffer to `useRef`**: `framesBuffer` is the source of truth
+- **Lightweight React state**: Replaced full `currentRecording` state with:
+  - `currentRecordingMetadata`: Only id, name, startTime
+  - `currentFrameCount`: Frame count for UI display
+  - `currentDuration`: Duration for UI display
+- **Reduced state updates in recordFrame**: Now only updates `currentFrameCount` and `currentDuration` instead of rebuilding the entire frames array
+- **Lazy-computed currentRecording**: Computed from refs only when needed for exports
+
+**Result**: Reduced state update overhead in the hot path significantly.
+
+## Performance Impact
+
+These changes eliminate the array-copy penalty that was causing:
+- Growing memory allocations
+- Full buffer copies on every landmark
+- Excessive React reconciliation cycles
+
+The bottleneck moved from recording logic to MediaPipe inference and stereo triangulation, which is where it should be.
+
+## Backward Compatibility
+
+- Both hooks return the same API signatures
+- `recordedData` is still exposed (returns `ref.current`)
+- Components using these hooks do not need changes
+
+
 ## Technology Stack
 
 | Layer | Technology |
