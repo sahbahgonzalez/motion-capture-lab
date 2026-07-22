@@ -33,8 +33,8 @@ function SkeletonView({ pose3D, view, width, height }: {
   const project = (key: keyof PoseLandmarks) => {
     const pt = pose3D[key];
     if (!pt) return null;
-    if (view === 'front') return { px: pt.x, py: pt.y };
-    if (view === 'side')  return { px: pt.z, py: pt.y };
+    if (view === 'front') return { px: pt.x, py: -pt.y };  // negate Y: OpenCV Y-down → SVG Y-up
+    if (view === 'side')  return { px: pt.z, py: -pt.y };
     return { px: pt.x, py: pt.z };
   };
   const projected = LANDMARK_KEYS.map(k => ({ key: k, pt: project(k) })).filter(d => d.pt !== null) as
