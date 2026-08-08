@@ -3,8 +3,7 @@ import { SKELETON_CONNECTIONS, LANDMARK_KEYS } from '../hooks/useTriangulation';
 
 // Matches the 3D lab's LANDMARK_COLORS palette exactly
 const LANDMARK_COLORS: Record<keyof PoseLandmarks, string> = {
-  nose: '#a78bfa', leftEye: '#a78bfa', rightEye: '#a78bfa',
-  leftEar: '#a78bfa', rightEar: '#a78bfa',
+  nose: '#a78bfa',
   leftShoulder: '#34d399', rightShoulder: '#34d399',
   leftElbow: '#60a5fa', rightElbow: '#60a5fa',
   leftWrist: '#f87171', rightWrist: '#f87171',
@@ -63,7 +62,7 @@ export function LivePoseOverlay({
       {LANDMARK_KEYS.map(key => {
         const pt = landmarks[key];
         if (!pt || (pt.visibility ?? 1) < 0.5) return null;
-        const isHead = key === 'nose' || key === 'leftEye' || key === 'rightEye' || key === 'leftEar' || key === 'rightEar';
+        const isHead = key === 'nose';
         return (
           <circle
             key={key}

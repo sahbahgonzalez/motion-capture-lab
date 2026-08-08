@@ -33,12 +33,14 @@ export function useMotionRecorder() {
   const framesBuffer = useRef<MotionFrame[]>([]);
   const currentMetadataRef = useRef<MotionRecording['metadata']>({});
   const lastDisplayUpdateRef = useRef<number>(0);
+  const debugMetricsRef = useRef({ frameBufferPushCalls: 0 });
 
   const startRecording = useCallback((metadata?: MotionRecording['metadata']) => {
     const startTime = Date.now();
     recordingStartTime.current = startTime;
     frameCounter.current = 0;
     framesBuffer.current = [];
+    debugMetricsRef.current.frameBufferPushCalls = 0;
     currentMetadataRef.current = metadata || {};
     lastDisplayUpdateRef.current = 0;
     
@@ -89,6 +91,7 @@ export function useMotionRecorder() {
       frameNumber: frameCounter.current++,
     };
 
+    debugMetricsRef.current.frameBufferPushCalls += 1;
     framesBuffer.current.push(frame);
 
     // Throttle display updates to ~4Hz — the frame data is already in the ref.
@@ -162,5 +165,6 @@ export function useMotionRecorder() {
     clearAllRecordings,
     exportRecording,
     exportAllRecordings,
+    debugMetrics: debugMetricsRef,
   };
 }

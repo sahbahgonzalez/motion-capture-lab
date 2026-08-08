@@ -115,17 +115,23 @@ export function calculateJitterMetrics(
   const velocityVariance =
     velocities.reduce((sum, v) => sum + Math.pow(v - meanVelocity, 2), 0) / velocities.length;
 
-  // Position std dev in native units (mm or [0,1]) — for display only, not compared across labs
-  const meanPos = {
-    x: positions.reduce((sum, p) => sum + p.x, 0) / positions.length,
-    y: positions.reduce((sum, p) => sum + p.y, 0) / positions.length,
-    z: positions.reduce((sum, p) => sum + (p.z ?? 0), 0) / positions.length,
-  };
-  const positionStdDev = {
-    x: Math.sqrt(positions.reduce((sum, p) => sum + Math.pow(p.x - meanPos.x, 2), 0) / positions.length),
-    y: Math.sqrt(positions.reduce((sum, p) => sum + Math.pow(p.y - meanPos.y, 2), 0) / positions.length),
-    z: Math.sqrt(positions.reduce((sum, p) => sum + Math.pow((p.z ?? 0) - meanPos.z, 2), 0) / positions.length),
-  };
+  // Position std dev — only over frames where the joint was actually visible.
+  // Occluded joints are stored as (0,0,0) with visibility=0; including those
+  // zeros would pull the mean toward the origin and inflate std dev.
+  const validPositions = positions.filter(p => (p.visibility ?? 1) >= 0.5);
+  const positionStdDev = (() => {
+    if (validPositions.length === 0) return { x: 0, y: 0, z: 0 };
+    const mean = {
+      x: validPositions.reduce((s, p) => s + p.x, 0) / validPositions.length,
+      y: validPositions.reduce((s, p) => s + p.y, 0) / validPositions.length,
+      z: validPositions.reduce((s, p) => s + (p.z ?? 0), 0) / validPositions.length,
+    };
+    return {
+      x: Math.sqrt(validPositions.reduce((s, p) => s + Math.pow(p.x - mean.x, 2), 0) / validPositions.length),
+      y: Math.sqrt(validPositions.reduce((s, p) => s + Math.pow(p.y - mean.y, 2), 0) / validPositions.length),
+      z: Math.sqrt(validPositions.reduce((s, p) => s + Math.pow((p.z ?? 0) - mean.z, 2), 0) / validPositions.length),
+    };
+  })();
 
   // High-frequency noise: fraction of frames where acceleration > 2× mean velocity
   let rapidChanges = 0;

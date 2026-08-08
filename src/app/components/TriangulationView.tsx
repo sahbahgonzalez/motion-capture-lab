@@ -23,8 +23,7 @@ interface TriangulationViewProps {
 }
 
 const LANDMARK_COLORS: Record<keyof PoseLandmarks, string> = {
-  nose: '#a78bfa', leftEye: '#a78bfa', rightEye: '#a78bfa',
-  leftEar: '#a78bfa', rightEar: '#a78bfa',
+  nose: '#a78bfa',
   leftShoulder: '#34d399', rightShoulder: '#34d399',
   leftElbow: '#60a5fa', rightElbow: '#60a5fa',
   leftWrist: '#f87171', rightWrist: '#f87171',
@@ -155,6 +154,16 @@ export function TriangulationView({
       displayVideo2Ref.current.srcObject = camera2Stream;
   }, [camera2Stream]);
 
+  useEffect(() => {
+    const track = camera1Stream?.getVideoTracks()[0];
+    if (track) console.info('[NORMAL 3D DEBUG] Camera1 settings', track.getSettings());
+  }, [camera1Stream]);
+
+  useEffect(() => {
+    const track = camera2Stream?.getVideoTracks()[0];
+    if (track) console.info('[NORMAL 3D DEBUG] Camera2 settings', track.getSettings());
+  }, [camera2Stream]);
+
   const calibration = calibrationResult ?? preloadedCalibration ?? null;
 
   const {
@@ -167,7 +176,14 @@ export function TriangulationView({
     deleteRecording,
     clearAllRecordings,
     exportRecording,
+    debugCounters,
+    debugMetrics,
   } = useStereoMotionRecorder();
+
+  const debugRecorderSummaryRef = useRef({
+    onStereoFrameCalls: 0,
+    triangulationCalls: 0,
+  });
 
   // pose3D is updated once per stereo frame inside the video-frame callback,
   // not via useMemo/useTriangulation, so triangulation runs exactly once per
@@ -192,6 +208,7 @@ export function TriangulationView({
   >(null);
 
   onStereoFrameRef.current = (lm1: PoseLandmarks | null, lm2: PoseLandmarks | null) => {
+    debugRecorderSummaryRef.current.onStereoFrameCalls += 1;
     if (!lm1 || !lm2 || !calibrationRef.current) return;
 
     const w1 = camera1Ref.current?.videoWidth  ?? 1280;
@@ -200,6 +217,7 @@ export function TriangulationView({
     const h2 = camera2Ref.current?.videoHeight ?? 720;
 
     // Single triangulation per stereo frame — result goes to both recording and UI.
+    debugRecorderSummaryRef.current.triangulationCalls += 1;
     const newPose = triangulateAllLandmarks(calibrationRef.current, lm1, lm2, w1, h1, w2, h2);
 
     if (isRecordingRef.current) {
@@ -209,11 +227,13 @@ export function TriangulationView({
     setPose3D(newPose);
   };
 
-  const { camera1Landmarks, camera2Landmarks, isLoaded: poseLoaded, error: poseError } =
-    useDualMediaPipePose(
-      camera1Ref.current, camera2Ref.current,
-      isBothCamerasActive, onStereoFrameRef,
-    );
+  const {
+    camera1Landmarks, camera2Landmarks, isLoaded: poseLoaded, error: poseError,
+    debugInstanceId, debugStats,
+  } = useDualMediaPipePose(
+    camera1Ref.current, camera2Ref.current,
+    isBothCamerasActive, onStereoFrameRef,
+  );
 
   const cam1W = camera1Ref.current?.videoWidth  ?? 1280;
   const cam1H = camera1Ref.current?.videoHeight ?? 720;
@@ -221,13 +241,23 @@ export function TriangulationView({
   const cam2H = camera2Ref.current?.videoHeight ?? 720;
 
   const handleStartRecording = useCallback(() => {
+    debugRecorderSummaryRef.current = { onStereoFrameCalls: 0, triangulationCalls: 0 };
     startRecording({ notes: '3D stereo recording', deviceInfo: navigator.userAgent });
   }, [startRecording]);
 
   const handleStopRecording = useCallback(() => {
     stopRecording();
+    console.info('[NORMAL 3D DEBUG SUMMARY]', {
+      debugInstanceId,
+      debugStats: debugStats.current,
+      onStereoFrameCalls: debugRecorderSummaryRef.current.onStereoFrameCalls,
+      triangulationCalls: debugRecorderSummaryRef.current.triangulationCalls,
+      recordStereoFrameCalls: debugCounters.current.recordStereoFrameCalls,
+      recordFrameCalls: debugCounters.current.recordFrameCalls,
+      bufferPushCalls: debugMetrics.current.frameBufferPushCalls,
+    });
     setRecordingName('');
-  }, [stopRecording]);
+  }, [stopRecording, debugCounters, debugMetrics, debugInstanceId, debugStats]);
 
   const handleLoadCalibration = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];

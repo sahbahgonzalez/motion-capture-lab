@@ -16,8 +16,7 @@ interface StereoVideoPlaybackProps {
 }
 
 const LANDMARK_COLORS: Record<keyof PoseLandmarks, string> = {
-  nose: '#a78bfa', leftEye: '#a78bfa', rightEye: '#a78bfa',
-  leftEar: '#a78bfa', rightEar: '#a78bfa',
+  nose: '#a78bfa',
   leftShoulder: '#34d399', rightShoulder: '#34d399',
   leftElbow: '#60a5fa', rightElbow: '#60a5fa',
   leftWrist: '#f87171', rightWrist: '#f87171',

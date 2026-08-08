@@ -14,8 +14,6 @@ export type TriangulatedPose = {
 
 export const LANDMARK_KEYS: Array<keyof PoseLandmarks> = [
   'nose',
-  'leftEye', 'rightEye',
-  'leftEar', 'rightEar',
   'leftShoulder', 'rightShoulder',
   'leftElbow', 'rightElbow',
   'leftWrist', 'rightWrist',
@@ -25,8 +23,7 @@ export const LANDMARK_KEYS: Array<keyof PoseLandmarks> = [
 ];
 
 export const SKELETON_CONNECTIONS: Array<[keyof PoseLandmarks, keyof PoseLandmarks]> = [
-  ['nose', 'leftEye'], ['nose', 'rightEye'],
-  ['leftEye', 'leftEar'], ['rightEye', 'rightEar'],
+  ['nose', 'leftShoulder'], ['nose', 'rightShoulder'],
   ['leftShoulder', 'rightShoulder'],
   ['leftShoulder', 'leftHip'], ['rightShoulder', 'rightHip'],
   ['leftHip', 'rightHip'],

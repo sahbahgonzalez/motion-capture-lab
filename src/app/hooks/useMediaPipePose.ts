@@ -10,10 +10,6 @@ export interface LandmarkPoint {
 
 export interface PoseLandmarks {
   nose: LandmarkPoint;
-  leftEye: LandmarkPoint;
-  rightEye: LandmarkPoint;
-  leftEar: LandmarkPoint;
-  rightEar: LandmarkPoint;
   leftShoulder: LandmarkPoint;
   rightShoulder: LandmarkPoint;
   leftElbow: LandmarkPoint;
@@ -209,10 +205,6 @@ export function useMediaPipePose(
           // MediaPipe landmark indices: https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
           const poseLandmarks: PoseLandmarks = {
             nose: { ...landmarks[0], visibility: landmarks[0].visibility },
-            leftEye: { ...landmarks[1], visibility: landmarks[1].visibility },
-            rightEye: { ...landmarks[2], visibility: landmarks[2].visibility },
-            leftEar: { ...landmarks[3], visibility: landmarks[3].visibility },
-            rightEar: { ...landmarks[4], visibility: landmarks[4].visibility },
             leftShoulder: { ...landmarks[11], visibility: landmarks[11].visibility },
             rightShoulder: { ...landmarks[12], visibility: landmarks[12].visibility },
             leftElbow: { ...landmarks[13], visibility: landmarks[13].visibility },

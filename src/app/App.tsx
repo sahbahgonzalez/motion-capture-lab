@@ -1,5 +1,6 @@
 import { MotionCaptureView } from './components/MotionCaptureView';
 import { ThreeDMotionCaptureView } from './components/ThreeDMotionCaptureView';
+import { FailureCorrectionLabView } from './components/FailureCorrectionLabView';
 import { Toaster } from './components/ui/sonner';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 
@@ -17,6 +18,9 @@ export default function App() {
               <TabsTrigger value="3d" className="data-[state=active]:bg-gray-700">
                 3D Motion Capture (Stereo)
               </TabsTrigger>
+              <TabsTrigger value="fc" className="data-[state=active]:bg-purple-900">
+                3D + Failure Correction
+              </TabsTrigger>
             </TabsList>
           </div>
 
@@ -26,6 +30,10 @@ export default function App() {
 
           <TabsContent value="3d" className="m-0">
             <ThreeDMotionCaptureView />
+          </TabsContent>
+
+          <TabsContent value="fc" className="m-0">
+            <FailureCorrectionLabView />
           </TabsContent>
         </Tabs>
       </div>

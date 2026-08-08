@@ -1,10 +1,11 @@
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { useMotionRecorder } from './useMotionRecorder';
 import { PoseLandmarks } from './useMediaPipePose';
 import { TriangulatedPose, LANDMARK_KEYS } from './useTriangulation';
 
 export function useStereoMotionRecorder() {
   const recorder = useMotionRecorder();
+  const debugCountersRef = useRef({ recordStereoFrameCalls: 0, recordFrameCalls: 0 });
 
   // Destructure stable values instead of depending on the whole recorder object.
   // recorder is a new object reference on every render, so [recorder] would
@@ -14,6 +15,7 @@ export function useStereoMotionRecorder() {
 
   const recordStereoFrame = useCallback(
     (pose3Dmm: TriangulatedPose, cam1Landmarks: PoseLandmarks | null) => {
+      debugCountersRef.current.recordStereoFrameCalls += 1;
       if (!isRecording) return;
       const landmarks = {} as PoseLandmarks;
       for (const key of LANDMARK_KEYS) {
@@ -50,5 +52,5 @@ export function useStereoMotionRecorder() {
     [isRecording, recordFrame],
   );
 
-  return { ...recorder, recordStereoFrame, recordBackProjectedFrame };
+  return { ...recorder, recordStereoFrame, recordBackProjectedFrame, debugCounters: debugCountersRef };
 }

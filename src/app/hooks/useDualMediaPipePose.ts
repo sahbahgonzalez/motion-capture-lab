@@ -34,6 +34,21 @@ export function useDualMediaPipePose(
   const [camera2Landmarks, setCamera2Landmarks] = useState<PoseLandmarks | null>(null);
   const [error, setError] = useState<string | null>(null);
 
+  const debugInstanceId = useRef(Math.random().toString(36).slice(2, 8));
+  const debugStatsRef = useRef({
+    rvfcCallbacks: 0,
+    uniqueCurrentTimeValues: 0,
+    duplicateCurrentTimeValues: 0,
+    processStereoFrameCalls: 0,
+    lastCurrentTime: -1,
+    lastProcessedFrameAt: 0,
+    lastLogAt: 0,
+    frameIntervalTotalMs: 0,
+    frameIntervalCount: 0,
+    frameIntervalMinMs: Infinity,
+    frameIntervalMaxMs: 0,
+  });
+
   const poseLandmarker1Ref = useRef<PoseLandmarker | null>(null);
   const poseLandmarker2Ref = useRef<PoseLandmarker | null>(null);
   const loopHandleRef = useRef<number | null>(null);
@@ -100,10 +115,6 @@ export function useDualMediaPipePose(
       const lm = result.landmarks[0];
       return {
         nose:          { x: lm[0].x,  y: lm[0].y,  z: lm[0].z,  visibility: lm[0].visibility },
-        leftEye:       { x: lm[1].x,  y: lm[1].y,  z: lm[1].z,  visibility: lm[1].visibility },
-        rightEye:      { x: lm[2].x,  y: lm[2].y,  z: lm[2].z,  visibility: lm[2].visibility },
-        leftEar:       { x: lm[3].x,  y: lm[3].y,  z: lm[3].z,  visibility: lm[3].visibility },
-        rightEar:      { x: lm[4].x,  y: lm[4].y,  z: lm[4].z,  visibility: lm[4].visibility },
         leftShoulder:  { x: lm[11].x, y: lm[11].y, z: lm[11].z, visibility: lm[11].visibility },
         rightShoulder: { x: lm[12].x, y: lm[12].y, z: lm[12].z, visibility: lm[12].visibility },
         leftElbow:     { x: lm[13].x, y: lm[13].y, z: lm[13].z, visibility: lm[13].visibility },
@@ -130,6 +141,16 @@ export function useDualMediaPipePose(
       const v2 = videoEl2Ref.current;
       let lm1: PoseLandmarks | null = null;
       let lm2: PoseLandmarks | null = null;
+
+      debugStatsRef.current.processStereoFrameCalls += 1;
+      if (debugStatsRef.current.lastProcessedFrameAt > 0) {
+        const interval = timestamp - debugStatsRef.current.lastProcessedFrameAt;
+        debugStatsRef.current.frameIntervalTotalMs += interval;
+        debugStatsRef.current.frameIntervalCount += 1;
+        debugStatsRef.current.frameIntervalMinMs = Math.min(debugStatsRef.current.frameIntervalMinMs, interval);
+        debugStatsRef.current.frameIntervalMaxMs = Math.max(debugStatsRef.current.frameIntervalMaxMs, interval);
+      }
+      debugStatsRef.current.lastProcessedFrameAt = timestamp;
 
       if (v1 && poseLandmarker1Ref.current && v1.readyState >= 2) {
         const w = v1.videoWidth, h = v1.videoHeight;
@@ -191,6 +212,12 @@ export function useDualMediaPipePose(
 
     setIsRunning(true);
     lastVideoTime1Ref.current = -1;
+    console.info(`[DUAL POSE ${debugInstanceId.current}] LOOP START`, {
+      isLoaded,
+      isActive,
+      hasVideo1: !!videoElement1,
+      hasVideo2: !!videoElement2,
+    });
     let active = true;
 
     const schedule = () => {
@@ -200,8 +227,44 @@ export function useDualMediaPipePose(
 
       if (SUPPORTS_RVFC) {
         // Fire exactly when the video element presents a new decoded frame.
-        loopHandleRef.current = v1.requestVideoFrameCallback((now) => {
+        loopHandleRef.current = v1.requestVideoFrameCallback((now, metadata) => {
           if (!active) return;
+          debugStatsRef.current.rvfcCallbacks += 1;
+
+          const currentVideoTime = v1.currentTime;
+          if (currentVideoTime === debugStatsRef.current.lastCurrentTime) {
+            debugStatsRef.current.duplicateCurrentTimeValues += 1;
+          } else {
+            debugStatsRef.current.uniqueCurrentTimeValues += 1;
+            debugStatsRef.current.lastCurrentTime = currentVideoTime;
+          }
+
+          const meta = metadata as {
+            mediaTime?: number;
+            presentedFrames?: number;
+            expectedDisplayTime?: number;
+          } | null;
+          const nowMs = performance.now();
+          if (debugStatsRef.current.lastLogAt === 0 || nowMs - debugStatsRef.current.lastLogAt >= 1000) {
+            const stats = debugStatsRef.current;
+            const avgInterval = stats.frameIntervalCount > 0 ? stats.frameIntervalTotalMs / stats.frameIntervalCount : 0;
+            console.info(`[DUAL POSE ${debugInstanceId.current}]`, {
+              rvfc: stats.rvfcCallbacks,
+              uniqueVideoTimes: stats.uniqueCurrentTimeValues,
+              duplicateVideoTimes: stats.duplicateCurrentTimeValues,
+              processStereo: stats.processStereoFrameCalls,
+              avgFrameIntervalMs: Number(avgInterval.toFixed(2)),
+              minFrameIntervalMs: Number(stats.frameIntervalMinMs === Infinity ? 0 : stats.frameIntervalMinMs.toFixed(2)),
+              maxFrameIntervalMs: Number(stats.frameIntervalMaxMs.toFixed(2)),
+              metadata: meta ? {
+                mediaTime: meta.mediaTime,
+                presentedFrames: meta.presentedFrames,
+                expectedDisplayTime: meta.expectedDisplayTime,
+              } : null,
+            });
+            stats.lastLogAt = nowMs;
+          }
+
           processStereoFrame(now);
           schedule();
         });
@@ -224,6 +287,12 @@ export function useDualMediaPipePose(
     return () => {
       active = false;
       setIsRunning(false);
+      console.info(`[DUAL POSE ${debugInstanceId.current}] LOOP STOP`, {
+        rvfc: debugStatsRef.current.rvfcCallbacks,
+        uniqueVideoTimes: debugStatsRef.current.uniqueCurrentTimeValues,
+        duplicateVideoTimes: debugStatsRef.current.duplicateCurrentTimeValues,
+        processStereo: debugStatsRef.current.processStereoFrameCalls,
+      });
       if (loopHandleRef.current !== null) {
         if (SUPPORTS_RVFC) {
           videoElement1.cancelVideoFrameCallback(loopHandleRef.current);
@@ -241,5 +310,7 @@ export function useDualMediaPipePose(
     camera1Landmarks,
     camera2Landmarks,
     error,
+    debugInstanceId: debugInstanceId.current,
+    debugStats: debugStatsRef,
   };
 }
