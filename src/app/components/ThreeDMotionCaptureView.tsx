@@ -83,10 +83,12 @@ export function ThreeDMotionCaptureView() {
           </Card>
         )}
 
-        {/* Always-mounted hidden videos — keeps streams alive across tab switches */}
-        <div className="hidden" aria-hidden="true">
-          <video ref={camera1Ref} autoPlay playsInline muted />
-          <video ref={camera2Ref} autoPlay playsInline muted />
+        {/* Always-mounted off-screen videos — keeps streams alive for MediaPipe across tab switches.
+            position:fixed + left/top far off-screen rather than display:none so the browser
+            still decodes frames (readyState advances) and rVFC continues firing. */}
+        <div aria-hidden="true" style={{ position: 'fixed', left: -9999, top: -9999, width: 1, height: 1, overflow: 'hidden', pointerEvents: 'none' }}>
+          <video ref={camera1Ref} autoPlay playsInline muted style={{ width: 1, height: 1 }} />
+          <video ref={camera2Ref} autoPlay playsInline muted style={{ width: 1, height: 1 }} />
         </div>
 
         <Tabs defaultValue="cameras" className="w-full">
@@ -254,7 +256,7 @@ export function ThreeDMotionCaptureView() {
                 <h4 className="font-semibold mb-3">Camera 1 Feed</h4>
                 <div className="relative bg-black rounded-lg overflow-hidden" style={{ aspectRatio: '16/9' }}>
                   <video
-                    ref={(el) => { if (el && camera1Stream) el.srcObject = camera1Stream; }}
+                    ref={(el) => { if (el && el.srcObject !== camera1Stream) el.srcObject = camera1Stream; }}
                     autoPlay playsInline muted
                     className="w-full h-full object-contain"
                   />
@@ -270,7 +272,7 @@ export function ThreeDMotionCaptureView() {
                 <h4 className="font-semibold mb-3">Camera 2 Feed</h4>
                 <div className="relative bg-black rounded-lg overflow-hidden" style={{ aspectRatio: '16/9' }}>
                   <video
-                    ref={(el) => { if (el && camera2Stream) el.srcObject = camera2Stream; }}
+                    ref={(el) => { if (el && el.srcObject !== camera2Stream) el.srcObject = camera2Stream; }}
                     autoPlay playsInline muted
                     className="w-full h-full object-contain"
                   />

@@ -95,10 +95,12 @@ export function FailureCorrectionLabView() {
           </Card>
         )}
 
-        {/* Hidden videos that keep streams alive across inner tab switches */}
-        <div className="hidden" aria-hidden="true">
-          <video ref={camera1Ref} autoPlay playsInline muted />
-          <video ref={camera2Ref} autoPlay playsInline muted />
+        {/* Off-screen videos that keep streams alive for MediaPipe across inner tab switches.
+            position:fixed + far off-screen rather than display:none so browsers keep decoding
+            frames (readyState advances) and rVFC continues firing. */}
+        <div aria-hidden="true" style={{ position: 'fixed', left: -9999, top: -9999, width: 1, height: 1, overflow: 'hidden', pointerEvents: 'none' }}>
+          <video ref={camera1Ref} autoPlay playsInline muted style={{ width: 1, height: 1 }} />
+          <video ref={camera2Ref} autoPlay playsInline muted style={{ width: 1, height: 1 }} />
         </div>
 
         <Tabs defaultValue="cameras" className="w-full">
@@ -245,7 +247,7 @@ export function FailureCorrectionLabView() {
               <Card className="bg-gray-900 border-gray-700 p-4">
                 <h4 className="font-semibold mb-3">Camera 1 Feed</h4>
                 <div className="relative bg-black rounded-lg overflow-hidden" style={{ aspectRatio: '16/9' }}>
-                  <video ref={(el) => { if (el && camera1Stream) el.srcObject = camera1Stream; }}
+                  <video ref={(el) => { if (el && el.srcObject !== camera1Stream) el.srcObject = camera1Stream; }}
                     autoPlay playsInline muted className="w-full h-full object-contain" />
                   {!isCamera1Active && (
                     <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-sm">
@@ -257,7 +259,7 @@ export function FailureCorrectionLabView() {
               <Card className="bg-gray-900 border-gray-700 p-4">
                 <h4 className="font-semibold mb-3">Camera 2 Feed</h4>
                 <div className="relative bg-black rounded-lg overflow-hidden" style={{ aspectRatio: '16/9' }}>
-                  <video ref={(el) => { if (el && camera2Stream) el.srcObject = camera2Stream; }}
+                  <video ref={(el) => { if (el && el.srcObject !== camera2Stream) el.srcObject = camera2Stream; }}
                     autoPlay playsInline muted className="w-full h-full object-contain" />
                   {!isCamera2Active && (
                     <div className="absolute inset-0 flex items-center justify-center text-gray-500 text-sm">

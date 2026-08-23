@@ -100,7 +100,7 @@ export function CalibrationView({
     loadCalibration,
   } = useCameraCalibration();
 
-  const { isLoaded: cvLoaded, isLoading: cvLoading } = useOpenCV();
+  const { isLoaded: cvLoaded, isLoading: cvLoading, detectCheckerboard } = useOpenCV();
 
   const [checkerboardRows, setCheckerboardRows] = useState(5);
   const [checkerboardCols, setCheckerboardCols] = useState(8);
@@ -135,6 +135,21 @@ export function CalibrationView({
     ctx1.drawImage(v1, 0, 0);
     ctx2.drawImage(v2, 0, 0);
 
+    // Detect checkerboard corners immediately if OpenCV is loaded.
+    // This lets the "Run Calibration" button become enabled without requiring
+    // an export → re-import round-trip.
+    const patternSize = { width: checkerboardCols - 1, height: checkerboardRows - 1 };
+    let corners1: number[][] | undefined;
+    let corners2: number[][] | undefined;
+    let found1 = false;
+    let found2 = false;
+    if (cvLoaded) {
+      const r1 = detectCheckerboard(ctx1.getImageData(0, 0, w1, h1), patternSize);
+      const r2 = detectCheckerboard(ctx2.getImageData(0, 0, w2, h2), patternSize);
+      found1 = r1.found; corners1 = r1.corners;
+      found2 = r2.found; corners2 = r2.corners;
+    }
+
     const ts = Date.now();
 
     const image1: CalibrationImage = {
@@ -142,7 +157,8 @@ export function CalibrationView({
       cameraId: 1,
       timestamp: ts,
       imageData: c1.toDataURL('image/jpeg', 0.85),
-      cornersDetected: false,
+      cornersDetected: found1,
+      corners: corners1,
       imageWidth: w1,
       imageHeight: h1,
     };
@@ -152,7 +168,8 @@ export function CalibrationView({
       cameraId: 2,
       timestamp: ts,
       imageData: c2.toDataURL('image/jpeg', 0.85),
-      cornersDetected: false,
+      cornersDetected: found2,
+      corners: corners2,
       imageWidth: w2,
       imageHeight: h2,
     };
@@ -162,7 +179,7 @@ export function CalibrationView({
       timestamp: ts,
       camera1Image: image1,
       camera2Image: image2,
-      bothCornersDetected: false,
+      bothCornersDetected: found1 && found2,
     });
   };
 
@@ -391,7 +408,7 @@ export function CalibrationView({
               <p className="text-sm text-gray-400 mb-2">{label}</p>
               <div className="relative bg-black rounded-lg overflow-hidden" style={{ aspectRatio: '16/9' }}>
                 <video
-                  ref={(el) => { if (el && stream) el.srcObject = stream; }}
+                  ref={(el) => { if (el && el.srcObject !== stream) el.srcObject = stream; }}
                   autoPlay playsInline muted
                   className="w-full h-full object-contain"
                   style={{ transform: 'scaleX(-1)' }}
