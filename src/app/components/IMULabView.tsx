@@ -5,7 +5,6 @@
  *
  * Phase B adds:
  *   - Real IMU reconstruction using relative quaternion rotation + forward kinematics
- *   - Freeze Vision Reference dev toggle
  *   - Angular error metrics (stereo direction vs IMU direction per segment)
  *   - Extended reconstruction debug panel
  *
@@ -15,6 +14,16 @@
  *   - Reconstruction runs once per stereo frame inside onCorrectedPose.
  *   - All hot-path writes go to refs; React state syncs at 10fps.
  *   - Quaternion math only — no Euler intermediates in reconstruction path.
+ *
+ * Anchor rule (applies to all future segments):
+ *   IMU encodes ROTATION, not POSITION. Every segment needs a live stereo anchor
+ *   joint to pin it in world space:
+ *     Right arm  → right shoulder must be visible
+ *     Left arm   → left shoulder must be visible
+ *     Right leg  → right hip must be visible  (future)
+ *     Left leg   → left hip must be visible   (future; user: "both hips" required)
+ *   If the anchor is lost, reconstruction for that segment is suppressed entirely.
+ *   IMU fills in OCCLUDED distal joints (elbow, wrist) when the anchor is still seen.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Card } from './ui/card';
@@ -42,7 +51,7 @@ import {
 } from '../utils/quaternionUtils';
 import {
   Video, VideoOff, AlertCircle, RefreshCw, Circle, Square, Download,
-  Wifi, WifiOff, Activity, ChevronDown, ChevronUp, Snowflake,
+  Wifi, WifiOff, Activity, ChevronDown, ChevronUp,
 } from 'lucide-react';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -329,7 +338,6 @@ interface CalibConditionDebug {
   tracked: number; segOk: boolean; uaLenMm: number; faLenMm: number;
   /** Lenient jitter gate used for calibration (light_jitter OK, heavy_jitter blocks). */
   armCalibOk: boolean;
-  posVelocityOk: boolean;
   imu01Fresh: boolean; imu02Fresh: boolean; imu01AgeMs: number; imu02AgeMs: number;
 }
 
@@ -384,22 +392,36 @@ export function IMULabView() {
   const [imuReconDebug, setImuReconDebug]   = useState<ReconDebug | null>(null);
 
   // ── Calibration ──────────────────────────────────────────────────────────────
-  const [calibStatus, setCalibStatus]       = useState<'idle' | 'collecting' | 'done'>('idle');
+  const [calibStatus, setCalibStatus]       = useState<'idle' | 'countdown' | 'collecting' | 'done'>('idle');
   const [calibFrames, setCalibFrames]       = useState<CalibrationFrame[]>([]);
   const [armCalibration, setArmCalibration] = useState<ArmCalibration | null>(null);
+  const [countdownSec, setCountdownSec]     = useState(0);
   const calibFramesRef    = useRef<CalibrationFrame[]>([]);
   const armCalibrationRef = useRef<ArmCalibration | null>(null);
   useEffect(() => { armCalibrationRef.current = armCalibration; }, [armCalibration]);
+
+  // 5-second countdown before frame collection begins
+  useEffect(() => {
+    if (calibStatus !== 'countdown') return;
+    let remaining = 5;
+    setCountdownSec(remaining);
+    const id = setInterval(() => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        clearInterval(id);
+        setCalibStatus('collecting');
+      } else {
+        setCountdownSec(remaining);
+      }
+    }, 1000);
+    return () => clearInterval(id);
+  }, [calibStatus]);
 
   // ── Last Reliable Vision ─────────────────────────────────────────────────────
   const [lastReliable, setLastReliable]   = useState<LastReliableVision | null>(null);
   const lastReliableRef       = useRef<LastReliableVision | null>(null);
   const lastReliableUpdateRef = useRef(0);
 
-  // ── Freeze Vision Reference dev toggle ───────────────────────────────────────
-  const [freezeReference, setFreezeReference] = useState(false);
-  const freezeReferenceRef = useRef(false);
-  useEffect(() => { freezeReferenceRef.current = freezeReference; }, [freezeReference]);
 
   // ── Per-frame calibration condition debug ────────────────────────────────────
   const calibCondDebugRef = useRef<CalibConditionDebug | null>(null);
@@ -471,13 +493,15 @@ export function IMULabView() {
       segOk && rightArmClean && segCalibOk && posVelocityOk;
 
     // Lenient arm validity — gates calibration frame collection
-    // Does NOT require rightArmClean so minor jitter during T-pose doesn't block calibration.
+    // posVelocityOk intentionally omitted: it checks distance vs lastReliableRef, which creates
+    // a deadlock when the wrist briefly leaves frame and returns at a new position. segOk and
+    // rightArmCalibOk are sufficient to validate geometry for calibration purposes.
     // segCalibOk intentionally omitted: no prior calibration exists yet on first run.
     const calibArmOk = shoulderOk && elbowOk && wristOk && tracked >= 3 &&
-      segOk && rightArmCalibOk && posVelocityOk;
+      segOk && rightArmCalibOk;
 
     // ── Update Last Reliable Vision (strict gate, position-anchor only) ──────
-    if (armReliable && shoulder && elbow && wrist && !freezeReferenceRef.current) {
+    if (armReliable && shoulder && elbow && wrist) {
       const imu01Raw = getRawIMURef.current('imu_01');
       const imu02Raw = getRawIMURef.current('imu_02');
       const imu01Quat: Quaternion | null = imu01Raw?.latest ? packetToQuat(imu01Raw.latest) : null;
@@ -510,7 +534,6 @@ export function IMULabView() {
         shoulderOk, elbowOk, wristOk, tracked,
         segOk, uaLenMm: uaLen, faLenMm: faLen,
         armCalibOk: rightArmCalibOk,
-        posVelocityOk,
         // Freshness threshold matches the "online" health threshold in useIMUWebSocket
         imu01Fresh: imu01Age <= 500, imu02Fresh: imu02Age <= 500,
         imu01AgeMs: isFinite(imu01Age) ? Math.round(imu01Age) : 9999,
@@ -559,6 +582,18 @@ export function IMULabView() {
       return;
     }
 
+    // Shoulder MUST be visible to stereo — it is the ONLY valid position anchor.
+    // IMU quaternions encode rotation, not position. Without a real-time stereo shoulder
+    // we cannot accurately place the arm in world space, so reconstruction stops entirely.
+    // (A stale calibration or last-reliable shoulder would place the arm at the wrong
+    // world position if the person has moved since that reference was captured.)
+    if (!isValidVec(shoulder)) {
+      imuReconPoseRef.current = null;
+      imuReconDebugRef.current = { ua: emptySegDebug(), fa: emptySegDebug() };
+      return;
+    }
+    const anchorShoulder = shoulder!;
+
     // imu_01 controls upper arm — required for any reconstruction
     const imu01Raw = getRawIMURef.current('imu_01');
     const imu01Packet = imu01Raw?.latest;
@@ -581,12 +616,6 @@ export function IMULabView() {
       calib.upperArm.directionNorm.z,
     ];
     const dirCurrentUA = rotateVectorByQuaternion(deltaQUA, calibDirUA);
-
-    // Shoulder anchor: prefer live stereo (keeps arm grounded as person moves),
-    // fall back to last-reliable shoulder, then calibration shoulder.
-    const anchorShoulder = isValidVec(shoulder)
-      ? shoulder!
-      : (lastReliableRef.current?.upperArm.shoulder ?? calib.upperArm.shoulderPos);
 
     const uaLength = calib.upperArm.lengthMm;
     const reconElbow = {
@@ -722,11 +751,10 @@ export function IMULabView() {
   const startCalibration = useCallback(() => {
     calibFramesRef.current = [];
     setCalibFrames([]);
-    // Reset the reliable-vision reference so posVelocityOk starts true on the first
-    // T-pose frame. Without this, moving the arm > 120mm into T-pose deadlocks the
-    // velocity gate because lastReliableRef still points at the pre-calibration position.
+    // Reset reliable-vision reference so posVelocityOk starts true once collecting begins.
     lastReliableRef.current = null;
-    setCalibStatus('collecting');
+    // Countdown state — frames don't collect until the 5-second timer elapses.
+    setCalibStatus('countdown');
   }, []);
 
   const clearCalibration = useCallback(() => {
@@ -827,14 +855,12 @@ export function IMULabView() {
             {imuReconPose && (
               <Badge className="bg-orange-700">IMU Recon Active</Badge>
             )}
-            {freezeReference && (
-              <Badge className="bg-amber-700 flex items-center gap-1">
-                <Snowflake className="h-3 w-3" />Vision Frozen
-              </Badge>
-            )}
           </div>
           <p className="text-gray-400 text-sm mt-1">
-            Phase B · Corrected stereo vs IMU reconstruction · native quaternion forward kinematics
+            Phase B · Stereo anchors + IMU occlusion fill · quaternion forward kinematics
+          </p>
+          <p className="text-gray-600 text-xs mt-0.5">
+            Right shoulder must remain visible — IMU fills occluded elbow / wrist from the shoulder anchor
           </p>
         </div>
 
@@ -996,7 +1022,7 @@ export function IMULabView() {
           {/* ── IMU ─────────────────────────────────────────────────── */}
           <TabsContent value="imu" className="space-y-6">
 
-            {/* Connection + Freeze Reference */}
+            {/* IMU Connection */}
             <Card className="bg-gray-900 border-gray-700 p-4">
               <div className="flex items-center justify-between flex-wrap gap-3">
                 <div className="flex items-center gap-3">
@@ -1010,29 +1036,10 @@ export function IMULabView() {
                     <p className="text-xs text-gray-400">ws://localhost:8765 · native BNO085 quaternion</p>
                   </div>
                 </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    onClick={() => setFreezeReference(v => !v)}
-                    variant={freezeReference ? 'default' : 'outline'}
-                    size="sm"
-                    className={freezeReference
-                      ? 'bg-amber-700 hover:bg-amber-600 text-white border-amber-600'
-                      : 'border-gray-600 text-gray-300'}
-                  >
-                    <Snowflake className="h-3.5 w-3.5 mr-1.5" />
-                    {freezeReference ? 'Resume Vision Reference' : 'Freeze Vision Reference'}
-                  </Button>
-                  <Button variant="outline" size="sm" onClick={reconnectIMU} className="border-gray-600">
-                    <RefreshCw className="h-4 w-4 mr-2" /> Reconnect
-                  </Button>
-                </div>
+                <Button variant="outline" size="sm" onClick={reconnectIMU} className="border-gray-600">
+                  <RefreshCw className="h-4 w-4 mr-2" /> Reconnect
+                </Button>
               </div>
-              {freezeReference && (
-                <div className="mt-3 p-2 bg-amber-900/20 border border-amber-800 rounded text-xs text-amber-300">
-                  Vision reference is frozen. IMU reconstruction continues updating from the frozen anchor.
-                  Use this to validate IMU tracking without physically blocking the cameras.
-                </div>
-              )}
             </Card>
 
             {/* IMU Health Panel */}
@@ -1065,10 +1072,30 @@ export function IMULabView() {
                 ))}
               </div>
 
+              {/* ── Countdown ── */}
+              {calibStatus === 'countdown' && (
+                <div className="mb-4 p-4 bg-amber-900/20 border border-amber-700 rounded flex items-center gap-5">
+                  <div className="flex-shrink-0 w-16 h-16 rounded-full bg-amber-800/50 border-2 border-amber-500
+                    flex items-center justify-center">
+                    <span className="text-4xl font-bold text-amber-300 tabular-nums leading-none">
+                      {countdownSec}
+                    </span>
+                  </div>
+                  <div>
+                    <p className="text-sm font-semibold text-amber-300 mb-1">Get into T-Pose</p>
+                    <p className="text-xs text-amber-400 leading-relaxed">
+                      Stand with arms straight out to the sides, palms facing down.<br />
+                      Hold still — capture begins when the timer reaches zero.
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Collecting ── */}
               {calibStatus === 'collecting' && (
                 <div className="mb-4 p-3 bg-blue-900/20 border border-blue-800 rounded">
-                  <p className="text-sm text-blue-300 font-semibold mb-1">Hold T-Pose</p>
-                  <p className="text-xs text-blue-400 mb-2">Stand with arms straight out, palms down. Keep still.</p>
+                  <p className="text-sm text-blue-300 font-semibold mb-1">Hold T-Pose — Capturing</p>
+                  <p className="text-xs text-blue-400 mb-2">Keep still. Frames are being captured.</p>
                   <div className="flex items-center gap-3 mb-3">
                     <div className="flex-1 bg-gray-800 rounded-full h-2">
                       <div className="bg-blue-500 h-2 rounded-full transition-all"
@@ -1089,7 +1116,6 @@ export function IMULabView() {
                           { label: `Joints tracked ≥ 3 (now: ${calibCondDebug.tracked})`, ok: calibCondDebug.tracked >= 3 },
                           { label: `Seg lengths OK  UA:${calibCondDebug.uaLenMm.toFixed(0)} FA:${calibCondDebug.faLenMm.toFixed(0)} mm`, ok: calibCondDebug.segOk },
                           { label: 'No heavy jitter (light jitter OK)', ok: calibCondDebug.armCalibOk },
-                          { label: 'Arm velocity OK (< 120 mm/frame)', ok: calibCondDebug.posVelocityOk },
                           { label: `IMU-01 fresh  (${calibCondDebug.imu01AgeMs} ms)`, ok: calibCondDebug.imu01Fresh },
                           { label: `IMU-02 fresh  (${calibCondDebug.imu02AgeMs} ms)`, ok: calibCondDebug.imu02Fresh },
                         ].map(({ label, ok }) => (
@@ -1108,8 +1134,12 @@ export function IMULabView() {
               {armCalibration && (() => {
                 const ua = armCalibration.upperArm;
                 const fa = armCalibration.forearm;
-                const stddevBad  = ua.lengthStdDevMm > 15 || fa.lengthStdDevMm > 15;
-                const stddevWarn = ua.lengthStdDevMm > 5  || fa.lengthStdDevMm > 5;
+                // Thresholds are intentionally generous — webcam stereo at typical working
+                // distances routinely produces 10–30 mm frame-to-frame scatter. Calibration
+                // still uses the median length (robust to outliers) so moderate std dev
+                // does not meaningfully hurt reconstruction accuracy.
+                const stddevBad  = ua.lengthStdDevMm > 50 || fa.lengthStdDevMm > 50;
+                const stddevWarn = ua.lengthStdDevMm > 20 || fa.lengthStdDevMm > 20;
                 const accBad     = ua.imuAccuracy === 0 || fa.imuAccuracy === 0;
                 const accWarn    = ua.imuAccuracy === 1 || fa.imuAccuracy === 1;
                 const quality: 'good' | 'warning' | 'failed' =
@@ -1148,7 +1178,7 @@ export function IMULabView() {
                           </div>
                           <div className="flex justify-between">
                             <span className="text-gray-500">Std Dev</span>
-                            <span className={`tabular-nums font-mono ${stdDev > 10 ? 'text-red-400' : stdDev > 5 ? 'text-yellow-400' : 'text-green-400'}`}>
+                            <span className={`tabular-nums font-mono ${stdDev > 50 ? 'text-red-400' : stdDev > 20 ? 'text-yellow-400' : 'text-green-400'}`}>
                               {fmtStd(stdDev)}
                             </span>
                           </div>
@@ -1178,14 +1208,14 @@ export function IMULabView() {
                       <span>Status: <span className={qs.text}>{quality.toUpperCase()}</span></span>
                       {quality === 'warning' && (
                         <span className="text-yellow-500">
-                          {stddevWarn && !stddevBad ? 'High variability — consider recalibrating. ' : ''}
-                          {accWarn && !accBad ? 'Low IMU accuracy — move away from metal/magnets.' : ''}
+                          {stddevWarn && !stddevBad ? 'Moderate stereo noise — reconstruction will work; recalibrate closer to cameras for better accuracy. ' : ''}
+                          {accWarn && !accBad ? 'Low IMU accuracy — move away from metal objects/magnets and let the sensor stabilise.' : ''}
                         </span>
                       )}
                       {quality === 'failed' && (
                         <span className="text-red-400">
-                          {stddevBad ? 'Stereo noise too high — check calibration and camera stability. ' : ''}
-                          {accBad ? 'IMU accuracy = Unreliable — sensor not calibrated.' : ''}
+                          {stddevBad ? 'Very high stereo noise (> 50 mm std dev) — segment lengths are unreliable. Stand closer to cameras, improve lighting, or recalibrate stereo. ' : ''}
+                          {accBad ? 'IMU accuracy = Unreliable — rotate the sensor through a figure-eight to recalibrate its magnetometer.' : ''}
                         </span>
                       )}
                     </div>
@@ -1194,10 +1224,15 @@ export function IMULabView() {
               })()}
 
               <div className="flex gap-2">
-                <Button onClick={startCalibration} disabled={!canCalibrate || calibStatus === 'collecting'}
+                <Button
+                  onClick={startCalibration}
+                  disabled={!canCalibrate || calibStatus === 'countdown' || calibStatus === 'collecting'}
                   className="bg-blue-700 hover:bg-blue-600 text-sm"
-                  title={!canCalibrate ? 'All conditions must be met' : undefined}>
-                  {calibStatus === 'collecting' ? 'Collecting...' : 'Calibrate Right Arm'}
+                  title={!canCalibrate ? 'All conditions must be met' : undefined}
+                >
+                  {calibStatus === 'countdown'  ? `Get Ready… ${countdownSec}` :
+                   calibStatus === 'collecting' ? 'Collecting...' :
+                   'Calibrate Right Arm'}
                 </Button>
                 <Button variant="outline" onClick={clearCalibration}
                   className="border-gray-600 text-gray-300 hover:bg-red-900/20 text-sm">
@@ -1282,7 +1317,6 @@ export function IMULabView() {
                         ['imu_01 status',      imuStates['imu_01']?.health ?? '—'],
                         ['imu_02 status',      imuStates['imu_02']?.health ?? '—'],
                         ['IMU recon active',   imuReconPose ? 'yes' : 'no'],
-                        ['Vision frozen',      String(freezeReference)],
                         ['Active tab',         activeInnerTab],
                         ['Last reliable',      lastReliable ? new Date(lastReliable.timestamp).toLocaleTimeString() : 'Never'],
                       ] as [string, string][]).map(([label, value]) => (
