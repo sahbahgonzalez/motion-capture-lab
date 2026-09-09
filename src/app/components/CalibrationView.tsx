@@ -100,7 +100,7 @@ export function CalibrationView({
     loadCalibration,
   } = useCameraCalibration();
 
-  const { isLoaded: cvLoaded, isLoading: cvLoading, detectCheckerboard } = useOpenCV();
+  const { isLoaded: cvLoaded, isLoading: cvLoading } = useOpenCV();
 
   const [checkerboardRows, setCheckerboardRows] = useState(5);
   const [checkerboardCols, setCheckerboardCols] = useState(8);
@@ -115,39 +115,54 @@ export function CalibrationView({
   const calibFileRef = useRef<HTMLInputElement>(null);
   const capturesFileRef = useRef<HTMLInputElement>(null);
 
-  const captureFrame = () => {
-    const v1 = camera1Ref.current;
-    const v2 = camera2Ref.current;
-    if (!v1 || !v2 || !canvas1Ref.current || !canvas2Ref.current) return;
+  // Capture one frame from a live MediaStream into a canvas.
+  // Creates a temporary video element to ensure we get a real decoded frame
+  // regardless of how the processing video elements are sized or positioned.
+  const grabStreamFrame = (
+    stream: MediaStream,
+    canvas: HTMLCanvasElement,
+  ): Promise<{ dataURL: string; width: number; height: number }> =>
+    new Promise((resolve, reject) => {
+      const v = document.createElement('video');
+      v.muted = true;
+      v.playsInline = true;
+      v.srcObject = stream;
 
-    const c1 = canvas1Ref.current;
-    const c2 = canvas2Ref.current;
-    const ctx1 = c1.getContext('2d');
-    const ctx2 = c2.getContext('2d');
-    if (!ctx1 || !ctx2) return;
+      const draw = () => {
+        const w = v.videoWidth;
+        const h = v.videoHeight;
+        if (!w || !h) { reject(new Error('No video dimensions')); return; }
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d')!.drawImage(v, 0, 0);
+        v.srcObject = null;
+        resolve({ dataURL: canvas.toDataURL('image/jpeg', 0.85), width: w, height: h });
+      };
 
-    const w1 = v1.videoWidth, h1 = v1.videoHeight;
-    const w2 = v2.videoWidth, h2 = v2.videoHeight;
-    if (!w1 || !h1 || !w2 || !h2) return;
+      const vid = v as HTMLVideoElement & { requestVideoFrameCallback?: (cb: () => void) => void };
+      if (vid.requestVideoFrameCallback) {
+        vid.play().then(() => vid.requestVideoFrameCallback!(draw)).catch(reject);
+      } else {
+        vid.oncanplay = () => vid.play().then(draw).catch(reject);
+      }
+      v.onerror = () => reject(new Error('Video element error during capture'));
+    });
 
-    c1.width = w1; c1.height = h1;
-    c2.width = w2; c2.height = h2;
-    ctx1.drawImage(v1, 0, 0);
-    ctx2.drawImage(v2, 0, 0);
+  const captureFrame = async () => {
+    if (!camera1Stream || !camera2Stream) return;
+    if (!canvas1Ref.current || !canvas2Ref.current) return;
 
-    // Detect checkerboard corners immediately if OpenCV is loaded.
-    // This lets the "Run Calibration" button become enabled without requiring
-    // an export → re-import round-trip.
-    const patternSize = { width: checkerboardCols - 1, height: checkerboardRows - 1 };
-    let corners1: number[][] | undefined;
-    let corners2: number[][] | undefined;
-    let found1 = false;
-    let found2 = false;
-    if (cvLoaded) {
-      const r1 = detectCheckerboard(ctx1.getImageData(0, 0, w1, h1), patternSize);
-      const r2 = detectCheckerboard(ctx2.getImageData(0, 0, w2, h2), patternSize);
-      found1 = r1.found; corners1 = r1.corners;
-      found2 = r2.found; corners2 = r2.corners;
+    let r1: { dataURL: string; width: number; height: number };
+    let r2: { dataURL: string; width: number; height: number };
+
+    try {
+      [r1, r2] = await Promise.all([
+        grabStreamFrame(camera1Stream, canvas1Ref.current),
+        grabStreamFrame(camera2Stream, canvas2Ref.current),
+      ]);
+    } catch (err) {
+      console.error('Capture failed:', err);
+      return;
     }
 
     const ts = Date.now();
@@ -156,22 +171,20 @@ export function CalibrationView({
       id: `cam1_${ts}`,
       cameraId: 1,
       timestamp: ts,
-      imageData: c1.toDataURL('image/jpeg', 0.85),
-      cornersDetected: found1,
-      corners: corners1,
-      imageWidth: w1,
-      imageHeight: h1,
+      imageData: r1.dataURL,
+      cornersDetected: false,
+      imageWidth: r1.width,
+      imageHeight: r1.height,
     };
 
     const image2: CalibrationImage = {
       id: `cam2_${ts}`,
       cameraId: 2,
       timestamp: ts,
-      imageData: c2.toDataURL('image/jpeg', 0.85),
-      cornersDetected: found2,
-      corners: corners2,
-      imageWidth: w2,
-      imageHeight: h2,
+      imageData: r2.dataURL,
+      cornersDetected: false,
+      imageWidth: r2.width,
+      imageHeight: r2.height,
     };
 
     addCapture({
@@ -179,7 +192,7 @@ export function CalibrationView({
       timestamp: ts,
       camera1Image: image1,
       camera2Image: image2,
-      bothCornersDetected: found1 && found2,
+      bothCornersDetected: false,
     });
   };
 
@@ -408,7 +421,7 @@ export function CalibrationView({
               <p className="text-sm text-gray-400 mb-2">{label}</p>
               <div className="relative bg-black rounded-lg overflow-hidden" style={{ aspectRatio: '16/9' }}>
                 <video
-                  ref={(el) => { if (el && el.srcObject !== stream) el.srcObject = stream; }}
+                  ref={(el) => { if (el && stream) el.srcObject = stream; }}
                   autoPlay playsInline muted
                   className="w-full h-full object-contain"
                   style={{ transform: 'scaleX(-1)' }}
