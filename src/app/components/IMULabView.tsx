@@ -3,24 +3,36 @@
  *
  * "3D Failure Correction + IMU" tab.
  *
- * Phase C replaces the 2-pose ΔQ relative reconstruction with a 4-pose
- * sensor-to-bone absolute reconstruction:
+ * CALIBRATION (3 poses) — alternating least-squares (ALS):
+ *   Model: d_stereo_i ≈ A * R(q_i) * b_sensor
+ *     A         = rotation from IMU world frame → stereo world frame
+ *     R(q_i)    = rotation matrix of BNO085 quaternion (maps sensor → IMU world)
+ *     b_sensor  = fixed bone direction in sensor frame
  *
- *   CALIBRATION (4 poses):
- *     Each pose provides observed stereo bone directions + IMU quaternions.
- *     For every frame: boneLocalDir = rotate(inv(q_imu), stereoDir_world)
- *     All observations averaged → fixed sensor-frame bone direction per IMU.
+ *   Pose 1: T-pose lateral (arm straight and lateral — constrains UA and FA)
+ *   Pose 2: Raised straight arm (~45–60° elevation, elbow straight — second UA orientation)
+ *   Pose 3: Forearm up (upper arm lateral, elbow ~90°, forearm upward — second FA orientation)
  *
- *   RUNTIME:
- *     worldDir_UA = rotate(q_imu01_current, uaBoneLocalDir)
- *     elbow = shoulder + uaLength × worldDir_UA
- *     worldDir_FA = rotate(q_imu02_current, faBoneLocalDir)
- *     wrist = elbow + faLength × worldDir_FA
+ *   ALS algorithm (per segment, using all frames from all poses):
+ *     Initialize A from gravity constraint: A_init maps IMU-world [0,0,-1] → stereo [0,1,0]
+ *     Iterate until convergence (or max 30 iters):
+ *       b-step: b = normalize(Σ R(q_i)^T * A^T * d_i)
+ *       A-step: s_i = R(q_i)*b; A = Wahba/Kabsch SVD on {(s_i, d_i)} + gravity regularizer
+ *     Gravity regularizer: add (s=[0,0,-1], d=[0,1,0]) with weight 5
  *
- *   No ΔQ. No hinge axis. No LastReliableVision for orientation.
- *   Shoulder live stereo position is the only positional anchor.
+ *   BNO085 convention: ENU/Z-up. World gravity = [0, 0, -1].
+ *   Stereo/OpenCV convention: X=right, Y=down, Z=depth. World gravity = [0, 1, 0].
+ *
+ * RUNTIME (unchanged):
+ *   worldDir_UA = normalize(A_ua * rotate(q_imu01, uaBoneLocalDir))
+ *   elbow = shoulder + uaLength × worldDir_UA
+ *   worldDir_FA = normalize(A_fa * rotate(q_imu02, faBoneLocalDir))
+ *   wrist = elbow + faLength × worldDir_FA
+ *
+ *   No ΔQ. No hinge axis. Shoulder stereo position is the only positional anchor.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { Matrix, SVD } from 'ml-matrix';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Badge } from './ui/badge';
@@ -200,8 +212,11 @@ function checkStability(
  * Check that the current stereo geometry matches the expected calibration pose.
  * Returns a human-readable rejection reason, or null if the pose is valid.
  *
- * Stereo coordinate convention (from SVG projection labels):
- *   X = lateral, Y = vertical (positive = down in image), Z = depth
+ * Stereo coordinate convention: X = lateral, Y = vertical (positive = down), Z = depth.
+ *
+ * Pose 0: T-pose lateral — arm straight, pointing to the side.
+ * Pose 1: Raised straight arm — arm still straight, elevated 20–80° from T-pose.
+ * Pose 2: Forearm up — upper arm lateral (≈ T-pose), elbow bent ~90° with forearm upward.
  */
 function checkPoseGeometry(
   poseIdx: number,
@@ -211,10 +226,7 @@ function checkPoseGeometry(
   pose1Dirs: {ua:{x:number;y:number;z:number}; fa:{x:number;y:number;z:number}} | null,
 ): string | null {
   if (poseIdx === 0) {
-    // Right-arm-only development mode: the first calibration pose is a simple T-pose.
-    // Accept a straight arm when the upper arm points mostly lateral and the forearm
-    // remains aligned with it, even if the system is not yet doing the full 3-pose
-    // multi-configuration validation.
+    // T-pose: arm straight and lateral.
     if (armStraightAngle > 35) return `Arm not straight (${armStraightAngle.toFixed(0)}°) — keep the right arm straight in a T-pose`;
     if (Math.abs(uaDir.x) < 0.25) return `Arm not lateral (|x|=${Math.abs(uaDir.x).toFixed(2)}) — extend the right arm to the side`;
     if (Math.abs(uaDir.y) > 0.75 || Math.abs(uaDir.z) > 0.75) return `Arm not level to the side (UA dir = x${uaDir.x.toFixed(2)} y${uaDir.y.toFixed(2)} z${uaDir.z.toFixed(2)})`;
@@ -222,18 +234,22 @@ function checkPoseGeometry(
     return null;
   }
   if (poseIdx === 1) {
-    if (armStraightAngle > 28) return `Arm not straight (${armStraightAngle.toFixed(0)}°) — extend arm fully`;
-    if (Math.abs(uaDir.z) < 0.35) return `Arm not forward enough (|z|=${Math.abs(uaDir.z).toFixed(2)}) — point arm toward camera`;
+    // Raised straight arm: elbow must stay straight, arm must be elevated from T-pose.
+    if (armStraightAngle > 35) return `Arm not straight (${armStraightAngle.toFixed(0)}°) — keep the elbow straight while raising the arm`;
+    if (Math.abs(uaDir.z) > 0.65) return `Arm pointing too far forward/back (UA z=${uaDir.z.toFixed(2)}) — raise arm in the frontal plane`;
     if (pose1Dirs) {
-      const diff = angleBetweenDeg(uaDir, pose1Dirs.ua);
-      if (diff < 25) return `Too similar to Pose 1 (${diff.toFixed(0)}°) — point arm more directly forward`;
+      const uaDrift = angleBetweenDeg(uaDir, pose1Dirs.ua);
+      if (uaDrift < 20) return `Arm not elevated enough (${uaDrift.toFixed(0)}° from T-pose) — raise the arm at least 20°`;
+      if (uaDrift > 80) return `Arm elevated too far (${uaDrift.toFixed(0)}° from T-pose) — lower slightly`;
     }
     return null;
   }
   if (poseIdx === 2) {
+    // Forearm up: upper arm stays lateral, elbow bent ~90°, forearm points upward.
+    if (armStraightAngle < 35 || armStraightAngle > 140) return `Forearm not bent upward enough (${armStraightAngle.toFixed(0)}°) — bend the elbow so the forearm points up`;
     if (pose1Dirs) {
       const uaDiff = angleBetweenDeg(uaDir, pose1Dirs.ua);
-      if (uaDiff > 40) return `Upper arm drifted (${uaDiff.toFixed(0)}° from T-pose) — keep upper arm lateral`;
+      if (uaDiff > 40) return `Upper arm drifted (${uaDiff.toFixed(0)}° from T-pose) — keep the upper arm lateral`;
       const faDiff = angleBetweenDeg(faDir, pose1Dirs.fa);
       if (faDiff < 30) return `Forearm not bent upward enough (${faDiff.toFixed(0)}°) — bend elbow so forearm points up`;
     }
@@ -272,67 +288,144 @@ function transpMat3(M: Mat3): Mat3 {
   return [[M[0][0],M[1][0],M[2][0]],[M[0][1],M[1][1],M[2][1]],[M[0][2],M[1][2],M[2][2]]];
 }
 
-function matMul3(A: Mat3, B: Mat3): Mat3 {
-  const r = [[0,0,0],[0,0,0],[0,0,0]];
-  for (let i = 0; i < 3; i++)
-    for (let j = 0; j < 3; j++)
-      for (let k = 0; k < 3; k++)
-        r[i][j] += A[i][k] * B[k][j];
-  return r as unknown as Mat3;
+
+/**
+ * Weighted Wahba/Kabsch SVD: find rotation R minimizing Σ w_i ||R*s_i - d_i||^2.
+ *
+ * H = Σ w_i * s_i * d_i^T  (s on left, d on right — maximizes trace(R*H))
+ * SVD(H) = U * Σ * V^T
+ * R = V * U^T  (enforcing det = +1)
+ *
+ * Returns null if pairs is empty or SVD is degenerate.
+ */
+function wahbaFromPairs(
+  pairs: Array<{ s: {x:number;y:number;z:number}; d: {x:number;y:number;z:number}; w: number }>,
+): Mat3 | null {
+  if (pairs.length === 0) return null;
+  let h00=0,h01=0,h02=0,h10=0,h11=0,h12=0,h20=0,h21=0,h22=0;
+  for (const { s, d, w } of pairs) {
+    h00+=w*s.x*d.x; h01+=w*s.x*d.y; h02+=w*s.x*d.z;
+    h10+=w*s.y*d.x; h11+=w*s.y*d.y; h12+=w*s.y*d.z;
+    h20+=w*s.z*d.x; h21+=w*s.z*d.y; h22+=w*s.z*d.z;
+  }
+  const HM = new Matrix([[h00,h01,h02],[h10,h11,h12],[h20,h21,h22]]);
+  const svd = new SVD(HM, { autoTranspose: true });
+  let V = svd.rightSingularVectors;
+  const U = svd.leftSingularVectors;
+  const Rraw = V.mmul(U.transpose());
+  const det =
+    Rraw.get(0,0)*(Rraw.get(1,1)*Rraw.get(2,2)-Rraw.get(1,2)*Rraw.get(2,1))
+  - Rraw.get(0,1)*(Rraw.get(1,0)*Rraw.get(2,2)-Rraw.get(1,2)*Rraw.get(2,0))
+  + Rraw.get(0,2)*(Rraw.get(1,0)*Rraw.get(2,1)-Rraw.get(1,1)*Rraw.get(2,0));
+  if (det < 0) {
+    const Vf = V.clone();
+    for (let r = 0; r < 3; r++) Vf.set(r, 2, -Vf.get(r, 2));
+    V = Vf;
+  }
+  const R = V.mmul(U.transpose());
+  return [
+    [R.get(0,0),R.get(0,1),R.get(0,2)],
+    [R.get(1,0),R.get(1,1),R.get(1,2)],
+    [R.get(2,0),R.get(2,1),R.get(2,2)],
+  ];
 }
 
 /**
- * Estimate rotation R such that stereoDir_k ≈ R * imuWorldDir_k for all pairs.
+ * Alternating Least-Squares calibration solver.
  *
- * Uses the 2-vector Gram-Schmidt method: selects the two most orthogonal
- * direction pairs to build a 3D orthonormal frame in both spaces, then
- * R = b_frame * a_frame^T.  Returns IDENTITY_MAT3 (with a warning) if all
- * pairs are nearly collinear (calibration poses are not sufficiently diverse).
+ * Finds A (IMU-world→stereo rotation) and b (bone dir in sensor frame) jointly
+ * from N observations {q_i, d_i} where d_stereo_i ≈ A * R(q_i) * b_sensor.
+ *
+ * Initialization: A_init must already respect the gravity constraint
+ *   (A_init * [0,0,-1] ≈ [0,1,0]) — use [[1,0,0],[0,0,-1],[0,1,0]].
+ *
+ * Gravity regularizer: adds (s=[0,0,-1], d=[0,1,0]) with weight GRAVITY_W
+ * to the A-step Wahba solve to keep the IMU world Y-up/stereo Y-down alignment stable.
  */
-function estimateWahbaR(
-  aVecs: {x:number;y:number;z:number}[],  // directions in IMU world frame
-  bVecs: {x:number;y:number;z:number}[],  // corresponding directions in stereo world
-): { R: Mat3; collinearWarn: boolean; pair: { i: number; j: number } | null } {
-  // Find the pair (i, j) whose cross product has the largest magnitude
-  let bestMag = 0, bestI = 0, bestJ = Math.min(1, aVecs.length - 1);
-  for (let i = 0; i < aVecs.length; i++) {
-    for (let j = i + 1; j < aVecs.length; j++) {
-      const c = cross3v(normalize3(aVecs[i]), normalize3(aVecs[j]));
-      const mag = Math.sqrt(c.x*c.x + c.y*c.y + c.z*c.z);
-      if (mag > bestMag) { bestMag = mag; bestI = i; bestJ = j; }
+interface ALSObs { q: Quaternion; d: {x:number;y:number;z:number} }
+
+function solveALS(
+  obs: ALSObs[],
+  A_init: Mat3,
+): { A: Mat3; b: Vec3; converged: boolean; ok: boolean } {
+  if (obs.length < 3) return { A: A_init, b: [1,0,0], converged: false, ok: false };
+
+  const G_S = { x: 0, y: 0, z: -1 };  // gravity in IMU world (source)
+  const G_D = { x: 0, y: 1, z: 0  };  // gravity in stereo world (target)
+  const GRAVITY_W = 5;
+  const MAX_ITER = 30;
+  const TOL_DEG = 0.05;
+
+  let A: Mat3 = A_init;
+  let b: Vec3 = [1, 0, 0];
+
+  for (let iter = 0; iter < MAX_ITER; iter++) {
+    // b-step: b = normalize(Σ R(q_i)^T * A^T * d_i)
+    const A_T = transpMat3(A);
+    let bx = 0, by = 0, bz = 0;
+    for (const { q, d } of obs) {
+      const d_imu = matVec3(A_T, d);
+      const b_s = rotateVectorByQuaternion(invertQuaternion(q), [d_imu.x, d_imu.y, d_imu.z]);
+      bx += b_s[0]; by += b_s[1]; bz += b_s[2];
+    }
+    const bMag = Math.sqrt(bx*bx + by*by + bz*bz);
+    if (bMag < 1e-6) return { A, b, converged: false, ok: false };
+    b = [bx/bMag, by/bMag, bz/bMag];
+
+    // A-step: s_i = R(q_i)*b; solve A via Wahba on {(s_i, d_i)} + gravity
+    const pairs: Array<{ s: {x:number;y:number;z:number}; d: {x:number;y:number;z:number}; w: number }> = [];
+    for (const { q, d } of obs) {
+      const sv = rotateVectorByQuaternion(q, b);
+      pairs.push({ s: { x: sv[0], y: sv[1], z: sv[2] }, d, w: 1 });
+    }
+    pairs.push({ s: G_S, d: G_D, w: GRAVITY_W });
+
+    const A_new = wahbaFromPairs(pairs);
+    if (!A_new) return { A, b, converged: false, ok: false };
+
+    // Convergence: angle of relative rotation A^T * A_new
+    const trace =
+      A[0][0]*A_new[0][0] + A[1][0]*A_new[1][0] + A[2][0]*A_new[2][0]
+    + A[0][1]*A_new[0][1] + A[1][1]*A_new[1][1] + A[2][1]*A_new[2][1]
+    + A[0][2]*A_new[0][2] + A[1][2]*A_new[1][2] + A[2][2]*A_new[2][2];
+    const angleDeg = Math.acos(Math.max(-1, Math.min(1, (trace - 1) / 2))) * RAD2DEG;
+    A = A_new;
+    if (angleDeg < TOL_DEG) {
+      // Final b refinement with converged A
+      const A_Tf = transpMat3(A);
+      let bxf = 0, byf = 0, bzf = 0;
+      for (const { q, d } of obs) {
+        const d_imu = matVec3(A_Tf, d);
+        const b_s = rotateVectorByQuaternion(invertQuaternion(q), [d_imu.x, d_imu.y, d_imu.z]);
+        bxf += b_s[0]; byf += b_s[1]; bzf += b_s[2];
+      }
+      const bMagF = Math.sqrt(bxf*bxf + byf*byf + bzf*bzf);
+      if (bMagF > 1e-6) b = [bxf/bMagF, byf/bMagF, bzf/bMagF];
+      return { A, b, converged: true, ok: true };
     }
   }
 
-  if (bestMag < 0.17) { // < ~10° angular separation
-    return { R: IDENTITY_MAT3, collinearWarn: true, pair: null };
+  return { A, b, converged: false, ok: true };
+}
+
+// ── Calibration failure sentinel ─────────────────────────────────────────────
+// Thrown inside the finalization try-block when observations are mathematically
+// inconsistent. The catch block converts it to a quality:'failed' result that
+// the UI can display, rather than just resetting to idle.
+class CalibFailed extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CalibFailed';
   }
-
-  // Orthonormal basis from a-vectors
-  const a1 = normalize3(aVecs[bestI]);
-  const a2proj = dot3(normalize3(aVecs[bestJ]), a1);
-  const a2 = normalize3({ x: aVecs[bestJ].x - a2proj*a1.x, y: aVecs[bestJ].y - a2proj*a1.y, z: aVecs[bestJ].z - a2proj*a1.z });
-  const a3 = normalize3(cross3v(a1, a2));
-
-  // Orthonormal basis from b-vectors
-  const b1 = normalize3(bVecs[bestI]);
-  const b2proj = dot3(normalize3(bVecs[bestJ]), b1);
-  const b2 = normalize3({ x: bVecs[bestJ].x - b2proj*b1.x, y: bVecs[bestJ].y - b2proj*b1.y, z: bVecs[bestJ].z - b2proj*b1.z });
-  const b3 = normalize3(cross3v(b1, b2));
-
-  // R = B_frame * A_frame^T  (maps a-space to b-space)
-  // B_frame has b1,b2,b3 as columns; A_frame^T has a1,a2,a3 as rows
-  const B: Mat3 = [[b1.x,b2.x,b3.x],[b1.y,b2.y,b3.y],[b1.z,b2.z,b3.z]];
-  const AT: Mat3 = [[a1.x,a1.y,a1.z],[a2.x,a2.y,a2.z],[a3.x,a3.y,a3.z]];
-  return { R: matMul3(B, AT), collinearWarn: false, pair: { i: bestI, j: bestJ } };
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
 type CalibStatus =
   | 'idle' | 'done'
-  | 'countdown1' | 'collecting1'   // Pose 1: T-pose lateral
-  | 'countdown2' | 'collecting2'   // Pose 2: arm straight forward
-  | 'countdown3' | 'collecting3';  // Pose 3: forearm bent upward ~90°
+  | 'countdown1' | 'collecting1'   // Pose 1: T-pose lateral (UA and FA in lateral direction)
+  | 'countdown2' | 'collecting2'   // Pose 2: raised straight arm (~45-60° elevation, elbow straight)
+  | 'countdown3' | 'collecting3';  // Pose 3: forearm up (upper arm lateral, elbow ~90°, FA upward)
 
 interface CalibrationFrame {
   shoulder: {x:number;y:number;z:number};
@@ -353,7 +446,7 @@ interface PoseCalibData {
   framesUsed:  number;
 }
 
-/** Calibration consistency test results — replayed through the estimated model. */
+/** Calibration consistency test results — per-frame residuals replayed through the estimated model. */
 interface CalibValidation {
   pose1UaResidualDeg:  number;
   pose1FaResidualDeg:  number;
@@ -364,7 +457,7 @@ interface CalibValidation {
   meanUaResidualDeg:   number;
   meanFaResidualDeg:   number;
   maxResidualDeg:      number;
-  /** True if the Gram-Schmidt Wahba estimation was well-conditioned for each IMU. */
+  /** True if ALS converged and observations are well-conditioned for each IMU. */
   alignOkUA:           boolean;
   alignOkFA:           boolean;
 }
@@ -429,8 +522,13 @@ function emptySegDebug(): SegmentReconDebug {
 
 // ── Calibration validation (standalone) ──────────────────────────────────────
 
+/**
+ * Per-frame residual validation: replay every stored calibration frame through the
+ * estimated model (A * R(q) * b) and compare to the recorded stereo direction.
+ * Returns mean per-pose residuals and overall mean/max.
+ */
 function computeValidation(
-  poses: PoseCalibData[],
+  allPoseFrames: CalibrationFrame[][],
   uaBoneLocalDir: Vec3,
   faBoneLocalDir: Vec3,
   R_ua: Mat3,
@@ -438,27 +536,39 @@ function computeValidation(
   alignOkUA: boolean,
   alignOkFA: boolean,
 ): CalibValidation {
-  const uaResiduals: number[] = [];
-  const faResiduals: number[] = [];
+  const poseUaMeans: number[] = [];
+  const poseFaMeans: number[] = [];
 
-  for (const pose of poses) {
-    // Bone dir in IMU world → apply world-to-stereo rotation → stereo world dir
-    const uaImuWorld = rotateVectorByQuaternion(pose.imu01, uaBoneLocalDir);
-    const faImuWorld = rotateVectorByQuaternion(pose.imu02, faBoneLocalDir);
-    const predUA = normalize3(matVec3(R_ua, { x: uaImuWorld[0], y: uaImuWorld[1], z: uaImuWorld[2] }));
-    const predFA = normalize3(matVec3(R_fa, { x: faImuWorld[0], y: faImuWorld[1], z: faImuWorld[2] }));
-    uaResiduals.push(angleBetweenDeg(predUA, pose.stereoUA));
-    faResiduals.push(angleBetweenDeg(predFA, pose.stereoFA));
+  for (const frames of allPoseFrames) {
+    const uaRes: number[] = [];
+    const faRes: number[] = [];
+    for (const frame of frames) {
+      const qUA = packetToQuat(frame.imu01);
+      const qFA = packetToQuat(frame.imu02);
+      const sUA = normalize3({ x: frame.elbow.x-frame.shoulder.x, y: frame.elbow.y-frame.shoulder.y, z: frame.elbow.z-frame.shoulder.z });
+      const sFA = normalize3({ x: frame.wrist.x-frame.elbow.x,   y: frame.wrist.y-frame.elbow.y,   z: frame.wrist.z-frame.elbow.z   });
+      const uaWorld = rotateVectorByQuaternion(qUA, uaBoneLocalDir);
+      const faWorld = rotateVectorByQuaternion(qFA, faBoneLocalDir);
+      const predUA = normalize3(matVec3(R_ua, { x: uaWorld[0], y: uaWorld[1], z: uaWorld[2] }));
+      const predFA = normalize3(matVec3(R_fa, { x: faWorld[0], y: faWorld[1], z: faWorld[2] }));
+      uaRes.push(angleBetweenDeg(predUA, sUA));
+      faRes.push(angleBetweenDeg(predFA, sFA));
+    }
+    const meanOf = (a: number[]) => a.length ? a.reduce((s,v)=>s+v,0)/a.length : 0;
+    poseUaMeans.push(meanOf(uaRes));
+    poseFaMeans.push(meanOf(faRes));
   }
 
-  const meanUA = uaResiduals.reduce((s, v) => s + v, 0) / uaResiduals.length;
-  const meanFA = faResiduals.reduce((s, v) => s + v, 0) / faResiduals.length;
-  const maxRes = Math.max(...uaResiduals, ...faResiduals);
+  const allUA  = poseUaMeans;
+  const allFA  = poseFaMeans;
+  const meanUA = allUA.reduce((s,v)=>s+v,0) / (allUA.length || 1);
+  const meanFA = allFA.reduce((s,v)=>s+v,0) / (allFA.length || 1);
+  const maxRes = Math.max(...allUA, ...allFA, 0);
 
   return {
-    pose1UaResidualDeg: uaResiduals[0], pose1FaResidualDeg: faResiduals[0],
-    pose2UaResidualDeg: uaResiduals[1], pose2FaResidualDeg: faResiduals[1],
-    pose3UaResidualDeg: uaResiduals[2], pose3FaResidualDeg: faResiduals[2],
+    pose1UaResidualDeg: allUA[0] ?? 0, pose1FaResidualDeg: allFA[0] ?? 0,
+    pose2UaResidualDeg: allUA[1] ?? 0, pose2FaResidualDeg: allFA[1] ?? 0,
+    pose3UaResidualDeg: allUA[2] ?? 0, pose3FaResidualDeg: allFA[2] ?? 0,
     meanUaResidualDeg: meanUA,
     meanFaResidualDeg: meanFA,
     maxResidualDeg: maxRes,
@@ -640,13 +750,20 @@ interface CalibSampleDiag {
   acceptedFrames:       number;
   rejectedFrames:       number;
   rejectionReason:      string | null;
+  poseRejectionReason:  string | null;
   isPoseValid:          boolean;
   isStable:             boolean;
+  isNewStereoFrame:     boolean;
+  imu01Fresh:           boolean;
+  imu02Fresh:           boolean;
   stereoAgeMs:          number;
   imu01AgeMs:           number;
   imu02AgeMs:           number;
   currentUaLenMm:       number;
   currentFaLenMm:       number;
+  elbowAngleDeg:        number | null;
+  uaDriftFromPose1Deg:  number | null;
+  faDeltaFromPose1Deg:  number | null;
   uaAngularSpreadDeg:   number;
   faAngularSpreadDeg:   number;
   runningUaStdDevMm:    number;
@@ -659,10 +776,8 @@ const POSE_META = [
   {
     num: 1, name: 'T-Pose (Lateral)',
     title: 'Pose 1 — T-Pose (Lateral)',
-    body: 'Stand with your right arm straight out to the side, palm facing down.\nKeep both upper arm and forearm horizontal. Hold still.',
-    // active strip classes
+    body: 'Stand with your right arm straight out to the side, palm facing down.\nKeep both upper arm and forearm horizontal. Hold still.\nThis pose anchors both segments in the lateral direction.',
     stripActive: 'border-blue-600 bg-blue-900/30 text-blue-300',
-    // countdown card classes
     cardBg: 'bg-amber-900/20 border-amber-700',
     ringBg: 'bg-amber-800/50 border-amber-500',
     titleCls: 'text-amber-300',
@@ -670,9 +785,9 @@ const POSE_META = [
     barCls: 'bg-amber-500',
   },
   {
-    num: 2, name: 'Forward (Depth)',
-    title: 'Pose 2 — Arm Straight Forward',
-    body: 'Extend your right arm straight forward into depth.\nKeep the arm straight. Hold still.',
+    num: 2, name: 'Raised Arm',
+    title: 'Pose 2 — Raised Straight Arm',
+    body: 'Keep the elbow straight. Raise your right arm 45–60° upward in the frontal plane.\nDo not swing forward or backward. Hold still.\nThis gives the upper-arm sensor a second orientation.',
     stripActive: 'border-cyan-600 bg-cyan-900/30 text-cyan-300',
     cardBg: 'bg-cyan-900/20 border-cyan-700',
     ringBg: 'bg-cyan-800/50 border-cyan-500',
@@ -683,7 +798,7 @@ const POSE_META = [
   {
     num: 3, name: 'Forearm Up',
     title: 'Pose 3 — Forearm Bent Upward',
-    body: 'Return your upper arm to the lateral T-pose position.\nBend your elbow so the forearm points straight up ~90°. Hold still.',
+    body: 'Return your upper arm to the lateral T-pose position.\nBend your elbow so the forearm points straight up ~90°. Hold still.\nThis gives the forearm sensor a second orientation.',
     stripActive: 'border-purple-600 bg-purple-900/30 text-purple-300',
     cardBg: 'bg-purple-900/20 border-purple-700',
     ringBg: 'bg-purple-800/50 border-purple-500',
@@ -743,11 +858,11 @@ export function IMULabView() {
   const [imuReconPose, setImuReconPose]   = useState<TriangulatedPose | null>(null);
   const [imuReconDebug, setImuReconDebug] = useState<ReconDebug | null>(null);
 
-  // ── 3-Pose Calibration state ──────────────────────────────────────────────────
+  // ── 3-Pose ALS Calibration state ─────────────────────────────────────────────
   const [calibStatus, setCalibStatus]   = useState<CalibStatus>('idle');
   const [countdownSec, setCountdownSec] = useState(0);
 
-  // Per-pose frame arrays: index 0-2 = poses 1-3
+  // Per-pose frame arrays: pose1=T-pose lateral, pose2=raised straight arm, pose3=forearm up
   const [pose1Frames, setPose1Frames] = useState<CalibrationFrame[]>([]);
   const [pose2Frames, setPose2Frames] = useState<CalibrationFrame[]>([]);
   const [pose3Frames, setPose3Frames] = useState<CalibrationFrame[]>([]);
@@ -762,13 +877,15 @@ export function IMULabView() {
   // ── Last Reliable Vision (positional velocity gate only) ─────────────────────
   const [lastReliable, setLastReliable]   = useState<LastReliableVision | null>(null);
   const lastReliableRef       = useRef<LastReliableVision | null>(null);
-  const lastReliableUpdateRef = useRef(0);
 
   // ── Timer-based calibration sampling refs ────────────────────────────────────
   /** Updated by onCorrectedPose for each fresh processed stereo frame. */
   const lastProcessedStereoTimestampRef = useRef<number>(0);
-  /** Prevents the same processed frame from being accepted twice. */
+  /** Prevents the same processed frame from being accepted twice into the calibration buffer. */
   const lastAcceptedTimestampRef        = useRef<number>(-1);
+  /** Prevents the same processed frame from being added to the stability window more than once.
+   *  Separate from lastAcceptedTimestampRef so rejected frames don't re-enter the window. */
+  const lastStabilityProcessedTimestampRef = useRef<number>(-1);
   /** Rolling stability window — cleared when entering each collecting phase. */
   const stabilityWindowRef        = useRef<Array<{
     shoulder:{x:number;y:number;z:number};
@@ -802,7 +919,7 @@ export function IMULabView() {
     return () => clearInterval(id);
   }, []);
 
-  // ── Unified countdown effect (handles all 3 countdown phases) ────────────────
+  // ── Unified countdown effect (handles all countdown phases) ─────────────────
   useEffect(() => {
     const nextMap: Partial<Record<CalibStatus, CalibStatus>> = {
       countdown1: 'collecting1',
@@ -825,7 +942,7 @@ export function IMULabView() {
     return () => clearInterval(id);
   }, [calibStatus]);
 
-  // ── Auto-advance: pose N collected → start countdown for pose N+1 ─────────────
+  // ── Auto-advance: pose 1 collected → start countdown for pose 2 ──────────────
   useEffect(() => {
     if (calibStatus !== 'collecting1' || pose1Frames.length < CALIBRATION_FRAMES_NEEDED) return;
     // Store avg UA/FA directions from pose 1 for validating poses 2 and 3
@@ -839,161 +956,102 @@ export function IMULabView() {
     stabilityWindowRef.current = [];
     lastProcessedStereoTimestampRef.current = 0;
     lastAcceptedTimestampRef.current = -1;
+    lastStabilityProcessedTimestampRef.current = -1;
     setCalibStatus('countdown2');
   }, [calibStatus, pose1Frames.length]);
 
+  // ── Auto-advance: pose 2 collected → start countdown for pose 3 ──────────────
   useEffect(() => {
     if (calibStatus !== 'collecting2' || pose2Frames.length < CALIBRATION_FRAMES_NEEDED) return;
     stabilityWindowRef.current = [];
     lastProcessedStereoTimestampRef.current = 0;
     lastAcceptedTimestampRef.current = -1;
+    lastStabilityProcessedTimestampRef.current = -1;
     setCalibStatus('countdown3');
   }, [calibStatus, pose2Frames.length]);
 
   // ── Finalize calibration after all 3 poses collected ─────────────────────────
   useEffect(() => {
     if (calibStatus !== 'collecting3' || pose3Frames.length < CALIBRATION_FRAMES_NEEDED) return;
+    if (pose1Frames.length < CALIBRATION_FRAMES_NEEDED || pose2Frames.length < CALIBRATION_FRAMES_NEEDED) {
+      console.error('[IMU CALIB] pose1/pose2 frames unexpectedly empty during finalization — aborting');
+      setCalibStatus('idle');
+      return;
+    }
+
+    try {
 
     const allPoseFrames = [pose1Frames, pose2Frames, pose3Frames];
 
     // Step 1: per-pose quaternion and stereo-direction averages
-    const poseData: PoseCalibData[] = allPoseFrames.map(frames => {
+    const poseData: PoseCalibData[] = allPoseFrames.map((frames, poseIdx) => {
       const imu01Avg = averageQuaternions(frames.map(f => packetToQuat(f.imu01)));
       const imu02Avg = averageQuaternions(frames.map(f => packetToQuat(f.imu02)));
       const uaDirs = frames.map(f => normalize3({ x: f.elbow.x-f.shoulder.x, y: f.elbow.y-f.shoulder.y, z: f.elbow.z-f.shoulder.z }));
       const faDirs = frames.map(f => normalize3({ x: f.wrist.x-f.elbow.x,   y: f.wrist.y-f.elbow.y,   z: f.wrist.z-f.elbow.z   }));
       const uaVec = averageVec3Simple(uaDirs);
       const faVec = averageVec3Simple(faDirs);
-      // Fall back to first frame direction if averaging fails (inconsistent data)
-      const stereoUA = uaVec ? { x: uaVec[0], y: uaVec[1], z: uaVec[2] }
-        : normalize3({ x: frames[0].elbow.x-frames[0].shoulder.x, y: frames[0].elbow.y-frames[0].shoulder.y, z: frames[0].elbow.z-frames[0].shoulder.z });
-      const stereoFA = faVec ? { x: faVec[0], y: faVec[1], z: faVec[2] }
-        : normalize3({ x: frames[0].wrist.x-frames[0].elbow.x, y: frames[0].wrist.y-frames[0].elbow.y, z: frames[0].wrist.z-frames[0].elbow.z });
+      if (!uaVec) throw new CalibFailed(`Pose ${poseIdx + 1} upper-arm stereo directions are inconsistent (frames cancelled) — arm drifted during capture, recalibrate`);
+      if (!faVec) throw new CalibFailed(`Pose ${poseIdx + 1} forearm stereo directions are inconsistent (frames cancelled) — arm drifted during capture, recalibrate`);
       return {
-        imu01: imu01Avg, imu02: imu02Avg, stereoUA, stereoFA,
+        imu01: imu01Avg, imu02: imu02Avg,
+        stereoUA: { x: uaVec[0], y: uaVec[1], z: uaVec[2] },
+        stereoFA: { x: faVec[0], y: faVec[1], z: faVec[2] },
         uaLengthMm: median(frames.map(f => dist3D(f.shoulder, f.elbow))),
         faLengthMm: median(frames.map(f => dist3D(f.elbow, f.wrist))),
         framesUsed: frames.length,
       };
     });
 
-    // Step 2: Initial bone-local-dir estimate (sensor frame) — ignoring R for now.
-    // boneLocalDir_sensor_0 = rotate(inv(q_imu), stereoDir)
-    // This is correct IF IMU world == stereo world; treated as initial approximation otherwise.
-    const uaLocalObs0: {x:number;y:number;z:number}[] = [];
-    const faLocalObs0: {x:number;y:number;z:number}[] = [];
+    // Step 2: Build observation arrays (all frames from all poses)
+    const uaObs: ALSObs[] = [];
+    const faObs: ALSObs[] = [];
     for (const frames of allPoseFrames) {
       for (const frame of frames) {
-        const qUA = packetToQuat(frame.imu01);
-        const qFA = packetToQuat(frame.imu02);
         const sUA = normalize3({ x: frame.elbow.x-frame.shoulder.x, y: frame.elbow.y-frame.shoulder.y, z: frame.elbow.z-frame.shoulder.z });
         const sFA = normalize3({ x: frame.wrist.x-frame.elbow.x,   y: frame.wrist.y-frame.elbow.y,   z: frame.wrist.z-frame.elbow.z   });
-        const uaL = rotateVectorByQuaternion(invertQuaternion(qUA), [sUA.x, sUA.y, sUA.z]);
-        const faL = rotateVectorByQuaternion(invertQuaternion(qFA), [sFA.x, sFA.y, sFA.z]);
-        uaLocalObs0.push({ x: uaL[0], y: uaL[1], z: uaL[2] });
-        faLocalObs0.push({ x: faL[0], y: faL[1], z: faL[2] });
+        uaObs.push({ q: packetToQuat(frame.imu01), d: sUA });
+        faObs.push({ q: packetToQuat(frame.imu02), d: sFA });
       }
     }
-    const uaBoneLocalDir0 = averageVec3Simple(uaLocalObs0);
-    const faBoneLocalDir0 = averageVec3Simple(faLocalObs0);
 
-    if (!uaBoneLocalDir0 || !faBoneLocalDir0) {
-      const result: ArmCalibration = {
-        timestamp: Date.now(),
-        uaBoneLocalDir: [1,0,0], faBoneLocalDir: [0,0,1],
-        R_ua: IDENTITY_MAT3, R_fa: IDENTITY_MAT3,
-        uaLengthMm: 0, uaLengthStdDevMm: 0, faLengthMm: 0, faLengthStdDevMm: 0,
-        poses: poseData as [PoseCalibData, PoseCalibData, PoseCalibData],
-        validation: { pose1UaResidualDeg:0,pose1FaResidualDeg:0,pose2UaResidualDeg:0,pose2FaResidualDeg:0,pose3UaResidualDeg:0,pose3FaResidualDeg:0,meanUaResidualDeg:0,meanFaResidualDeg:0,maxResidualDeg:0,alignOkUA:false,alignOkFA:false },
-        quality: 'failed',
-        error: 'Sensor-to-bone observations are inconsistent — recalibrate',
-      };
-      setArmCalibration(result);
-      setCalibStatus('done');
-      return;
-    }
+    // Step 3: Initialize A with gravity constraint.
+    // A_init maps IMU world gravity [0,0,-1] → stereo gravity [0,1,0].
+    // Verified: A_init*[0,0,-1]=[0,1,0], det(A_init)=1.
+    const A_GRAVITY_INIT: Mat3 = [[1,0,0],[0,0,-1],[0,1,0]];
 
-    // Step 3: Estimate R_imu_to_stereo for each IMU using Wahba (Gram-Schmidt 2-vector).
-    // For each pose, bone direction in IMU world = rotate(q_pose_avg, boneLocalDir_sensor_0)
-    const uaImuWorldDirs = poseData.map(p => {
-      const v = rotateVectorByQuaternion(p.imu01, uaBoneLocalDir0);
-      return { x: v[0], y: v[1], z: v[2] };
-    });
-    const faImuWorldDirs = poseData.map(p => {
-      const v = rotateVectorByQuaternion(p.imu02, faBoneLocalDir0);
-      return { x: v[0], y: v[1], z: v[2] };
-    });
-    const stereoUADirs = poseData.map(p => p.stereoUA);
-    const stereoFADirs = poseData.map(p => p.stereoFA);
+    // Step 4: Alternating least-squares — solve A and b jointly
+    const uaResult = solveALS(uaObs, A_GRAVITY_INIT);
+    const faResult = solveALS(faObs, A_GRAVITY_INIT);
 
-    const { R: R_ua, collinearWarn: warnUA, pair: uaPair } = estimateWahbaR(uaImuWorldDirs, stereoUADirs);
-    const { R: R_fa, collinearWarn: warnFA, pair: faPair } = estimateWahbaR(faImuWorldDirs, stereoFADirs);
+    if (!uaResult.ok) throw new CalibFailed('UA sensor calibration failed (degenerate observations) — ensure poses are distinct and arm holds still, then recalibrate');
+    if (!faResult.ok) throw new CalibFailed('FA sensor calibration failed (degenerate observations) — ensure poses are distinct and arm holds still, then recalibrate');
 
-    console.info('[IMU CALIB] Wahba pair selection', {
-      ua: uaPair,
-      fa: faPair,
-      uaWarn: warnUA,
-      faWarn: warnFA,
+    const R_ua = uaResult.A;
+    const R_fa = faResult.A;
+    const uaBoneLocalDir = uaResult.b;
+    const faBoneLocalDir = faResult.b;
+
+    console.info('[IMU CALIB] ALS result', {
+      uaConverged: uaResult.converged, faConverged: faResult.converged,
+      uaBoneLocalDir, faBoneLocalDir,
+      gravityCheckUA: (() => { const g = matVec3(R_ua,{x:0,y:0,z:-1}); return `x${g.x.toFixed(3)} y${g.y.toFixed(3)} z${g.z.toFixed(3)}`; })(),
+      gravityCheckFA: (() => { const g = matVec3(R_fa,{x:0,y:0,z:-1}); return `x${g.x.toFixed(3)} y${g.y.toFixed(3)} z${g.z.toFixed(3)}`; })(),
     });
 
-    // Step 4: Refined bone-local-dir with R correction applied.
-    // boneLocalDir_refined = rotate(inv(q), R^T * stereoDir)
-    const uaLocalObs1: {x:number;y:number;z:number}[] = [];
-    const faLocalObs1: {x:number;y:number;z:number}[] = [];
-    const R_ua_T = transpMat3(R_ua);
-    const R_fa_T = transpMat3(R_fa);
-    for (const frames of allPoseFrames) {
-      for (const frame of frames) {
-        const qUA = packetToQuat(frame.imu01);
-        const qFA = packetToQuat(frame.imu02);
-        const sUA = normalize3({ x: frame.elbow.x-frame.shoulder.x, y: frame.elbow.y-frame.shoulder.y, z: frame.elbow.z-frame.shoulder.z });
-        const sFA = normalize3({ x: frame.wrist.x-frame.elbow.x,   y: frame.wrist.y-frame.elbow.y,   z: frame.wrist.z-frame.elbow.z   });
-        // Map stereo direction into IMU world frame, then into sensor frame
-        const sUA_imu = matVec3(R_ua_T, sUA);
-        const sFA_imu = matVec3(R_fa_T, sFA);
-        const uaL = rotateVectorByQuaternion(invertQuaternion(qUA), [sUA_imu.x, sUA_imu.y, sUA_imu.z]);
-        const faL = rotateVectorByQuaternion(invertQuaternion(qFA), [sFA_imu.x, sFA_imu.y, sFA_imu.z]);
-        uaLocalObs1.push({ x: uaL[0], y: uaL[1], z: uaL[2] });
-        faLocalObs1.push({ x: faL[0], y: faL[1], z: faL[2] });
-      }
-    }
-    const uaBoneLocalDir = averageVec3Simple(uaLocalObs1) ?? uaBoneLocalDir0;
-    const faBoneLocalDir = averageVec3Simple(faLocalObs1) ?? faBoneLocalDir0;
+    // Step 5: Validation — per-frame residuals per pose
+    const validation = computeValidation(allPoseFrames, uaBoneLocalDir, faBoneLocalDir, R_ua, R_fa, uaResult.converged, faResult.converged);
+
+    console.info('[IMU CALIB] per-pose residuals', {
+      pose1: { ua: validation.pose1UaResidualDeg.toFixed(1), fa: validation.pose1FaResidualDeg.toFixed(1) },
+      pose2: { ua: validation.pose2UaResidualDeg.toFixed(1), fa: validation.pose2FaResidualDeg.toFixed(1) },
+      pose3: { ua: validation.pose3UaResidualDeg.toFixed(1), fa: validation.pose3FaResidualDeg.toFixed(1) },
+      mean: { ua: validation.meanUaResidualDeg.toFixed(1), fa: validation.meanFaResidualDeg.toFixed(1) },
+      max: validation.maxResidualDeg.toFixed(1),
+    });
 
     const allUaLengths = allPoseFrames.flatMap(frames => frames.map(f => dist3D(f.shoulder, f.elbow)));
     const allFaLengths = allPoseFrames.flatMap(frames => frames.map(f => dist3D(f.elbow, f.wrist)));
-
-    const validation = computeValidation(poseData, uaBoneLocalDir, faBoneLocalDir, R_ua, R_fa, !warnUA, !warnFA);
-
-    const uaPredicted = poseData.map(p => {
-      const v = rotateVectorByQuaternion(p.imu01, uaBoneLocalDir);
-      return normalize3(matVec3(R_ua, { x: v[0], y: v[1], z: v[2] }));
-    });
-    const faPredicted = poseData.map(p => {
-      const v = rotateVectorByQuaternion(p.imu02, faBoneLocalDir);
-      return normalize3(matVec3(R_fa, { x: v[0], y: v[1], z: v[2] }));
-    });
-
-    const perPoseDebug = poseData.map((p, idx) => ({
-      pose: idx + 1,
-      uaLengthMm: p.uaLengthMm,
-      faLengthMm: p.faLengthMm,
-      stereoUA: p.stereoUA,
-      stereoFA: p.stereoFA,
-      imu01Quat: p.imu01,
-      imu02Quat: p.imu02,
-      predictedUA: uaPredicted[idx],
-      predictedFA: faPredicted[idx],
-      uaResidualDeg: angleBetweenDeg(uaPredicted[idx], p.stereoUA),
-      faResidualDeg: angleBetweenDeg(faPredicted[idx], p.stereoFA),
-    }));
-
-    console.info('[IMU CALIB] pose-by-pose debug', {
-      uaSelectedPair: uaPair,
-      faSelectedPair: faPair,
-      perPose: perPoseDebug,
-      validation,
-    });
 
     const quality: ArmCalibration['quality'] =
       (!validation.alignOkUA || !validation.alignOkFA || validation.maxResidualDeg > 25) ? 'failed'
@@ -1015,8 +1073,34 @@ export function IMULabView() {
 
     setArmCalibration(result);
     setCalibStatus('done');
-    console.info('[IMU CALIB] 3-pose sensor-to-bone calibration complete', result);
-  }, [calibStatus, pose3Frames, pose1Frames, pose2Frames]);
+    console.info('[IMU CALIB] 3-pose ALS calibration complete', result);
+
+    } catch (err) {
+      if (err instanceof CalibFailed) {
+        const DUMMY_POSE: PoseCalibData = {
+          imu01: [1,0,0,0], imu02: [1,0,0,0],
+          stereoUA: {x:1,y:0,z:0}, stereoFA: {x:0,y:0,z:1},
+          uaLengthMm: 0, faLengthMm: 0, framesUsed: 0,
+        };
+        const failResult: ArmCalibration = {
+          timestamp: Date.now(),
+          uaBoneLocalDir: [1,0,0], faBoneLocalDir: [0,0,1],
+          R_ua: IDENTITY_MAT3, R_fa: IDENTITY_MAT3,
+          uaLengthMm: 0, uaLengthStdDevMm: 0, faLengthMm: 0, faLengthStdDevMm: 0,
+          poses: [DUMMY_POSE, DUMMY_POSE, DUMMY_POSE],
+          validation: { pose1UaResidualDeg:0, pose1FaResidualDeg:0, pose2UaResidualDeg:0, pose2FaResidualDeg:0, pose3UaResidualDeg:0, pose3FaResidualDeg:0, meanUaResidualDeg:0, meanFaResidualDeg:0, maxResidualDeg:0, alignOkUA:false, alignOkFA:false },
+          quality: 'failed',
+          error: err.message,
+        };
+        setArmCalibration(failResult);
+        setCalibStatus('done');
+        console.warn('[IMU CALIB] calibration failed:', err.message);
+      } else {
+        console.error('[IMU CALIB] finalization threw unexpectedly — resetting to idle', err);
+        setCalibStatus('idle');
+      }
+    }
+  }, [calibStatus, pose3Frames, pose2Frames, pose1Frames]);
 
   // ── getRawIMU stable ref (needed by timer and onCorrectedPose) ───────────────
   const getRawIMURef = useRef(getRawIMU);
@@ -1070,16 +1154,34 @@ export function IMULabView() {
       const imu01Ok     = !!(imu01Raw?.latest) && imu01Fresh;
       const imu02Ok     = !!(imu02Raw?.latest) && imu02Fresh;
 
-      // ── Dedup: accept each processed stereo frame only once ───────────────
+      // ── Arm directions (hoisted for pose check AND diagnostics) ─────────────
+      const uaDir = (jointsOk && shoulder && elbow)
+        ? normalize3({ x: elbow.x-shoulder.x, y: elbow.y-shoulder.y, z: elbow.z-shoulder.z })
+        : null;
+      const faDir = (jointsOk && elbow && wrist)
+        ? normalize3({ x: wrist.x-elbow.x, y: wrist.y-elbow.y, z: wrist.z-elbow.z })
+        : null;
+      const elbowAngleDeg = (uaDir && faDir) ? angleBetweenDeg(uaDir, faDir) : null;
+      const uaDriftFromPose1Deg = (uaDir && pose1AvgDirsRef.current)
+        ? angleBetweenDeg(uaDir, pose1AvgDirsRef.current.ua) : null;
+      const faDeltaFromPose1Deg = (faDir && pose1AvgDirsRef.current)
+        ? angleBetweenDeg(faDir, pose1AvgDirsRef.current.fa) : null;
+
+      // ── Dedup for calibration acceptance: one acceptance per stereo frame ───
+      // Compared against lastAcceptedTimestampRef so the same frame is never
+      // stored twice in the calibration buffer.
       const isNewFrame = lastProcessedStereoTimestampRef.current !== lastAcceptedTimestampRef.current;
 
-      // ── Stability gating ─────────────────────────────────────────────────
-      // Only add a fresh processed frame to the window. A repeated frozen frame
-      // should not make the arm look stable just because the last sample never changed.
-      if (isNewFrame && jointsOk && shoulder && elbow && wrist) {
+      // ── Stability window: one entry per stereo frame ─────────────────────
+      // Uses a SEPARATE dedup ref so rejected frames don't get pushed
+      // into the window repeatedly on subsequent timer ticks before the
+      // next stereo frame arrives.
+      const isNewStabilityFrame = lastProcessedStereoTimestampRef.current !== lastStabilityProcessedTimestampRef.current;
+      if (isNewStabilityFrame && jointsOk && shoulder && elbow && wrist) {
         stabilityWindowRef.current.push({ shoulder: {...shoulder}, elbow: {...elbow}, wrist: {...wrist} });
         if (stabilityWindowRef.current.length > STABILITY_WINDOW)
           stabilityWindowRef.current.shift();
+        lastStabilityProcessedTimestampRef.current = lastProcessedStereoTimestampRef.current;
       }
 
       const hasFullWindow = stabilityWindowRef.current.length >= STABILITY_WINDOW;
@@ -1088,17 +1190,14 @@ export function IMULabView() {
 
       // ── Pose geometry validation ─────────────────────────────────────────
       let poseRejectionReason: string | null = null;
-      let isPoseValid = false;
-      if (jointsOk && segOk && shoulder && elbow && wrist) {
-        const uaDir = normalize3({ x: elbow.x-shoulder.x, y: elbow.y-shoulder.y, z: elbow.z-shoulder.z });
-        const faDir = normalize3({ x: wrist.x-elbow.x,   y: wrist.y-elbow.y,   z: wrist.z-elbow.z   });
-        const straightAngleDeg = angleBetweenDeg(uaDir, faDir);
+      let isPoseValid = !COLLECTING_STATES.includes(calibStatus);
+      if (COLLECTING_STATES.includes(calibStatus) && jointsOk && segOk && uaDir && faDir) {
         poseRejectionReason = checkPoseGeometry(
-          poseIdx, uaDir, faDir, straightAngleDeg,
+          poseIdx, uaDir, faDir, elbowAngleDeg ?? 0,
           pose1AvgDirsRef.current,
         );
         isPoseValid = poseRejectionReason === null;
-      } else {
+      } else if (COLLECTING_STATES.includes(calibStatus)) {
         poseRejectionReason = !jointsOk ? 'Joints not visible' : 'Segment length out of range';
       }
 
@@ -1109,7 +1208,7 @@ export function IMULabView() {
       else if (!stereoFresh)   rejectionReason = `Stereo stale (${stereoAgeMs.toFixed(0)}ms)`;
       else if (!imu01Ok)       rejectionReason = `imu_01 stale (${imu01AgeMs.toFixed(0)}ms)`;
       else if (!imu02Ok)       rejectionReason = `imu_02 stale (${imu02AgeMs.toFixed(0)}ms)`;
-      else if (!isNewFrame)    rejectionReason = 'Same stereo frame (waiting for new data)';
+      else if (!isNewFrame)    rejectionReason = 'Waiting for next stereo frame';
       else if (!hasFullWindow) rejectionReason = `Building stability window (${stabilityWindowRef.current.length}/${STABILITY_WINDOW})`;
       else if (!isStable)      rejectionReason = 'Hold still — waiting for stable arm geometry';
       else if (!isPoseValid)   rejectionReason = poseRejectionReason;
@@ -1134,20 +1233,27 @@ export function IMULabView() {
       const faLens = framesRef.current.map(f => dist3D(f.elbow, f.wrist));
 
       calibSampleDiagRef.current = {
-        acceptedFrames:    framesRef.current.length,
-        rejectedFrames:    rejected,
-        rejectionReason:   allOk ? null : rejectionReason,
+        acceptedFrames:      framesRef.current.length,
+        rejectedFrames:      rejected,
+        rejectionReason:     allOk ? null : rejectionReason,
+        poseRejectionReason,
         isPoseValid,
         isStable,
-        stereoAgeMs:       isFinite(stereoAgeMs) ? Math.round(stereoAgeMs) : 9999,
-        imu01AgeMs:        isFinite(imu01AgeMs)  ? Math.round(imu01AgeMs)  : 9999,
-        imu02AgeMs:        isFinite(imu02AgeMs)  ? Math.round(imu02AgeMs)  : 9999,
-        currentUaLenMm:    uaLen,
-        currentFaLenMm:    faLen,
-        uaAngularSpreadDeg: stabilityMetrics.uaAngularSpreadDeg,
-        faAngularSpreadDeg: stabilityMetrics.faAngularSpreadDeg,
-        runningUaStdDevMm: stddev(uaLens),
-        runningFaStdDevMm: stddev(faLens),
+        isNewStereoFrame:    isNewFrame,
+        imu01Fresh,
+        imu02Fresh,
+        stereoAgeMs:         isFinite(stereoAgeMs) ? Math.round(stereoAgeMs) : 9999,
+        imu01AgeMs:          isFinite(imu01AgeMs)  ? Math.round(imu01AgeMs)  : 9999,
+        imu02AgeMs:          isFinite(imu02AgeMs)  ? Math.round(imu02AgeMs)  : 9999,
+        currentUaLenMm:      uaLen,
+        currentFaLenMm:      faLen,
+        elbowAngleDeg,
+        uaDriftFromPose1Deg,
+        faDeltaFromPose1Deg,
+        uaAngularSpreadDeg:  stabilityMetrics.uaAngularSpreadDeg,
+        faAngularSpreadDeg:  stabilityMetrics.faAngularSpreadDeg,
+        runningUaStdDevMm:   stddev(uaLens),
+        runningFaStdDevMm:   stddev(faLens),
         windowFrameCount:  stabilityWindowRef.current.length,
       };
     }, 40); // ~25 Hz
@@ -1211,10 +1317,6 @@ export function IMULabView() {
         upperArm:  { shoulder: {...shoulder}, elbow: {...elbow} },
         forearm:   { elbow: {...elbow}, wrist: {...wrist} },
       };
-      const nowMs = performance.now();
-      if (nowMs - lastReliableUpdateRef.current > 500) {
-        lastReliableUpdateRef.current = nowMs;
-      }
     }
 
     // ── Per-frame condition debug ────────────────────────────────────────────
@@ -1361,17 +1463,17 @@ export function IMULabView() {
   );
   const stereoReliable = trackedCountRef.current >= 3;
   const canCalibrate = imu01Online && imu02Online && rightArmVisible && stereoReliable && bothCamerasActive;
-  const calibInProgress = ['countdown1','collecting1','countdown2','collecting2',
-    'countdown3','collecting3'].includes(calibStatus);
+  const calibInProgress = ['countdown1','collecting1','countdown2','collecting2','countdown3','collecting3'].includes(calibStatus);
 
   const startCalibration = useCallback(() => {
     pose1FramesRef.current = []; pose2FramesRef.current = []; pose3FramesRef.current = [];
     setPose1Frames([]); setPose2Frames([]); setPose3Frames([]);
-    lastReliableRef.current          = null;
-    lastAcceptedTimestampRef.current = -1;
-    stabilityWindowRef.current       = [];
-    pose1AvgDirsRef.current          = null;
-    calibSampleDiagRef.current       = null;
+    lastReliableRef.current                      = null;
+    lastAcceptedTimestampRef.current             = -1;
+    lastStabilityProcessedTimestampRef.current   = -1;
+    stabilityWindowRef.current                   = [];
+    pose1AvgDirsRef.current                      = null;
+    calibSampleDiagRef.current                   = null;
     setCalibSampleDiag(null);
     setCalibStatus('countdown1');
   }, []);
@@ -1464,7 +1566,7 @@ export function IMULabView() {
             )}
           </div>
           <p className="text-gray-400 text-sm mt-1">
-            Phase C · 4-pose sensor-to-bone calibration · absolute quaternion reconstruction
+            Phase C · 3-pose ALS calibration · absolute quaternion reconstruction
           </p>
           <p className="text-gray-600 text-xs mt-0.5">
             Right shoulder must remain visible — IMU fills occluded elbow / wrist from the shoulder anchor
@@ -1656,7 +1758,7 @@ export function IMULabView() {
             <Card className="bg-gray-900 border-gray-700 p-4">
               <h3 className="text-sm font-semibold text-white mb-1">Right Arm Calibration</h3>
               <p className="text-xs text-gray-500 mb-4">
-                3-pose sensor-to-bone calibration with IMU-to-stereo frame alignment. Each pose teaches the fixed alignment between each IMU and its bone.
+                3-pose ALS calibration. Pose 1 (T-pose lateral) + Pose 2 (raised straight arm) → UA sensor-to-bone. Pose 3 (forearm up) → FA sensor-to-bone. Gravity regularizes the A-step throughout.
               </p>
 
               {/* Prerequisites */}
@@ -1677,7 +1779,7 @@ export function IMULabView() {
                 ))}
               </div>
 
-              {/* 3-pose progress strip */}
+              {/* 2-pose progress strip */}
               {calibInProgress && (
                 <div className="flex items-center gap-2 mb-4 flex-wrap">
                   {POSE_META.map((p, i) => {
@@ -1697,7 +1799,7 @@ export function IMULabView() {
                           {isDone && <span className="ml-1 text-green-400">✓</span>}
                           {isActive && <span className="ml-1 tabular-nums">({frames}/{CALIBRATION_FRAMES_NEEDED})</span>}
                         </div>
-                        {i < 2 && <span className="text-gray-600">→</span>}
+                        {i < POSE_META.length - 1 && <span className="text-gray-600">→</span>}
                       </div>
                     );
                   })}
@@ -1734,10 +1836,15 @@ export function IMULabView() {
                   return (
                     <div key={`col-${i}`} className={`mb-4 p-3 ${p.cardBg} border rounded`}>
                       <p className={`text-sm ${p.titleCls} font-semibold mb-1`}>{p.title} — Capturing</p>
+                      {/* Primary rejection reason */}
                       {diag?.rejectionReason && (
                         <p className="text-xs text-red-400 mb-2 font-medium">{diag.rejectionReason}</p>
                       )}
-                      {(!diag?.rejectionReason) && (
+                      {/* Pose-specific geometry rejection (shown even when overall reason differs) */}
+                      {diag?.poseRejectionReason && diag.poseRejectionReason !== diag.rejectionReason && (
+                        <p className="text-xs text-orange-400 mb-2">[Pose] {diag.poseRejectionReason}</p>
+                      )}
+                      {!diag?.rejectionReason && (
                         <p className={`text-xs ${p.bodyCls} mb-2`}>Hold still. Collecting stable frames.</p>
                       )}
                       <div className="flex items-center gap-3 mb-3">
@@ -1750,13 +1857,16 @@ export function IMULabView() {
                         </span>
                       </div>
                       {diag && (
-                        <div className="border-t border-gray-700/50 pt-2 mt-1 space-y-1.5">
-                          {/* Status indicators */}
-                          <div className="flex flex-wrap gap-2">
-                            {[
-                              { label: 'Pose valid',  ok: diag.isPoseValid },
-                              { label: 'Stable',      ok: diag.isStable },
-                            ].map(({ label, ok }) => (
+                        <div className="border-t border-gray-700/50 pt-2 mt-1 space-y-2">
+                          {/* Boolean gate indicators */}
+                          <div className="flex flex-wrap gap-1.5">
+                            {([
+                              ['Pose valid',      diag.isPoseValid],
+                              ['Stable',          diag.isStable],
+                              ['New frame',       diag.isNewStereoFrame],
+                              ['imu_01 fresh',    diag.imu01Fresh],
+                              ['imu_02 fresh',    diag.imu02Fresh],
+                            ] as [string, boolean][]).map(([label, ok]) => (
                               <span key={label} className={`text-xs px-2 py-0.5 rounded-full font-semibold
                                 ${ok ? 'bg-green-900/40 border border-green-700 text-green-300' : 'bg-red-900/30 border border-red-800 text-red-400'}`}>
                                 {ok ? '✓' : '✗'} {label}
@@ -1766,21 +1876,37 @@ export function IMULabView() {
                               ✓ {diag.acceptedFrames}  ✗ {diag.rejectedFrames}
                             </span>
                           </div>
+                          {/* Pose geometry diagnostics */}
+                          <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs font-mono">
+                            {([
+                              ['Elbow angle',     diag.elbowAngleDeg !== null ? `${diag.elbowAngleDeg.toFixed(1)}°` : '—',
+                                diag.elbowAngleDeg !== null && diag.elbowAngleDeg >= 35 && diag.elbowAngleDeg <= 140],
+                              ['UA drift P1',     diag.uaDriftFromPose1Deg !== null ? `${diag.uaDriftFromPose1Deg.toFixed(1)}°` : '—',
+                                diag.uaDriftFromPose1Deg !== null && diag.uaDriftFromPose1Deg <= 40],
+                              ['FA Δ from P1',    diag.faDeltaFromPose1Deg !== null ? `${diag.faDeltaFromPose1Deg.toFixed(1)}°` : '—',
+                                diag.faDeltaFromPose1Deg !== null && diag.faDeltaFromPose1Deg >= 30],
+                            ] as [string, string, boolean][]).map(([label, val, ok]) => (
+                              <div key={label} className="flex justify-between gap-2">
+                                <span className="text-gray-600">{label}</span>
+                                <span className={ok ? 'text-green-400' : 'text-orange-400'}>{val}</span>
+                              </div>
+                            ))}
+                          </div>
                           {/* Freshness + stability metrics */}
                           <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs font-mono">
-                            {[
-                              ['Stereo age', `${diag.stereoAgeMs}ms`,          diag.stereoAgeMs < 150],
-                              ['imu_01 age', `${diag.imu01AgeMs}ms`,            diag.imu01AgeMs  < 150],
-                              ['imu_02 age', `${diag.imu02AgeMs}ms`,            diag.imu02AgeMs  < 150],
-                              ['UA spread',  `${diag.uaAngularSpreadDeg.toFixed(1)}°`,   diag.uaAngularSpreadDeg < STABILITY_ANGLE_SPREAD_DEG],
-                              ['FA spread',  `${diag.faAngularSpreadDeg.toFixed(1)}°`,   diag.faAngularSpreadDeg < STABILITY_ANGLE_SPREAD_DEG],
-                              ['UA length',  `${diag.currentUaLenMm.toFixed(0)}mm ±${diag.runningUaStdDevMm.toFixed(1)}`, diag.runningUaStdDevMm < STABILITY_LENGTH_STDDEV_MM],
-                              ['FA length',  `${diag.currentFaLenMm.toFixed(0)}mm ±${diag.runningFaStdDevMm.toFixed(1)}`, diag.runningFaStdDevMm < STABILITY_LENGTH_STDDEV_MM],
-                              ['Window',     `${diag.windowFrameCount}/${STABILITY_WINDOW}`, diag.windowFrameCount >= STABILITY_WINDOW],
-                            ].map(([label, val, ok]) => (
-                              <div key={String(label)} className="flex justify-between gap-2">
+                            {([
+                              ['Stereo age',  `${diag.stereoAgeMs}ms`,                                      diag.stereoAgeMs < 150],
+                              ['imu_01 age',  `${diag.imu01AgeMs}ms`,                                       diag.imu01AgeMs  < 150],
+                              ['imu_02 age',  `${diag.imu02AgeMs}ms`,                                       diag.imu02AgeMs  < 150],
+                              ['UA spread',   `${diag.uaAngularSpreadDeg.toFixed(1)}°`,                     diag.uaAngularSpreadDeg < STABILITY_ANGLE_SPREAD_DEG],
+                              ['FA spread',   `${diag.faAngularSpreadDeg.toFixed(1)}°`,                     diag.faAngularSpreadDeg < STABILITY_ANGLE_SPREAD_DEG],
+                              ['UA len±SD',   `${diag.currentUaLenMm.toFixed(0)}±${diag.runningUaStdDevMm.toFixed(1)}mm`, diag.runningUaStdDevMm < STABILITY_LENGTH_STDDEV_MM],
+                              ['FA len±SD',   `${diag.currentFaLenMm.toFixed(0)}±${diag.runningFaStdDevMm.toFixed(1)}mm`, diag.runningFaStdDevMm < STABILITY_LENGTH_STDDEV_MM],
+                              ['Win size',    `${diag.windowFrameCount}/${STABILITY_WINDOW}`,               diag.windowFrameCount >= STABILITY_WINDOW],
+                            ] as [string, string, boolean][]).map(([label, val, ok]) => (
+                              <div key={label} className="flex justify-between gap-2">
                                 <span className="text-gray-600">{label}</span>
-                                <span className={String(ok) === 'true' ? 'text-gray-300' : 'text-yellow-400'}>{val}</span>
+                                <span className={ok ? 'text-gray-300' : 'text-yellow-400'}>{val}</span>
                               </div>
                             ))}
                           </div>
@@ -1846,20 +1972,24 @@ export function IMULabView() {
                     <div className="border-t border-gray-700 pt-3 mt-1">
                       <p className="text-xs text-gray-400 font-semibold mb-2">Calibration Consistency Residuals</p>
                       <p className="text-xs text-gray-600 mb-2 italic">
-                        Each stored pose quaternion replayed through the estimated model vs recorded stereo direction.
+                        Per-frame residuals: A·R(q)·b vs recorded stereo direction, averaged per pose.
                         Good: &lt;10°  Warning: 10–25°  Failed: &gt;25°
                       </p>
                       <div className="grid grid-cols-3 gap-2 text-xs mb-3">
-                        {[0,1,2].map(i => (
+                        {[
+                          [v.pose1UaResidualDeg, v.pose1FaResidualDeg],
+                          [v.pose2UaResidualDeg, v.pose2FaResidualDeg],
+                          [v.pose3UaResidualDeg, v.pose3FaResidualDeg],
+                        ].map(([uaR, faR], i) => (
                           <div key={i} className="bg-gray-800/60 rounded p-2 space-y-1">
                             <p className="text-gray-500 font-semibold">Pose {i+1}</p>
                             <div className="flex justify-between">
                               <span className="text-gray-600">UA</span>
-                              {resDeg([v.pose1UaResidualDeg, v.pose2UaResidualDeg, v.pose3UaResidualDeg][i])}
+                              {resDeg(uaR)}
                             </div>
                             <div className="flex justify-between">
                               <span className="text-gray-600">FA</span>
-                              {resDeg([v.pose1FaResidualDeg, v.pose2FaResidualDeg, v.pose3FaResidualDeg][i])}
+                              {resDeg(faR)}
                             </div>
                           </div>
                         ))}
@@ -1889,7 +2019,7 @@ export function IMULabView() {
                             ok ? 'bg-green-900/30 border border-green-800 text-green-300'
                                : 'bg-red-900/30 border border-red-700 text-red-300'
                           }`}>
-                            {ok ? `✓ ${label}` : `✗ ${label} — calibration poses not diverse enough`}
+                            {ok ? `✓ ${label}` : `✗ ${label} — ALS did not converge, try more distinct poses`}
                           </div>
                         ))}
                       </div>
@@ -1905,13 +2035,13 @@ export function IMULabView() {
                       )}
                       {armCalibration.quality === 'failed' && !armCalibration.error && (
                         <span className="text-red-400 w-full">
-                          {(!v.alignOkUA || !v.alignOkFA) ? 'Frame alignment failed — poses are too similar. Hold distinct poses (lateral / forward / forearm-up). ' : ''}
-                          {v.maxResidualDeg > 25 ? 'High residuals (>25°) — sensor may have shifted, or poses were not distinct enough. Recalibrate.' : ''}
+                          {(!v.alignOkUA || !v.alignOkFA) ? 'ALS did not converge — poses may not be diverse enough. Ensure poses 1 and 2 differ significantly for UA, and poses 1 and 3 for FA. ' : ''}
+                          {v.maxResidualDeg > 25 ? 'High residuals (>25°) — sensor may have shifted between poses, or arm was not held still. Recalibrate.' : ''}
                         </span>
                       )}
                       {armCalibration.quality === 'warning' && (
                         <span className="text-yellow-500 w-full">
-                          Moderate residuals (10–25°) — reconstruction will work but may have some directional error. Stand closer to cameras or hold poses more steadily for better results.
+                          Moderate residuals (10–25°) — reconstruction will work but may have some directional error. Hold poses more steadily or stand closer to cameras for better results.
                         </span>
                       )}
                     </div>
@@ -1927,8 +2057,8 @@ export function IMULabView() {
                   title={!canCalibrate ? 'All conditions must be met' : undefined}
                 >
                   {calibInProgress
-                    ? `Pose ${activePoseIdx + 1}/4 — ${calibStatus.startsWith('countdown') ? `Get ready… ${countdownSec}` : 'Capturing...'}`
-                    : 'Calibrate Right Arm (4-Pose)'}
+                    ? `Pose ${activePoseIdx + 1}/3 — ${calibStatus.startsWith('countdown') ? `Get ready… ${countdownSec}` : 'Capturing...'}`
+                    : 'Calibrate Right Arm (3-Pose ALS)'}
                 </Button>
                 <Button variant="outline" onClick={clearCalibration}
                   className="border-gray-600 text-gray-300 hover:bg-red-900/20 text-sm">
@@ -2079,7 +2209,7 @@ export function IMULabView() {
                         </p>
                         <p className="text-gray-600 italic mb-2">
                           Fixed bone direction in each IMU sensor frame.
-                          Averaged across {armCalibration.poses.reduce((s, p) => s + p.framesUsed, 0)} total frames (4 poses).
+                          Averaged across {armCalibration.poses.reduce((s, p) => s + p.framesUsed, 0)} total frames (2 poses).
                           Never updated at runtime.
                         </p>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1.5">

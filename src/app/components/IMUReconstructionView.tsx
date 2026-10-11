@@ -225,8 +225,8 @@ export function IMUReconstructionView({
 
   const displayVideo1Ref = useRef<HTMLVideoElement | null>(null);
   const displayVideo2Ref = useRef<HTMLVideoElement | null>(null);
-  useEffect(() => { if (displayVideo1Ref.current && camera1Stream) displayVideo1Ref.current.srcObject = camera1Stream; }, [camera1Stream]);
-  useEffect(() => { if (displayVideo2Ref.current && camera2Stream) displayVideo2Ref.current.srcObject = camera2Stream; }, [camera2Stream]);
+  useEffect(() => { if (displayVideo1Ref.current) displayVideo1Ref.current.srcObject = camera1Stream; }, [camera1Stream]);
+  useEffect(() => { if (displayVideo2Ref.current) displayVideo2Ref.current.srcObject = camera2Stream; }, [camera2Stream]);
 
   const calibration = calibrationResult ?? preloadedCalibration ?? null;
 
@@ -485,9 +485,9 @@ export function IMUReconstructionView({
           // Phase A placeholder: right arm joints only from stereo raw pose
           const rightArmPlaceholder: TriangulatedPose = {
             ...Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])),
-            rightShoulder: rawPose.rightShoulder,
-            rightElbow:    rawPose.rightElbow,
-            rightWrist:    rawPose.rightWrist,
+            rightShoulder: correctedPose.rightShoulder,
+            rightElbow:    correctedPose.rightElbow,
+            rightWrist:    correctedPose.rightWrist,
           } as TriangulatedPose;
           const imuDisplayPose = imuReconstructionPose ?? rightArmPlaceholder;
 
