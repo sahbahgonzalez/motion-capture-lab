@@ -233,7 +233,8 @@ export function CalibrationView({
         }
 
         const cv = window.cv;
-        const patternSize = { width: cols - 1, height: rows - 1 };
+        // cols/rows are inner-corner counts (Squares − 1) as labeled in the UI.
+        const patternSize = { width: cols, height: rows };
 
         setImportProgress({ done: 0, total: rawCaptures.length });
         setImportStatus('Detecting checkerboard corners in each image…');

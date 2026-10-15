@@ -169,16 +169,17 @@ function getArmStabilityMetrics(
   faLengthStdDevMm: number;
   isStable: boolean;
 } {
+  const nonZero = (d: {x:number;y:number;z:number}) => d.x !== 0 || d.y !== 0 || d.z !== 0;
   const uaDirs = buf.map(b => normalize3({
     x: b.elbow.x - b.shoulder.x,
     y: b.elbow.y - b.shoulder.y,
     z: b.elbow.z - b.shoulder.z,
-  }));
+  })).filter(nonZero);
   const faDirs = buf.map(b => normalize3({
     x: b.wrist.x - b.elbow.x,
     y: b.wrist.y - b.elbow.y,
     z: b.wrist.z - b.elbow.z,
-  }));
+  })).filter(nonZero);
   const uaLens = buf.map(b => dist3D(b.shoulder, b.elbow));
   const faLens = buf.map(b => dist3D(b.elbow, b.wrist));
 
@@ -946,13 +947,18 @@ export function IMULabView() {
   useEffect(() => {
     if (calibStatus !== 'collecting1' || pose1Frames.length < CALIBRATION_FRAMES_NEEDED) return;
     // Store avg UA/FA directions from pose 1 for validating poses 2 and 3
-    const uaDirs = pose1Frames.map(f => normalize3({ x: f.elbow.x-f.shoulder.x, y: f.elbow.y-f.shoulder.y, z: f.elbow.z-f.shoulder.z }));
-    const faDirs = pose1Frames.map(f => normalize3({ x: f.wrist.x-f.elbow.x,   y: f.wrist.y-f.elbow.y,   z: f.wrist.z-f.elbow.z   }));
+    const _nz = (d: {x:number;y:number;z:number}) => d.x !== 0 || d.y !== 0 || d.z !== 0;
+    const uaDirs = pose1Frames.map(f => normalize3({ x: f.elbow.x-f.shoulder.x, y: f.elbow.y-f.shoulder.y, z: f.elbow.z-f.shoulder.z })).filter(_nz);
+    const faDirs = pose1Frames.map(f => normalize3({ x: f.wrist.x-f.elbow.x,   y: f.wrist.y-f.elbow.y,   z: f.wrist.z-f.elbow.z   })).filter(_nz);
     const uaAvg = averageVec3Simple(uaDirs);
     const faAvg = averageVec3Simple(faDirs);
-    if (uaAvg && faAvg) {
-      pose1AvgDirsRef.current = { ua: { x: uaAvg[0], y: uaAvg[1], z: uaAvg[2] }, fa: { x: faAvg[0], y: faAvg[1], z: faAvg[2] } };
+    if (!uaAvg || !faAvg) {
+      console.warn('[IMU CALIB] Pose 1 directions inconsistent (frames cancelled) — resetting to idle');
+      setCalibStatus('idle');
+      return;
     }
+    pose1AvgDirsRef.current = { ua: { x: uaAvg[0], y: uaAvg[1], z: uaAvg[2] }, fa: { x: faAvg[0], y: faAvg[1], z: faAvg[2] } };
+    calibSampleDiagRef.current = null;
     stabilityWindowRef.current = [];
     lastProcessedStereoTimestampRef.current = 0;
     lastAcceptedTimestampRef.current = -1;
@@ -963,6 +969,7 @@ export function IMULabView() {
   // ── Auto-advance: pose 2 collected → start countdown for pose 3 ──────────────
   useEffect(() => {
     if (calibStatus !== 'collecting2' || pose2Frames.length < CALIBRATION_FRAMES_NEEDED) return;
+    calibSampleDiagRef.current = null;
     stabilityWindowRef.current = [];
     lastProcessedStereoTimestampRef.current = 0;
     lastAcceptedTimestampRef.current = -1;
@@ -987,8 +994,9 @@ export function IMULabView() {
     const poseData: PoseCalibData[] = allPoseFrames.map((frames, poseIdx) => {
       const imu01Avg = averageQuaternions(frames.map(f => packetToQuat(f.imu01)));
       const imu02Avg = averageQuaternions(frames.map(f => packetToQuat(f.imu02)));
-      const uaDirs = frames.map(f => normalize3({ x: f.elbow.x-f.shoulder.x, y: f.elbow.y-f.shoulder.y, z: f.elbow.z-f.shoulder.z }));
-      const faDirs = frames.map(f => normalize3({ x: f.wrist.x-f.elbow.x,   y: f.wrist.y-f.elbow.y,   z: f.wrist.z-f.elbow.z   }));
+      const _nz2 = (d: {x:number;y:number;z:number}) => d.x !== 0 || d.y !== 0 || d.z !== 0;
+      const uaDirs = frames.map(f => normalize3({ x: f.elbow.x-f.shoulder.x, y: f.elbow.y-f.shoulder.y, z: f.elbow.z-f.shoulder.z })).filter(_nz2);
+      const faDirs = frames.map(f => normalize3({ x: f.wrist.x-f.elbow.x,   y: f.wrist.y-f.elbow.y,   z: f.wrist.z-f.elbow.z   })).filter(_nz2);
       const uaVec = averageVec3Simple(uaDirs);
       const faVec = averageVec3Simple(faDirs);
       if (!uaVec) throw new CalibFailed(`Pose ${poseIdx + 1} upper-arm stereo directions are inconsistent (frames cancelled) — arm drifted during capture, recalibrate`);
@@ -1086,7 +1094,7 @@ export function IMULabView() {
           timestamp: Date.now(),
           uaBoneLocalDir: [1,0,0], faBoneLocalDir: [0,0,1],
           R_ua: IDENTITY_MAT3, R_fa: IDENTITY_MAT3,
-          uaLengthMm: 0, uaLengthStdDevMm: 0, faLengthMm: 0, faLengthStdDevMm: 0,
+          uaLengthMm: 300, uaLengthStdDevMm: 0, faLengthMm: 300, faLengthStdDevMm: 0,
           poses: [DUMMY_POSE, DUMMY_POSE, DUMMY_POSE],
           validation: { pose1UaResidualDeg:0, pose1FaResidualDeg:0, pose2UaResidualDeg:0, pose2FaResidualDeg:0, pose3UaResidualDeg:0, pose3FaResidualDeg:0, meanUaResidualDeg:0, meanFaResidualDeg:0, maxResidualDeg:0, alignOkUA:false, alignOkFA:false },
           quality: 'failed',
@@ -1292,7 +1300,7 @@ export function IMULabView() {
 
     // Calibrated segment-length gate (active only after calibration)
     const calibData = armCalibrationRef.current;
-    const segCalibOk = calibData
+    const segCalibOk = (calibData && calibData.uaLengthMm > 0 && calibData.faLengthMm > 0)
       ? Math.abs(uaLen - calibData.uaLengthMm) / calibData.uaLengthMm <= 0.20 &&
         Math.abs(faLen - calibData.faLengthMm) / calibData.faLengthMm <= 0.20
       : true;
@@ -1880,7 +1888,7 @@ export function IMULabView() {
                           <div className="grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs font-mono">
                             {([
                               ['Elbow angle',     diag.elbowAngleDeg !== null ? `${diag.elbowAngleDeg.toFixed(1)}°` : '—',
-                                diag.elbowAngleDeg !== null && diag.elbowAngleDeg >= 35 && diag.elbowAngleDeg <= 140],
+                                diag.elbowAngleDeg !== null && (i < 2 ? diag.elbowAngleDeg <= 35 : diag.elbowAngleDeg >= 35 && diag.elbowAngleDeg <= 140)],
                               ['UA drift P1',     diag.uaDriftFromPose1Deg !== null ? `${diag.uaDriftFromPose1Deg.toFixed(1)}°` : '—',
                                 diag.uaDriftFromPose1Deg !== null && diag.uaDriftFromPose1Deg <= 40],
                               ['FA Δ from P1',    diag.faDeltaFromPose1Deg !== null ? `${diag.faDeltaFromPose1Deg.toFixed(1)}°` : '—',
@@ -2209,7 +2217,7 @@ export function IMULabView() {
                         </p>
                         <p className="text-gray-600 italic mb-2">
                           Fixed bone direction in each IMU sensor frame.
-                          Averaged across {armCalibration.poses.reduce((s, p) => s + p.framesUsed, 0)} total frames (2 poses).
+                          Averaged across {armCalibration.poses.reduce((s, p) => s + p.framesUsed, 0)} total frames (3 poses).
                           Never updated at runtime.
                         </p>
                         <div className="grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-1.5">
