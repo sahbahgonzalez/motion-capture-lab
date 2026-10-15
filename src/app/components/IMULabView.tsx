@@ -289,6 +289,14 @@ function transpMat3(M: Mat3): Mat3 {
   return [[M[0][0],M[1][0],M[2][0]],[M[0][1],M[1][1],M[2][1]],[M[0][2],M[1][2],M[2][2]]];
 }
 
+function matMul3(A: Mat3, B: Mat3): Mat3 {
+  return [
+    [ A[0][0]*B[0][0]+A[0][1]*B[1][0]+A[0][2]*B[2][0], A[0][0]*B[0][1]+A[0][1]*B[1][1]+A[0][2]*B[2][1], A[0][0]*B[0][2]+A[0][1]*B[1][2]+A[0][2]*B[2][2] ],
+    [ A[1][0]*B[0][0]+A[1][1]*B[1][0]+A[1][2]*B[2][0], A[1][0]*B[0][1]+A[1][1]*B[1][1]+A[1][2]*B[2][1], A[1][0]*B[0][2]+A[1][1]*B[1][2]+A[1][2]*B[2][2] ],
+    [ A[2][0]*B[0][0]+A[2][1]*B[1][0]+A[2][2]*B[2][0], A[2][0]*B[0][1]+A[2][1]*B[1][1]+A[2][2]*B[2][1], A[2][0]*B[0][2]+A[2][1]*B[1][2]+A[2][2]*B[2][2] ],
+  ];
+}
+
 
 /**
  * Weighted Wahba/Kabsch SVD: find rotation R minimizing Σ w_i ||R*s_i - d_i||^2.
@@ -348,17 +356,21 @@ interface ALSObs { q: Quaternion; d: {x:number;y:number;z:number} }
 function solveALS(
   obs: ALSObs[],
   A_init: Mat3,
-): { A: Mat3; b: Vec3; converged: boolean; ok: boolean } {
-  if (obs.length < 3) return { A: A_init, b: [1,0,0], converged: false, ok: false };
+): { A: Mat3; b: Vec3; converged: boolean; ok: boolean; iterCount: number; finalDeltaDeg: number } {
+  if (obs.length < 3) return { A: A_init, b: [1,0,0], converged: false, ok: false, iterCount: 0, finalDeltaDeg: 999 };
 
-  const G_S = { x: 0, y: 0, z: -1 };  // gravity in IMU world (source)
-  const G_D = { x: 0, y: 1, z: 0  };  // gravity in stereo world (target)
-  const GRAVITY_W = 5;
-  const MAX_ITER = 30;
-  const TOL_DEG = 0.05;
+  const G_S = { x: 0, y: 0, z: -1 };  // gravity in IMU world (BNO085: Z-up, gravity = -Z)
+  const G_D = { x: 0, y: 1, z: 0  };  // gravity in stereo world (OpenCV: Y-down = +Y)
+  // Weight increased from 5 → 20: gravity now contributes ~13% of ~150 frame observations,
+  // enough to meaningfully constrain tilt without dominating the data.
+  const GRAVITY_W = 20;
+  const MAX_ITER = 100;   // increased from 30; allows slower-converging yaw initializations to settle
+  const TOL_DEG = 0.05;  // tight convergence — do not relax
 
   let A: Mat3 = A_init;
   let b: Vec3 = [1, 0, 0];
+  let lastDeltaDeg = 999;
+  let stagnationCount = 0;
 
   for (let iter = 0; iter < MAX_ITER; iter++) {
     // b-step: b = normalize(Σ R(q_i)^T * A^T * d_i)
@@ -370,10 +382,10 @@ function solveALS(
       bx += b_s[0]; by += b_s[1]; bz += b_s[2];
     }
     const bMag = Math.sqrt(bx*bx + by*by + bz*bz);
-    if (bMag < 1e-6) return { A, b, converged: false, ok: false };
+    if (bMag < 1e-6) return { A, b, converged: false, ok: false, iterCount: iter + 1, finalDeltaDeg: lastDeltaDeg };
     b = [bx/bMag, by/bMag, bz/bMag];
 
-    // A-step: s_i = R(q_i)*b; solve A via Wahba on {(s_i, d_i)} + gravity
+    // A-step: s_i = R(q_i)*b; solve A via Wahba on {(s_i, d_i)} + gravity regularizer
     const pairs: Array<{ s: {x:number;y:number;z:number}; d: {x:number;y:number;z:number}; w: number }> = [];
     for (const { q, d } of obs) {
       const sv = rotateVectorByQuaternion(q, b);
@@ -382,15 +394,25 @@ function solveALS(
     pairs.push({ s: G_S, d: G_D, w: GRAVITY_W });
 
     const A_new = wahbaFromPairs(pairs);
-    if (!A_new) return { A, b, converged: false, ok: false };
+    if (!A_new) return { A, b, converged: false, ok: false, iterCount: iter + 1, finalDeltaDeg: lastDeltaDeg };
 
-    // Convergence: angle of relative rotation A^T * A_new
+    // Convergence: angle of rotation change A^T * A_new
     const trace =
       A[0][0]*A_new[0][0] + A[1][0]*A_new[1][0] + A[2][0]*A_new[2][0]
     + A[0][1]*A_new[0][1] + A[1][1]*A_new[1][1] + A[2][1]*A_new[2][1]
     + A[0][2]*A_new[0][2] + A[1][2]*A_new[1][2] + A[2][2]*A_new[2][2];
     const angleDeg = Math.acos(Math.max(-1, Math.min(1, (trace - 1) / 2))) * RAD2DEG;
+
+    // Stagnation: if iteration delta barely changes for 10 consecutive steps, the solver
+    // has plateaued at a local minimum and further iterations won't help.
+    if (Math.abs(lastDeltaDeg - angleDeg) < 1e-4) {
+      stagnationCount++;
+    } else {
+      stagnationCount = 0;
+    }
+    lastDeltaDeg = angleDeg;
     A = A_new;
+
     if (angleDeg < TOL_DEG) {
       // Final b refinement with converged A
       const A_Tf = transpMat3(A);
@@ -402,11 +424,95 @@ function solveALS(
       }
       const bMagF = Math.sqrt(bxf*bxf + byf*byf + bzf*bzf);
       if (bMagF > 1e-6) b = [bxf/bMagF, byf/bMagF, bzf/bMagF];
-      return { A, b, converged: true, ok: true };
+      return { A, b, converged: true, ok: true, iterCount: iter + 1, finalDeltaDeg: angleDeg };
     }
+
+    if (stagnationCount >= 10) break;  // plateaued; don't waste more iterations
   }
 
-  return { A, b, converged: false, ok: true };
+  return { A, b, converged: false, ok: true, iterCount: MAX_ITER, finalDeltaDeg: lastDeltaDeg };
+}
+
+/**
+ * Multi-initialization ALS solver.
+ *
+ * Runs solveALS from 12 evenly-spaced yaw rotations around the gravity axis
+ * (every 30°). Each initialization is gravity-consistent: A_init*[0,0,-1]=[0,1,0].
+ * The solution with the lowest mean per-frame residual (with a small gravity
+ * regularization penalty) is selected. Solutions within 1° of the best but with
+ * materially different A matrices (>15°) trigger an ambiguity warning.
+ */
+function solveALSMultiInit(obs: ALSObs[], nYaw = 12): {
+  A: Mat3; b: Vec3; converged: boolean; ok: boolean;
+  iterCount: number; finalDeltaDeg: number;
+  gravityErrorDeg: number; perFrameResidualMeanDeg: number;
+  initYawDeg: number; ambiguous: boolean;
+} {
+  const A_BASE: Mat3 = [[1,0,0],[0,0,-1],[0,1,0]];
+  const AMBIGUITY_RESIDUAL_TOL = 1.0;  // °: solutions this close are "tied"
+  const AMBIGUITY_ROTATION_TOL = 15.0; // °: tied solutions differing more than this are ambiguous
+
+  type Candidate = ReturnType<typeof solveALS> & {
+    gravityErrorDeg: number;
+    perFrameResidualMeanDeg: number;
+    yawDeg: number;
+  };
+  const candidates: Candidate[] = [];
+
+  for (let i = 0; i < nYaw; i++) {
+    const θ = (2 * Math.PI * i) / nYaw;
+    const c = Math.cos(θ), s = Math.sin(θ);
+    // Pre-rotate around the IMU-world Z-axis (gravity axis) to explore all yaw initializations
+    const Yaw: Mat3 = [[c, -s, 0], [s, c, 0], [0, 0, 1]];
+    const A_init = matMul3(A_BASE, Yaw);
+    const result = solveALS(obs, A_init);
+    if (!result.ok) continue;
+
+    // Gravity alignment error: how far is A*[0,0,-1] from [0,1,0]?
+    const gMapped = matVec3(result.A, { x: 0, y: 0, z: -1 });
+    const gravityErrorDeg = angleBetweenDeg(gMapped, { x: 0, y: 1, z: 0 });
+
+    // Mean per-frame residual for ranking
+    let totalRes = 0; let validCnt = 0;
+    for (const { q, d } of obs) {
+      const sv = rotateVectorByQuaternion(q, result.b);
+      const pred = normalize3(matVec3(result.A, { x: sv[0], y: sv[1], z: sv[2] }));
+      if (pred.x !== 0 || pred.y !== 0 || pred.z !== 0) {
+        totalRes += angleBetweenDeg(pred, d); validCnt++;
+      }
+    }
+    const perFrameResidualMeanDeg = validCnt > 0 ? totalRes / validCnt : 999;
+
+    candidates.push({ ...result, gravityErrorDeg, perFrameResidualMeanDeg, yawDeg: (360 * i) / nYaw });
+  }
+
+  if (candidates.length === 0) {
+    return { A: A_BASE, b: [1,0,0], converged: false, ok: false,
+             iterCount: 0, finalDeltaDeg: 999,
+             gravityErrorDeg: 999, perFrameResidualMeanDeg: 999, initYawDeg: 0, ambiguous: false };
+  }
+
+  // Primary sort: residual; secondary: small gravity-error penalty (5% weight)
+  candidates.sort((a, b) =>
+    (a.perFrameResidualMeanDeg + 0.05 * a.gravityErrorDeg) -
+    (b.perFrameResidualMeanDeg + 0.05 * b.gravityErrorDeg),
+  );
+  const best = candidates[0];
+
+  // Ambiguity: another solution within AMBIGUITY_RESIDUAL_TOL but with a
+  // materially different A matrix (different physical prediction)
+  let ambiguous = false;
+  for (let i = 1; i < candidates.length && !ambiguous; i++) {
+    const cand = candidates[i];
+    if (Math.abs(cand.perFrameResidualMeanDeg - best.perFrameResidualMeanDeg) > AMBIGUITY_RESIDUAL_TOL) break;
+    // Rotation angle between best.A and cand.A via trace of (best.A)^T * cand.A
+    let tr = 0;
+    for (let r = 0; r < 3; r++) for (let cc = 0; cc < 3; cc++) tr += best.A[r][cc] * cand.A[r][cc];
+    const diffDeg = Math.acos(Math.max(-1, Math.min(1, (tr - 1) / 2))) * RAD2DEG;
+    if (diffDeg > AMBIGUITY_ROTATION_TOL) ambiguous = true;
+  }
+
+  return { ...best, initYawDeg: best.yawDeg, ambiguous };
 }
 
 // ── Calibration failure sentinel ─────────────────────────────────────────────
@@ -457,10 +563,24 @@ interface CalibValidation {
   pose3FaResidualDeg:  number;
   meanUaResidualDeg:   number;
   meanFaResidualDeg:   number;
+  /** Max of per-pose mean residuals (original field — kept for quality threshold). */
   maxResidualDeg:      number;
+  /** Max individual-frame residual across all poses and both segments. */
+  maxFrameResidualDeg: number;
   /** True if ALS converged and observations are well-conditioned for each IMU. */
   alignOkUA:           boolean;
   alignOkFA:           boolean;
+  /** ALS iteration counts for each sensor. */
+  uaIterCount:         number;
+  faIterCount:         number;
+  /** Gravity alignment error: angle between A*[0,0,-1] and [0,1,0] in degrees. */
+  gravityErrorDegUA:   number;
+  gravityErrorDegFA:   number;
+  /** True when multiple initializations produce similar residuals but different A matrices. */
+  ambiguous:           boolean;
+  /** Winning yaw initialization for each sensor (degrees). */
+  uaInitYawDeg:        number;
+  faInitYawDeg:        number;
 }
 
 interface ArmCalibration {
@@ -536,9 +656,17 @@ function computeValidation(
   R_fa: Mat3,
   alignOkUA: boolean,
   alignOkFA: boolean,
+  uaIterCount: number,
+  faIterCount: number,
+  gravityErrorDegUA: number,
+  gravityErrorDegFA: number,
+  ambiguous: boolean,
+  uaInitYawDeg: number,
+  faInitYawDeg: number,
 ): CalibValidation {
   const poseUaMeans: number[] = [];
   const poseFaMeans: number[] = [];
+  const allFrameResiduals: number[] = [];
 
   for (const frames of allPoseFrames) {
     const uaRes: number[] = [];
@@ -552,8 +680,11 @@ function computeValidation(
       const faWorld = rotateVectorByQuaternion(qFA, faBoneLocalDir);
       const predUA = normalize3(matVec3(R_ua, { x: uaWorld[0], y: uaWorld[1], z: uaWorld[2] }));
       const predFA = normalize3(matVec3(R_fa, { x: faWorld[0], y: faWorld[1], z: faWorld[2] }));
-      uaRes.push(angleBetweenDeg(predUA, sUA));
-      faRes.push(angleBetweenDeg(predFA, sFA));
+      const rUA = angleBetweenDeg(predUA, sUA);
+      const rFA = angleBetweenDeg(predFA, sFA);
+      uaRes.push(rUA);
+      faRes.push(rFA);
+      allFrameResiduals.push(rUA, rFA);
     }
     const meanOf = (a: number[]) => a.length ? a.reduce((s,v)=>s+v,0)/a.length : 0;
     poseUaMeans.push(meanOf(uaRes));
@@ -565,6 +696,7 @@ function computeValidation(
   const meanUA = allUA.reduce((s,v)=>s+v,0) / (allUA.length || 1);
   const meanFA = allFA.reduce((s,v)=>s+v,0) / (allFA.length || 1);
   const maxRes = Math.max(...allUA, ...allFA, 0);
+  const maxFrameRes = allFrameResiduals.length > 0 ? Math.max(...allFrameResiduals) : 0;
 
   return {
     pose1UaResidualDeg: allUA[0] ?? 0, pose1FaResidualDeg: allFA[0] ?? 0,
@@ -573,8 +705,16 @@ function computeValidation(
     meanUaResidualDeg: meanUA,
     meanFaResidualDeg: meanFA,
     maxResidualDeg: maxRes,
+    maxFrameResidualDeg: maxFrameRes,
     alignOkUA,
     alignOkFA,
+    uaIterCount,
+    faIterCount,
+    gravityErrorDegUA,
+    gravityErrorDegFA,
+    ambiguous,
+    uaInitYawDeg,
+    faInitYawDeg,
   };
 }
 
@@ -1023,14 +1163,11 @@ export function IMULabView() {
       }
     }
 
-    // Step 3: Initialize A with gravity constraint.
-    // A_init maps IMU world gravity [0,0,-1] → stereo gravity [0,1,0].
-    // Verified: A_init*[0,0,-1]=[0,1,0], det(A_init)=1.
-    const A_GRAVITY_INIT: Mat3 = [[1,0,0],[0,0,-1],[0,1,0]];
-
-    // Step 4: Alternating least-squares — solve A and b jointly
-    const uaResult = solveALS(uaObs, A_GRAVITY_INIT);
-    const faResult = solveALS(faObs, A_GRAVITY_INIT);
+    // Step 3: Alternating least-squares with multi-initialization.
+    // solveALSMultiInit tries 12 evenly-spaced yaw initializations (each gravity-consistent)
+    // and returns the solution with the lowest mean per-frame residual.
+    const uaResult = solveALSMultiInit(uaObs);
+    const faResult = solveALSMultiInit(faObs);
 
     if (!uaResult.ok) throw new CalibFailed('UA sensor calibration failed (degenerate observations) — ensure poses are distinct and arm holds still, then recalibrate');
     if (!faResult.ok) throw new CalibFailed('FA sensor calibration failed (degenerate observations) — ensure poses are distinct and arm holds still, then recalibrate');
@@ -1040,30 +1177,50 @@ export function IMULabView() {
     const uaBoneLocalDir = uaResult.b;
     const faBoneLocalDir = faResult.b;
 
-    console.info('[IMU CALIB] ALS result', {
+    console.info('[IMU CALIB] ALS multi-init result', {
       uaConverged: uaResult.converged, faConverged: faResult.converged,
+      uaIterCount: uaResult.iterCount, faIterCount: faResult.iterCount,
+      uaInitYawDeg: uaResult.initYawDeg, faInitYawDeg: faResult.initYawDeg,
+      uaAmbiguous: uaResult.ambiguous, faAmbiguous: faResult.ambiguous,
+      uaGravityErrorDeg: uaResult.gravityErrorDeg.toFixed(2),
+      faGravityErrorDeg: faResult.gravityErrorDeg.toFixed(2),
       uaBoneLocalDir, faBoneLocalDir,
-      gravityCheckUA: (() => { const g = matVec3(R_ua,{x:0,y:0,z:-1}); return `x${g.x.toFixed(3)} y${g.y.toFixed(3)} z${g.z.toFixed(3)}`; })(),
-      gravityCheckFA: (() => { const g = matVec3(R_fa,{x:0,y:0,z:-1}); return `x${g.x.toFixed(3)} y${g.y.toFixed(3)} z${g.z.toFixed(3)}`; })(),
     });
 
-    // Step 5: Validation — per-frame residuals per pose
-    const validation = computeValidation(allPoseFrames, uaBoneLocalDir, faBoneLocalDir, R_ua, R_fa, uaResult.converged, faResult.converged);
+    // Reject if gravity alignment error is large: indicates the IMU world frame
+    // does not match the expected convention, which would corrupt reconstruction.
+    if (uaResult.gravityErrorDeg > 20) throw new CalibFailed(`UA gravity alignment error ${uaResult.gravityErrorDeg.toFixed(1)}° exceeds 20° — IMU world frame may be misconfigured or arm was not held still`);
+    if (faResult.gravityErrorDeg > 20) throw new CalibFailed(`FA gravity alignment error ${faResult.gravityErrorDeg.toFixed(1)}° exceeds 20° — IMU world frame may be misconfigured or arm was not held still`);
+
+    // Step 4: Validation — per-frame residuals per pose
+    const validation = computeValidation(
+      allPoseFrames, uaBoneLocalDir, faBoneLocalDir, R_ua, R_fa,
+      uaResult.converged, faResult.converged,
+      uaResult.iterCount, faResult.iterCount,
+      uaResult.gravityErrorDeg, faResult.gravityErrorDeg,
+      uaResult.ambiguous || faResult.ambiguous,
+      uaResult.initYawDeg, faResult.initYawDeg,
+    );
 
     console.info('[IMU CALIB] per-pose residuals', {
       pose1: { ua: validation.pose1UaResidualDeg.toFixed(1), fa: validation.pose1FaResidualDeg.toFixed(1) },
       pose2: { ua: validation.pose2UaResidualDeg.toFixed(1), fa: validation.pose2FaResidualDeg.toFixed(1) },
       pose3: { ua: validation.pose3UaResidualDeg.toFixed(1), fa: validation.pose3FaResidualDeg.toFixed(1) },
       mean: { ua: validation.meanUaResidualDeg.toFixed(1), fa: validation.meanFaResidualDeg.toFixed(1) },
-      max: validation.maxResidualDeg.toFixed(1),
+      maxPoseMean: validation.maxResidualDeg.toFixed(1),
+      maxFrame: validation.maxFrameResidualDeg.toFixed(1),
+      ambiguous: validation.ambiguous,
     });
 
     const allUaLengths = allPoseFrames.flatMap(frames => frames.map(f => dist3D(f.shoulder, f.elbow)));
     const allFaLengths = allPoseFrames.flatMap(frames => frames.map(f => dist3D(f.elbow, f.wrist)));
 
     const quality: ArmCalibration['quality'] =
-      (!validation.alignOkUA || !validation.alignOkFA || validation.maxResidualDeg > 25) ? 'failed'
-      : validation.maxResidualDeg > 10 ? 'warning'
+      (!validation.alignOkUA || !validation.alignOkFA
+       || validation.maxResidualDeg > 25
+       || validation.gravityErrorDegUA > 15
+       || validation.gravityErrorDegFA > 15) ? 'failed'
+      : (validation.maxResidualDeg > 10 || validation.ambiguous) ? 'warning'
       : 'good';
 
     const result: ArmCalibration = {
@@ -1085,6 +1242,9 @@ export function IMULabView() {
 
     } catch (err) {
       if (err instanceof CalibFailed) {
+        // Failure path: do NOT fabricate usable calibration parameters.
+        // Runtime reconstruction rejects quality:'failed' calibrations explicitly.
+        // Lengths are 0 (invalid) to make misuse obvious; identity rotations are sentinels only.
         const DUMMY_POSE: PoseCalibData = {
           imu01: [1,0,0,0], imu02: [1,0,0,0],
           stereoUA: {x:1,y:0,z:0}, stereoFA: {x:0,y:0,z:1},
@@ -1094,9 +1254,19 @@ export function IMULabView() {
           timestamp: Date.now(),
           uaBoneLocalDir: [1,0,0], faBoneLocalDir: [0,0,1],
           R_ua: IDENTITY_MAT3, R_fa: IDENTITY_MAT3,
-          uaLengthMm: 300, uaLengthStdDevMm: 0, faLengthMm: 300, faLengthStdDevMm: 0,
+          uaLengthMm: 0, uaLengthStdDevMm: 0, faLengthMm: 0, faLengthStdDevMm: 0,
           poses: [DUMMY_POSE, DUMMY_POSE, DUMMY_POSE],
-          validation: { pose1UaResidualDeg:0, pose1FaResidualDeg:0, pose2UaResidualDeg:0, pose2FaResidualDeg:0, pose3UaResidualDeg:0, pose3FaResidualDeg:0, meanUaResidualDeg:0, meanFaResidualDeg:0, maxResidualDeg:0, alignOkUA:false, alignOkFA:false },
+          validation: {
+            pose1UaResidualDeg:0, pose1FaResidualDeg:0,
+            pose2UaResidualDeg:0, pose2FaResidualDeg:0,
+            pose3UaResidualDeg:0, pose3FaResidualDeg:0,
+            meanUaResidualDeg:0, meanFaResidualDeg:0,
+            maxResidualDeg:0, maxFrameResidualDeg:0,
+            alignOkUA:false, alignOkFA:false,
+            uaIterCount:0, faIterCount:0,
+            gravityErrorDegUA:999, gravityErrorDegFA:999,
+            ambiguous:false, uaInitYawDeg:0, faInitYawDeg:0,
+          },
           quality: 'failed',
           error: err.message,
         };
@@ -1185,7 +1355,10 @@ export function IMULabView() {
       // into the window repeatedly on subsequent timer ticks before the
       // next stereo frame arrives.
       const isNewStabilityFrame = lastProcessedStereoTimestampRef.current !== lastStabilityProcessedTimestampRef.current;
-      if (isNewStabilityFrame && jointsOk && shoulder && elbow && wrist) {
+      // Require segOk so frames with out-of-range (stereo-unreliable) bone lengths
+      // cannot accumulate in the window and falsely claim stability with fewer than
+      // STABILITY_WINDOW truly valid, distinct frames.
+      if (isNewStabilityFrame && jointsOk && segOk && shoulder && elbow && wrist) {
         stabilityWindowRef.current.push({ shoulder: {...shoulder}, elbow: {...elbow}, wrist: {...wrist} });
         if (stabilityWindowRef.current.length > STABILITY_WINDOW)
           stabilityWindowRef.current.shift();
@@ -1300,7 +1473,7 @@ export function IMULabView() {
 
     // Calibrated segment-length gate (active only after calibration)
     const calibData = armCalibrationRef.current;
-    const segCalibOk = (calibData && calibData.uaLengthMm > 0 && calibData.faLengthMm > 0)
+    const segCalibOk = (calibData && calibData.quality !== 'failed' && calibData.uaLengthMm > 0 && calibData.faLengthMm > 0)
       ? Math.abs(uaLen - calibData.uaLengthMm) / calibData.uaLengthMm <= 0.20 &&
         Math.abs(faLen - calibData.faLengthMm) / calibData.faLengthMm <= 0.20
       : true;
@@ -1359,7 +1532,8 @@ export function IMULabView() {
     // Convention: BNO085 q maps sensor-local vectors → world frame.
     //   rotate(q, v_sensor) = v_world
     //   rotate(inv(q), v_world) = v_sensor
-    if (!calibData) {
+    // A failed calibration must never drive reconstruction: its R/b/length values are sentinels.
+    if (!calibData || calibData.quality === 'failed') {
       imuReconPoseRef.current = null;
       imuReconDebugRef.current = { ua: emptySegDebug(), fa: emptySegDebug() };
       return;
@@ -1375,7 +1549,10 @@ export function IMULabView() {
 
     const imu01Raw    = getRawIMURef.current('imu_01');
     const imu01Packet = imu01Raw?.latest;
-    if (!imu01Packet || !isValidQuat(packetToQuat(imu01Packet))) {
+    const imuNowMs    = performance.now();
+    const imu01ReconAgeMs = imu01Raw ? imuNowMs - imu01Raw.lastReceivedAt : Infinity;
+    // Stale IMU data must not produce a live reconstruction — treat as no signal.
+    if (!imu01Packet || !isValidQuat(packetToQuat(imu01Packet)) || imu01ReconAgeMs > 500) {
       imuReconPoseRef.current = null;
       imuReconDebugRef.current = { ua: emptySegDebug(), fa: emptySegDebug() };
       return;
@@ -1417,7 +1594,8 @@ export function IMULabView() {
     let reconWrist: {x:number;y:number;z:number} | null = null;
     let faDebug: SegmentReconDebug;
 
-    if (imu02Packet && isValidQuat(packetToQuat(imu02Packet))) {
+    const imu02ReconAgeMs = imu02Raw ? imuNowMs - imu02Raw.lastReceivedAt : Infinity;
+    if (imu02Packet && isValidQuat(packetToQuat(imu02Packet)) && imu02ReconAgeMs <= 500) {
       const qCurrentFA    = packetToQuat(imu02Packet);
       // sensor frame → IMU world → stereo world
       const boneImuWorldFA = rotateVectorByQuaternion(qCurrentFA, calibData.faBoneLocalDir);
@@ -2002,7 +2180,7 @@ export function IMULabView() {
                           </div>
                         ))}
                       </div>
-                      <div className="grid grid-cols-3 gap-2 text-xs">
+                      <div className="grid grid-cols-4 gap-2 text-xs">
                         <div className="bg-gray-800/60 rounded p-2">
                           <div className="text-gray-500 mb-0.5">Mean UA</div>
                           {resDeg(v.meanUaResidualDeg)}
@@ -2012,9 +2190,43 @@ export function IMULabView() {
                           {resDeg(v.meanFaResidualDeg)}
                         </div>
                         <div className="bg-gray-800/60 rounded p-2">
-                          <div className="text-gray-500 mb-0.5">Max</div>
+                          <div className="text-gray-500 mb-0.5">Max pose-mean</div>
                           {resDeg(v.maxResidualDeg)}
                         </div>
+                        <div className="bg-gray-800/60 rounded p-2">
+                          <div className="text-gray-500 mb-0.5">Max frame</div>
+                          {resDeg(v.maxFrameResidualDeg)}
+                        </div>
+                      </div>
+
+                      {/* Gravity alignment errors */}
+                      <div className="grid grid-cols-2 gap-2 text-xs mt-2">
+                        {[
+                          { label: 'Gravity err UA', deg: v.gravityErrorDegUA },
+                          { label: 'Gravity err FA', deg: v.gravityErrorDegFA },
+                        ].map(({ label, deg }) => (
+                          <div key={label} className="bg-gray-800/60 rounded p-2">
+                            <div className="text-gray-500 mb-0.5">{label}</div>
+                            <span className={deg > 15 ? 'text-red-400' : deg > 5 ? 'text-yellow-400' : 'text-green-400'}>
+                              {deg.toFixed(1)}°
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+
+                      {/* ALS solver diagnostics */}
+                      <div className="grid grid-cols-4 gap-2 text-xs mt-2">
+                        {[
+                          { label: 'UA iters', val: String(v.uaIterCount), ok: v.alignOkUA },
+                          { label: 'FA iters', val: String(v.faIterCount), ok: v.alignOkFA },
+                          { label: 'UA yaw init', val: `${v.uaInitYawDeg.toFixed(0)}°` },
+                          { label: 'FA yaw init', val: `${v.faInitYawDeg.toFixed(0)}°` },
+                        ].map(({ label, val, ok }) => (
+                          <div key={label} className="bg-gray-800/60 rounded p-2">
+                            <div className="text-gray-500 mb-0.5">{label}</div>
+                            <span className={ok === false ? 'text-red-400' : 'text-gray-300'}>{val}</span>
+                          </div>
+                        ))}
                       </div>
 
                       {/* Frame alignment quality */}
@@ -2030,6 +2242,11 @@ export function IMULabView() {
                             {ok ? `✓ ${label}` : `✗ ${label} — ALS did not converge, try more distinct poses`}
                           </div>
                         ))}
+                        {v.ambiguous && (
+                          <div className="w-full px-3 py-2 rounded text-xs font-semibold bg-yellow-900/30 border border-yellow-700 text-yellow-300">
+                            ⚠ Ambiguous calibration — multiple yaw initializations produce similar residuals with different predictions. Ensure poses cover a wider range of arm orientations.
+                          </div>
+                        )}
                       </div>
                     </div>
 
