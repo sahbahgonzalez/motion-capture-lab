@@ -48,6 +48,12 @@ import { useIMUWebSocket, IMU_IDS, IMU_SEGMENT, type IMUState, type IMUPacket } 
 import { type JointFailureStatus } from '../hooks/usePoseFailureCorrection';
 import { type TriangulatedPose, LANDMARK_KEYS } from '../hooks/useTriangulation';
 import {
+  useIMUFusionController,
+  type FusionDiagnostics,
+  type SimulatedFailures,
+  NO_SIMULATED_FAILURES,
+} from '../hooks/useIMUFusionController';
+import {
   type Quaternion,
   type Vec3,
   quaternionToEuler,
@@ -995,9 +1001,27 @@ export function IMULabView() {
   const imuReconPoseRef  = useRef<TriangulatedPose | null>(null);
   const imuReconDebugRef = useRef<ReconDebug>({ ua: emptySegDebug(), fa: emptySegDebug() });
 
-  const [displayPose, setDisplayPose]     = useState<TriangulatedPose>(correctedPoseRef.current);
-  const [imuReconPose, setImuReconPose]   = useState<TriangulatedPose | null>(null);
-  const [imuReconDebug, setImuReconDebug] = useState<ReconDebug | null>(null);
+  // ── Pipeline 4: failure-triggered IMU fusion ──────────────────────────────────
+  const fusedReconPoseRef = useRef<TriangulatedPose | null>(null);
+  const fusionDiagRef     = useRef<FusionDiagnostics | null>(null);
+  // Shoulder anchor is owned exclusively by the fusion controller (single source of truth).
+  // Use getEffectiveShoulder() to read it — do NOT maintain a parallel anchor here.
+
+  const [simulatedFailures, setSimulatedFailures] = useState<SimulatedFailures>(NO_SIMULATED_FAILURES);
+  const simulatedFailuresRef = useRef<SimulatedFailures>(NO_SIMULATED_FAILURES);
+  useEffect(() => { simulatedFailuresRef.current = simulatedFailures; }, [simulatedFailures]);
+
+  const { processFusionFrame, getEffectiveShoulder, reset: resetFusion } = useIMUFusionController();
+  const processFusionFrameRef = useRef(processFusionFrame);
+  const getEffectiveShoulderRef = useRef(getEffectiveShoulder);
+  useEffect(() => { processFusionFrameRef.current = processFusionFrame; }, [processFusionFrame]);
+  useEffect(() => { getEffectiveShoulderRef.current = getEffectiveShoulder; }, [getEffectiveShoulder]);
+
+  const [displayPose, setDisplayPose]       = useState<TriangulatedPose>(correctedPoseRef.current);
+  const [imuReconPose, setImuReconPose]     = useState<TriangulatedPose | null>(null);
+  const [imuReconDebug, setImuReconDebug]   = useState<ReconDebug | null>(null);
+  const [fusedReconPose, setFusedReconPose] = useState<TriangulatedPose | null>(null);
+  const [fusionDiag, setFusionDiag]         = useState<FusionDiagnostics | null>(null);
 
   // ── 3-Pose ALS Calibration state ─────────────────────────────────────────────
   const [calibStatus, setCalibStatus]   = useState<CalibStatus>('idle');
@@ -1053,6 +1077,8 @@ export function IMULabView() {
       setDisplayPose({ ...correctedPoseRef.current });
       setImuReconPose(imuReconPoseRef.current ? { ...imuReconPoseRef.current } : null);
       setImuReconDebug({ ...imuReconDebugRef.current });
+      setFusedReconPose(fusedReconPoseRef.current ? { ...fusedReconPoseRef.current } : null);
+      if (fusionDiagRef.current) setFusionDiag({ ...fusionDiagRef.current });
       if (lastReliableRef.current) setLastReliable({ ...lastReliableRef.current });
       if (calibCondDebugRef.current) setCalibCondDebug({ ...calibCondDebugRef.current });
       if (calibSampleDiagRef.current) setCalibSampleDiag({ ...calibSampleDiagRef.current });
@@ -1447,8 +1473,9 @@ export function IMULabView() {
   const onCorrectedPose = useCallback((pose: TriangulatedPose, tracked: number, statuses: JointFailureStatus[]) => {
     correctedPoseRef.current = pose;
     trackedCountRef.current  = tracked;
+    const imuNowMs = performance.now();
     // Stamp each new stereo frame so the timer-based sampler can detect new data
-    lastProcessedStereoTimestampRef.current = performance.now();
+    lastProcessedStereoTimestampRef.current = imuNowMs;
 
     const shoulder = pose['rightShoulder'];
     const elbow    = pose['rightElbow'];
@@ -1500,13 +1527,20 @@ export function IMULabView() {
       };
     }
 
+    // ── Shoulder anchor ───────────────────────────────────────────────────────
+    // The fusion controller is the single authoritative shoulder-anchor owner.
+    // It applies simulation overrides correctly before deciding whether to update.
+    // We read the current effective shoulder from it (one-frame lag is acceptable
+    // for the display pose; fusion itself uses the freshly-updated anchor).
+    const effectiveShoulder: { x: number; y: number; z: number } | null =
+      getEffectiveShoulderRef.current(imuNowMs);
+
     // ── Per-frame condition debug ────────────────────────────────────────────
     {
       const imu01RawDbg = getRawIMURef.current('imu_01');
       const imu02RawDbg = getRawIMURef.current('imu_02');
-      const nowMs = performance.now();
-      const imu01Age = imu01RawDbg ? nowMs - imu01RawDbg.lastReceivedAt : Infinity;
-      const imu02Age = imu02RawDbg ? nowMs - imu02RawDbg.lastReceivedAt : Infinity;
+      const imu01Age = imu01RawDbg ? imuNowMs - imu01RawDbg.lastReceivedAt : Infinity;
+      const imu02Age = imu02RawDbg ? imuNowMs - imu02RawDbg.lastReceivedAt : Infinity;
       calibCondDebugRef.current = {
         shoulderOk, elbowOk, wristOk, tracked,
         segOk, uaLenMm: uaLen, faLenMm: faLen,
@@ -1521,87 +1555,84 @@ export function IMULabView() {
     //
     // Absolute sensor-to-bone reconstruction (no ΔQ, no reference snapshot needed).
     //
-    // Upper arm:
-    //   worldDir_UA = normalize(rotate(q_imu01_current, uaBoneLocalDir))
-    //   elbow = shoulder + uaLength × worldDir_UA
+    //   worldDir_UA = normalize(A_ua * rotate(q_imu01, uaBoneLocalDir))
+    //   elbow       = shoulder_anchor + uaLength × worldDir_UA
+    //   worldDir_FA = normalize(A_fa * rotate(q_imu02, faBoneLocalDir))
+    //   wrist       = elbow_recon + faLength × worldDir_FA
     //
-    // Forearm:
-    //   worldDir_FA = normalize(rotate(q_imu02_current, faBoneLocalDir))
-    //   wrist = elbow + faLength × worldDir_FA
-    //
-    // Convention: BNO085 q maps sensor-local vectors → world frame.
-    //   rotate(q, v_sensor) = v_world
-    //   rotate(inv(q), v_world) = v_sensor
+    // The shoulder anchor may be the live stereo shoulder or a recently frozen copy.
     // A failed calibration must never drive reconstruction: its R/b/length values are sentinels.
-    if (!calibData || calibData.quality === 'failed') {
-      imuReconPoseRef.current = null;
-      imuReconDebugRef.current = { ua: emptySegDebug(), fa: emptySegDebug() };
-      return;
-    }
 
-    // Shoulder MUST be visible — it is the ONLY positional anchor.
-    if (!isValidVec(shoulder)) {
-      imuReconPoseRef.current = null;
-      imuReconDebugRef.current = { ua: emptySegDebug(), fa: emptySegDebug() };
-      return;
-    }
-    const anchorShoulder = shoulder!;
+    const imuReconValid = calibData
+      && calibData.quality !== 'failed'
+      && calibData.uaLengthMm > 0 && calibData.faLengthMm > 0;
 
     const imu01Raw    = getRawIMURef.current('imu_01');
     const imu01Packet = imu01Raw?.latest;
-    const imuNowMs    = performance.now();
     const imu01ReconAgeMs = imu01Raw ? imuNowMs - imu01Raw.lastReceivedAt : Infinity;
-    // Stale IMU data must not produce a live reconstruction — treat as no signal.
-    if (!imu01Packet || !isValidQuat(packetToQuat(imu01Packet)) || imu01ReconAgeMs > 500) {
-      imuReconPoseRef.current = null;
-      imuReconDebugRef.current = { ua: emptySegDebug(), fa: emptySegDebug() };
-      return;
-    }
-
-    const qCurrentUA    = packetToQuat(imu01Packet);
-    // sensor frame → IMU world → stereo world
-    const boneImuWorldUA = rotateVectorByQuaternion(qCurrentUA, calibData.uaBoneLocalDir);
-    const worldDirUA     = normalize3(matVec3(calibData.R_ua, { x: boneImuWorldUA[0], y: boneImuWorldUA[1], z: boneImuWorldUA[2] }));
-    const uaLength    = calibData.uaLengthMm;
-
-    const reconElbow = {
-      x: anchorShoulder.x + uaLength * worldDirUA.x,
-      y: anchorShoulder.y + uaLength * worldDirUA.y,
-      z: anchorShoulder.z + uaLength * worldDirUA.z,
-    };
-
-    const stereoElbow = pose['rightElbow'];
-    const stereoWrist = pose['rightWrist'];
-    const stereoUADir = (shoulderOk && elbowOk && shoulder && elbow)
-      ? normalize3({ x: elbow.x-shoulder.x, y: elbow.y-shoulder.y, z: elbow.z-shoulder.z })
-      : null;
-
-    const uaDebug: SegmentReconDebug = {
-      qCurrent:      qCurrentUA,
-      boneLocalDir:  calibData.uaBoneLocalDir,
-      worldDir:      [worldDirUA.x, worldDirUA.y, worldDirUA.z],
-      calibLength:   uaLength,
-      reconPos:      reconElbow,
-      stereoPos:     stereoElbow ? { ...stereoElbow } : null,
-      posError:      stereoElbow ? dist3D(reconElbow, stereoElbow) : null,
-      angError:      stereoUADir ? angleBetweenDeg(worldDirUA, stereoUADir) : null,
-      elbowAngleDeg: null,
-    };
-
     const imu02Raw    = getRawIMURef.current('imu_02');
     const imu02Packet = imu02Raw?.latest;
+    const imu02ReconAgeMs = imu02Raw ? imuNowMs - imu02Raw.lastReceivedAt : Infinity;
+
+    // imu01 availability (500ms threshold for the pure IMU display pose)
+    const imu01ReconAvail = imuReconValid && effectiveShoulder
+      && imu01Packet && isValidQuat(packetToQuat(imu01Packet))
+      && imu01ReconAgeMs <= 500;
+
+    let reconElbow: { x: number; y: number; z: number } | null = null;
+    let uaDebug: SegmentReconDebug = emptySegDebug();
+
+    if (imu01ReconAvail && effectiveShoulder && imu01Packet && calibData) {
+      const qCurrentUA    = packetToQuat(imu01Packet);
+      const boneImuWorldUA = rotateVectorByQuaternion(qCurrentUA, calibData.uaBoneLocalDir);
+      const worldDirUA     = normalize3(matVec3(calibData.R_ua, { x: boneImuWorldUA[0], y: boneImuWorldUA[1], z: boneImuWorldUA[2] }));
+      const uaLength    = calibData.uaLengthMm;
+
+      reconElbow = {
+        x: effectiveShoulder.x + uaLength * worldDirUA.x,
+        y: effectiveShoulder.y + uaLength * worldDirUA.y,
+        z: effectiveShoulder.z + uaLength * worldDirUA.z,
+      };
+
+      const stereoElbow = pose['rightElbow'];
+      const stereoUADir = (shoulderOk && elbowOk && shoulder && elbow)
+        ? normalize3({ x: elbow.x-shoulder.x, y: elbow.y-shoulder.y, z: elbow.z-shoulder.z })
+        : null;
+
+      uaDebug = {
+        qCurrent:      qCurrentUA,
+        boneLocalDir:  calibData.uaBoneLocalDir,
+        worldDir:      [worldDirUA.x, worldDirUA.y, worldDirUA.z],
+        calibLength:   uaLength,
+        reconPos:      reconElbow,
+        stereoPos:     stereoElbow ? { ...stereoElbow } : null,
+        posError:      stereoElbow ? dist3D(reconElbow, stereoElbow) : null,
+        angError:      stereoUADir ? angleBetweenDeg(worldDirUA, stereoUADir) : null,
+        elbowAngleDeg: null,
+      };
+    }
 
     let reconWrist: {x:number;y:number;z:number} | null = null;
-    let faDebug: SegmentReconDebug;
+    let faDebug: SegmentReconDebug = emptySegDebug();
+    // Normalized forearm world direction — passed to fusion so wrist anchors to
+    // the FUSED elbow rather than the IMU-only reconElbow. See Issue 1 fix.
+    let imuFAWorldDir: [number, number, number] | null = null;
 
-    const imu02ReconAgeMs = imu02Raw ? imuNowMs - imu02Raw.lastReceivedAt : Infinity;
-    if (imu02Packet && isValidQuat(packetToQuat(imu02Packet)) && imu02ReconAgeMs <= 500) {
+    const imu02ReconAvail = imuReconValid && reconElbow
+      && imu02Packet && isValidQuat(packetToQuat(imu02Packet))
+      && imu02ReconAgeMs <= 500;
+
+    if (imu02ReconAvail && reconElbow && imu02Packet && calibData) {
       const qCurrentFA    = packetToQuat(imu02Packet);
       // sensor frame → IMU world → stereo world
       const boneImuWorldFA = rotateVectorByQuaternion(qCurrentFA, calibData.faBoneLocalDir);
       const worldDirFA     = normalize3(matVec3(calibData.R_fa, { x: boneImuWorldFA[0], y: boneImuWorldFA[1], z: boneImuWorldFA[2] }));
       const faLength    = calibData.faLengthMm;
 
+      // Export normalized direction for fusion controller
+      imuFAWorldDir = [worldDirFA.x, worldDirFA.y, worldDirFA.z];
+
+      // reconWrist for the pure IMU display panel uses reconElbow (IMU-only elbow)
       reconWrist = {
         x: reconElbow.x + faLength * worldDirFA.x,
         y: reconElbow.y + faLength * worldDirFA.y,
@@ -1612,8 +1643,11 @@ export function IMULabView() {
         ? normalize3({ x: wrist.x-elbow.x, y: wrist.y-elbow.y, z: wrist.z-elbow.z })
         : null;
 
-      // Elbow angle: diagnostic angle between UA and FA world directions
-      const elbowAngleDeg = angleBetweenDeg(worldDirUA, worldDirFA);
+      // Elbow angle: diagnostic angle between UA and FA world directions.
+      const uaWorldDir = uaDebug.worldDir
+        ? { x: uaDebug.worldDir[0], y: uaDebug.worldDir[1], z: uaDebug.worldDir[2] }
+        : null;
+      const elbowAngleDeg = uaWorldDir ? angleBetweenDeg(uaWorldDir, worldDirFA) : null;
 
       faDebug = {
         qCurrent:      qCurrentFA,
@@ -1621,24 +1655,57 @@ export function IMULabView() {
         worldDir:      [worldDirFA.x, worldDirFA.y, worldDirFA.z],
         calibLength:   faLength,
         reconPos:      reconWrist,
-        stereoPos:     stereoWrist ? { ...stereoWrist } : null,
-        posError:      stereoWrist ? dist3D(reconWrist, stereoWrist) : null,
+        stereoPos:     wrist ? { ...wrist } : null,
+        posError:      wrist ? dist3D(reconWrist, wrist) : null,
         angError:      stereoFADir ? angleBetweenDeg(worldDirFA, stereoFADir) : null,
         elbowAngleDeg,
       };
-    } else {
-      faDebug = emptySegDebug();
     }
 
+    // ── Write pure IMU pose (Phase B display in center panel) ───────────────
+    // Uses effectiveShoulder (from fusion controller's anchor, may be frozen).
+    // reconWrist here uses reconElbow as anchor — independent IMU display only.
+    // The fused wrist in Pipeline 4 uses imuFAWorldDir anchored to finalElbow.
     const imuPose: TriangulatedPose = {
       ...Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])),
-      rightShoulder: { ...anchorShoulder },
+      rightShoulder: effectiveShoulder ? { ...effectiveShoulder } : null,
       rightElbow:    reconElbow,
       rightWrist:    reconWrist,
     } as TriangulatedPose;
 
-    imuReconPoseRef.current  = imuPose;
+    // Only set imuReconPose when we have actual IMU-derived data (not null all-around)
+    imuReconPoseRef.current  = (effectiveShoulder || reconElbow) ? imuPose : null;
     imuReconDebugRef.current = { ua: uaDebug, fa: faDebug };
+
+    // ── Pipeline 4: failure-triggered IMU fusion ────────────────────────────
+    // Runs on every stereo frame regardless of IMU availability.
+    // When stereo is reliable: output = corrected stereo (identical to Pipeline 3).
+    // When stereo fails: output = IMU reconstruction (if available) or UNAVAILABLE.
+    // Passes imuFADir (direction) not imuWrist so fusion can anchor wrist to finalElbow.
+    const fusionResult = processFusionFrameRef.current({
+      stereoShoulder: shoulderOk ? shoulder! : null,
+      stereoElbow:    elbowOk    ? elbow!    : null,
+      stereoWrist:    wristOk    ? wrist!    : null,
+      imuElbow:       reconElbow,
+      imuFADir:       imuFAWorldDir,
+      jointStatuses:  statuses,
+      calibrationValid: !!imuReconValid,
+      calibUaLengthMm: calibData?.uaLengthMm ?? 0,
+      calibFaLengthMm: calibData?.faLengthMm ?? 0,
+      imu01AgeMs: isFinite(imu01ReconAgeMs) ? imu01ReconAgeMs : 9999,
+      imu02AgeMs: isFinite(imu02ReconAgeMs) ? imu02ReconAgeMs : 9999,
+      simulated: simulatedFailuresRef.current,
+      nowMs: imuNowMs,
+    });
+
+    // Build fused pose: Pipeline 3 full body, right arm joints replaced by fusion output.
+    const fusedPose: TriangulatedPose = { ...pose };
+    fusedPose.rightShoulder = fusionResult.finalShoulder;
+    fusedPose.rightElbow    = fusionResult.finalElbow;
+    fusedPose.rightWrist    = fusionResult.finalWrist;
+
+    fusedReconPoseRef.current = fusedPose;
+    fusionDiagRef.current     = fusionResult.diagnostics;
   }, [calibStatus]);
 
   // ── Calibration controls ──────────────────────────────────────────────────────
@@ -1669,9 +1736,12 @@ export function IMULabView() {
     setPose1Frames([]); setPose2Frames([]); setPose3Frames([]);
     setArmCalibration(null);
     setCalibStatus('idle');
-    imuReconPoseRef.current  = null;
-    imuReconDebugRef.current = { ua: emptySegDebug(), fa: emptySegDebug() };
-  }, []);
+    imuReconPoseRef.current   = null;
+    imuReconDebugRef.current  = { ua: emptySegDebug(), fa: emptySegDebug() };
+    fusedReconPoseRef.current = null;
+    fusionDiagRef.current     = null;
+    resetFusion(); // also resets shoulder anchor inside the fusion controller
+  }, [resetFusion]);
 
   // ── Validation arms ───────────────────────────────────────────────────────────
   const stereoArm: ArmPoints = {
@@ -1679,11 +1749,13 @@ export function IMULabView() {
     elbow:    displayPose['rightElbow']    ?? null,
     wrist:    displayPose['rightWrist']    ?? null,
   };
+  // When IMU reconstruction is unavailable, show null arm (no stereo fallback).
+  // Mirroring stereo here would misrepresent the two estimates as independent.
   const validationArm: ArmPoints = imuReconPose ? {
     shoulder: imuReconPose['rightShoulder'] ?? null,
     elbow:    imuReconPose['rightElbow']    ?? null,
     wrist:    imuReconPose['rightWrist']    ?? null,
-  } : stereoArm;
+  } : { shoulder: null, elbow: null, wrist: null };
 
   // ── Error metrics ─────────────────────────────────────────────────────────────
   const elbowError = imuReconDebug?.ua.posError ?? null;
@@ -1905,6 +1977,10 @@ export function IMULabView() {
               preloadedCalibration={calibrationResult}
               onCorrectedPose={onCorrectedPose}
               imuReconstructionPose={imuReconPose}
+              fusedReconstructionPose={fusedReconPose}
+              fusionDiagnostics={fusionDiag}
+              simulatedFailures={simulatedFailures}
+              onSimulatedFailuresChange={setSimulatedFailures}
             />
           </TabsContent>
 

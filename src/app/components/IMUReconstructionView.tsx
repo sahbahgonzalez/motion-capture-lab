@@ -31,7 +31,14 @@ import { MotionDataVisualizer } from './MotionDataVisualizer';
 import { type MotionRecording } from '../hooks/useMotionRecorder';
 import { StereoCalibration } from '../type/calibration';
 import { PoseLandmarks } from '../hooks/useMediaPipePose';
-import { Upload, Eye, EyeOff, Circle, Square, Download, Trash2, BarChart3, Settings } from 'lucide-react';
+import { Upload, Eye, EyeOff, Circle, Square, Download, Trash2, BarChart3, Settings, Merge, Zap } from 'lucide-react';
+import {
+  type FusionDiagnostics,
+  type SimulatedFailures,
+  type SegmentState,
+  type RecoveryPhase,
+  NO_SIMULATED_FAILURES,
+} from '../hooks/useIMUFusionController';
 
 interface IMUReconstructionViewProps {
   camera1Ref: RefObject<HTMLVideoElement | null>;
@@ -43,10 +50,20 @@ interface IMUReconstructionViewProps {
   /** Called every stereo frame with the corrected pose, tracked count, and per-joint failure statuses. */
   onCorrectedPose?: (pose: TriangulatedPose, trackedCorrected: number, statuses: JointFailureStatus[]) => void;
   /**
-   * Phase B: provide actual IMU-reconstructed pose here to replace the placeholder.
-   * null (default) = Phase A placeholder (mirrors stereo right arm).
+   * Phase B IMU-reconstructed pose (pure orientation, no fusion).
+   * null = IMU reconstruction unavailable (shows explicit unavailable state, NOT stereo).
    */
   imuReconstructionPose?: TriangulatedPose | null;
+  /**
+   * Pipeline 4: adaptive failure-triggered fused pose.
+   * Stereo when reliable, IMU when stereo fails, blended on transitions.
+   */
+  fusedReconstructionPose?: TriangulatedPose | null;
+  /** Live fusion diagnostics — segment states, anchor status, failure reasons. */
+  fusionDiagnostics?: FusionDiagnostics | null;
+  /** Simulation override state — lets the user inject fake failures for testing. */
+  simulatedFailures?: SimulatedFailures;
+  onSimulatedFailuresChange?: (f: SimulatedFailures) => void;
 }
 
 const LANDMARK_COLORS: Record<keyof PoseLandmarks, string> = {
@@ -204,10 +221,145 @@ function formatDuration(ms: number) {
 const emptyPose = (): TriangulatedPose =>
   Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as TriangulatedPose;
 
+// ── Segment state display helpers ────────────────────────────────────────────
+
+const SEG_STATE_COLOR: Record<SegmentState, string> = {
+  STEREO:         'text-green-400',
+  IMU_CORRECTION: 'text-orange-400',
+  RECOVERY:       'text-cyan-400',
+  UNAVAILABLE:    'text-red-400',
+};
+const SEG_STATE_BG: Record<SegmentState, string> = {
+  STEREO:         'bg-green-900/40 border-green-700',
+  IMU_CORRECTION: 'bg-orange-900/40 border-orange-700',
+  RECOVERY:       'bg-cyan-900/40 border-cyan-700',
+  UNAVAILABLE:    'bg-red-900/40 border-red-700',
+};
+const SEG_STATE_LABEL: Record<SegmentState, string> = {
+  STEREO:         'Stereo',
+  IMU_CORRECTION: 'IMU Correcting',
+  RECOVERY:       'Recovering',
+  UNAVAILABLE:    'Unavailable',
+};
+
+function FusionDiagPanel({ diag }: { diag: FusionDiagnostics }) {
+  const anchorColor = diag.shoulderAnchorState === 'live' ? 'text-green-400'
+    : diag.shoulderAnchorState === 'frozen' ? 'text-yellow-400'
+    : 'text-red-400';
+  const anchorLabel = diag.shoulderAnchorState === 'live' ? 'Live'
+    : diag.shoulderAnchorState === 'frozen' ? `Frozen ${diag.shoulderAnchorAgeMs}ms`
+    : 'Expired';
+
+  const row = (label: string, value: string, color = 'text-gray-300') => (
+    <div className="flex items-center justify-between">
+      <span className="text-xs text-gray-500">{label}</span>
+      <span className={`text-xs font-mono font-semibold ${color}`}>{value}</span>
+    </div>
+  );
+
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-4">
+      {/* UA state */}
+      <div className={`rounded-lg border p-3 ${SEG_STATE_BG[diag.uaState]}`}>
+        <div className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">Upper Arm (UA)</div>
+        <div className={`text-sm font-bold mb-2 ${SEG_STATE_COLOR[diag.uaState]}`}>
+          {SEG_STATE_LABEL[diag.uaState]}
+        </div>
+        {diag.uaFailureReason && (
+          <div className="text-xs text-orange-300 mb-2 leading-tight">{diag.uaFailureReason}</div>
+        )}
+        {row('Blend α', `${(diag.blendAlphaUA * 100).toFixed(0)}%`)}
+        {diag.uaState === 'IMU_CORRECTION' && row('Active', `${diag.uaCorrectionActiveMs}ms`, 'text-orange-400')}
+        {diag.uaState === 'RECOVERY' && diag.uaRecoveryPhase === 'confirming' && row('Confirming', `${diag.uaRecoveryFrame} / frames`, 'text-yellow-400')}
+        {diag.uaState === 'RECOVERY' && diag.uaRecoveryPhase === 'blending' && row('Blending →', `${(diag.blendAlphaUA * 100).toFixed(0)}%`, 'text-cyan-400')}
+        {row('imu_01', `${diag.imu01AgeMs}ms`, diag.imu01AgeMs <= 150 ? 'text-green-400' : diag.imu01AgeMs <= 500 ? 'text-yellow-400' : 'text-red-400')}
+      </div>
+
+      {/* FA state */}
+      <div className={`rounded-lg border p-3 ${SEG_STATE_BG[diag.faState]}`}>
+        <div className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">Forearm (FA)</div>
+        <div className={`text-sm font-bold mb-2 ${SEG_STATE_COLOR[diag.faState]}`}>
+          {SEG_STATE_LABEL[diag.faState]}
+        </div>
+        {diag.faFailureReason && (
+          <div className="text-xs text-orange-300 mb-2 leading-tight">{diag.faFailureReason}</div>
+        )}
+        {row('Blend α', `${(diag.blendAlphaFA * 100).toFixed(0)}%`)}
+        {diag.faState === 'IMU_CORRECTION' && row('Active', `${diag.faCorrectionActiveMs}ms`, 'text-orange-400')}
+        {diag.faState === 'RECOVERY' && diag.faRecoveryPhase === 'confirming' && row('Confirming', `${diag.faRecoveryFrame} / frames`, 'text-yellow-400')}
+        {diag.faState === 'RECOVERY' && diag.faRecoveryPhase === 'blending' && row('Blending →', `${(diag.blendAlphaFA * 100).toFixed(0)}%`, 'text-cyan-400')}
+        {row('imu_02', `${diag.imu02AgeMs}ms`, diag.imu02AgeMs <= 150 ? 'text-green-400' : diag.imu02AgeMs <= 500 ? 'text-yellow-400' : 'text-red-400')}
+      </div>
+
+      {/* Anchor + calib */}
+      <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-3">
+        <div className="text-xs font-semibold text-gray-400 mb-2 uppercase tracking-wide">Anchor &amp; Calibration</div>
+        {row('Shoulder anchor', anchorLabel, anchorColor)}
+        {row('Calibration', diag.imuCalibrationValid ? 'Valid' : 'Invalid/Failed',
+          diag.imuCalibrationValid ? 'text-green-400' : 'text-red-400')}
+        {row('Fully available', diag.fullyAvailable ? 'Yes' : 'No',
+          diag.fullyAvailable ? 'text-green-400' : 'text-yellow-400')}
+        {(diag.simulated.shoulder || diag.simulated.elbow || diag.simulated.wrist) && (
+          <div className="mt-2 text-xs text-yellow-400 font-semibold">
+            SIM: {[
+              diag.simulated.shoulder && 'shoulder',
+              diag.simulated.elbow    && 'elbow',
+              diag.simulated.wrist    && 'wrist',
+            ].filter(Boolean).join(', ')}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function SimulationPanel({
+  simulated, onChange,
+}: {
+  simulated: SimulatedFailures;
+  onChange: (f: SimulatedFailures) => void;
+}) {
+  const btn = (label: string, key: keyof SimulatedFailures) => (
+    <button
+      key={key}
+      onClick={() => onChange({ ...simulated, [key]: !simulated[key] })}
+      className={`px-3 py-1.5 rounded border text-xs font-semibold transition-colors
+        ${simulated[key]
+          ? 'bg-red-700 border-red-500 text-white'
+          : 'bg-gray-800 border-gray-600 text-gray-400 hover:border-red-700 hover:text-red-300'}`}
+    >
+      {simulated[key] ? '✕ ' : ''}{label}
+    </button>
+  );
+
+  const anyActive = simulated.shoulder || simulated.elbow || simulated.wrist;
+
+  return (
+    <div className="flex items-center gap-3 flex-wrap">
+      <span className="text-xs text-gray-500 font-semibold">Simulate failure:</span>
+      {btn('Shoulder', 'shoulder')}
+      {btn('Elbow', 'elbow')}
+      {btn('Wrist', 'wrist')}
+      {anyActive && (
+        <button
+          onClick={() => onChange(NO_SIMULATED_FAILURES)}
+          className="px-3 py-1.5 rounded border border-gray-700 text-gray-400 text-xs hover:bg-gray-800"
+        >
+          Clear all
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function IMUReconstructionView({
   camera1Ref, camera2Ref, camera1Stream, camera2Stream,
   isBothCamerasActive, preloadedCalibration, onCorrectedPose,
   imuReconstructionPose = null,
+  fusedReconstructionPose = null,
+  fusionDiagnostics = null,
+  simulatedFailures = NO_SIMULATED_FAILURES,
+  onSimulatedFailuresChange,
 }: IMUReconstructionViewProps) {
   const { loadCalibration, calibrationResult } = useCameraCalibration();
   const calibFileRef = useRef<HTMLInputElement>(null);
@@ -450,11 +602,18 @@ export function IMUReconstructionView({
 
       {/* ── 3D Reconstruction ───────────────────────────────────────── */}
       <Card className="bg-gray-900 border-gray-700 p-6">
-        <div className="flex items-center justify-between mb-5">
+        <div className="flex items-center justify-between mb-4">
           <div>
-            <h3 className="text-lg font-semibold text-white">3D Skeleton — Stereo vs IMU</h3>
+            <h3 className="text-lg font-semibold text-white flex items-center gap-2">
+              3D Skeleton — Pipeline Comparison
+              {fusedReconstructionPose && (
+                <span className="text-xs px-1.5 py-0.5 rounded bg-teal-900/50 text-teal-300 border border-teal-700 font-semibold">
+                  Pipeline 4 Active
+                </span>
+              )}
+            </h3>
             <p className="text-xs text-gray-500 mt-0.5">
-              Stereo tracked: {trackedRaw} · Corrected (internal): {trackedCorrected}
+              Stereo tracked: {trackedRaw} · Corrected: {trackedCorrected}
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -462,7 +621,7 @@ export function IMUReconstructionView({
               <>
                 <Input placeholder="Recording name (optional)" value={recordingName}
                   onChange={e => setRecordingName(e.target.value)}
-                  className="bg-gray-800 border-gray-700 text-white w-48 h-8 text-sm" />
+                  className="bg-gray-800 border-gray-700 text-white w-40 h-8 text-sm" />
                 <Button onClick={handleStartRecording}
                   disabled={!isBothCamerasActive || !calibration || !poseLoaded}
                   className="bg-red-600 hover:bg-red-700 h-8 text-sm">
@@ -479,54 +638,116 @@ export function IMUReconstructionView({
         </div>
 
         {(() => {
-          const rawProjected = projectPose(correctedPose, 'front');
+          // Compute shared bounds from the richest available pose (fused > stereo)
+          const boundsSource = fusedReconstructionPose ?? correctedPose;
+          const rawProjected = projectPose(boundsSource, 'front');
           const sharedBounds = computeBounds(rawProjected);
 
-          // Phase A placeholder: right arm joints only from stereo raw pose
-          const rightArmPlaceholder: TriangulatedPose = {
-            ...Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])),
-            rightShoulder: correctedPose.rightShoulder,
-            rightElbow:    correctedPose.rightElbow,
-            rightWrist:    correctedPose.rightWrist,
-          } as TriangulatedPose;
-          const imuDisplayPose = imuReconstructionPose ?? rightArmPlaceholder;
+          // null pose for IMU unavailable state — all joints null, no stereo fallback.
+          // Showing stereo joints here would misrepresent the two estimates as independent.
+          const imuUnavailablePose: TriangulatedPose = Object.fromEntries(
+            LANDMARK_KEYS.map(k => [k, null])
+          ) as TriangulatedPose;
+          const imuDisplayPose = imuReconstructionPose ?? imuUnavailablePose;
+          const imuAvailable = imuReconstructionPose !== null;
+          const hasFused = fusedReconstructionPose !== null;
 
           return (
-            <div className="grid grid-cols-2 gap-3 mb-4">
-              {/* LEFT — Corrected Stereo 3D (best vision estimate; reference for IMU validation) */}
+            <div className={`grid gap-3 mb-4 ${hasFused ? 'grid-cols-3' : 'grid-cols-2'}`}>
+              {/* Pipeline 3 — Corrected Stereo */}
               <div>
-                <p className="text-xs text-gray-500 mb-1.5 font-medium">Corrected Stereo Reconstruction</p>
-                <div className="bg-gray-950 rounded-lg border border-gray-700 flex items-center justify-center" style={{ height: 280 }}>
-                  <SkeletonView pose3D={correctedPose} view="front" width={380} height={260} label="STEREO (corrected)" labelColor="#34d399" sharedBounds={sharedBounds} />
+                <p className="text-xs text-gray-500 mb-1.5 font-medium">Pipeline 3 · Stereo + Jitter Correction</p>
+                <div className="bg-gray-950 rounded-lg border border-gray-700 flex items-center justify-center" style={{ height: 260 }}>
+                  <SkeletonView pose3D={correctedPose} view="front" width={hasFused ? 240 : 380} height={240} label="STEREO" labelColor="#34d399" sharedBounds={sharedBounds} />
                 </div>
               </div>
 
-              {/* RIGHT — IMU Reconstruction (Phase A placeholder) */}
+              {/* Phase B — Pure IMU Reconstruction */}
               <div>
                 <div className="flex items-center gap-2 mb-1.5">
-                  <p className="text-xs text-gray-500 font-medium">IMU Reconstruction</p>
-                  {!imuReconstructionPose && (
-                    <span className="text-xs px-1.5 py-0.5 rounded bg-orange-900/40 text-orange-400 border border-orange-800 font-semibold leading-tight">
-                      Phase A Placeholder
+                  <p className="text-xs text-gray-500 font-medium">IMU Absolute Reconstruction</p>
+                  {!imuAvailable && (
+                    <span className="text-xs px-1.5 py-0.5 rounded bg-gray-800 text-gray-500 border border-gray-700 font-semibold leading-tight">
+                      Unavailable
                     </span>
                   )}
                 </div>
-                <div className="bg-gray-950 rounded-lg border border-orange-900/40 flex items-center justify-center relative" style={{ height: 280 }}>
-                  <SkeletonView pose3D={imuDisplayPose} view="front" width={380} height={260} label="IMU" labelColor="#fb923c" sharedBounds={sharedBounds} />
-                  {!imuReconstructionPose && (
-                    <div className="absolute bottom-2 left-0 right-0 flex justify-center pointer-events-none">
-                      <span className="text-xs text-orange-500/70 font-mono">mirrors stereo right arm · Phase B will replace</span>
+                <div className={`bg-gray-950 rounded-lg border flex items-center justify-center relative ${imuAvailable ? 'border-orange-900/40' : 'border-gray-800'}`} style={{ height: 260 }}>
+                  {imuAvailable ? (
+                    <SkeletonView pose3D={imuDisplayPose} view="front" width={hasFused ? 240 : 380} height={240} label="IMU" labelColor="#fb923c" sharedBounds={sharedBounds} />
+                  ) : (
+                    <div className="flex flex-col items-center gap-2 text-center px-6">
+                      <span className="text-gray-600 text-xs font-mono">IMU reconstruction unavailable</span>
+                      <span className="text-gray-700 text-xs">Calibrate IMU sensors to enable</span>
                     </div>
                   )}
                 </div>
               </div>
+
+              {/* Pipeline 4 — Fused Adaptive */}
+              {hasFused && (
+                <div>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <Merge className="h-3 w-3 text-teal-400" />
+                    <p className="text-xs text-teal-400 font-semibold">Pipeline 4 · Fused (Adaptive)</p>
+                  </div>
+                  <div className="bg-gray-950 rounded-lg border border-teal-900/50 flex items-center justify-center relative" style={{ height: 260 }}>
+                    <SkeletonView pose3D={fusedReconstructionPose!} view="front" width={240} height={240} label="FUSED" labelColor="#2dd4bf" sharedBounds={sharedBounds} />
+                    {fusionDiagnostics && (fusionDiagnostics.uaState !== 'STEREO' || fusionDiagnostics.faState !== 'STEREO') && (
+                      <div className="absolute top-2 right-2 flex gap-1 flex-col items-end pointer-events-none">
+                        {fusionDiagnostics.uaState === 'IMU_CORRECTION' && (
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-orange-900/80 text-orange-300 font-semibold">UA: IMU</span>
+                        )}
+                        {fusionDiagnostics.faState === 'IMU_CORRECTION' && (
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-orange-900/80 text-orange-300 font-semibold">FA: IMU</span>
+                        )}
+                        {fusionDiagnostics.uaState === 'RECOVERY' && (
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-cyan-900/80 text-cyan-300 font-semibold">
+                            UA: {fusionDiagnostics.uaRecoveryPhase === 'blending' ? 'Blending' : 'Confirming'}
+                          </span>
+                        )}
+                        {fusionDiagnostics.faState === 'RECOVERY' && (
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-cyan-900/80 text-cyan-300 font-semibold">
+                            FA: {fusionDiagnostics.faRecoveryPhase === 'blending' ? 'Blending' : 'Confirming'}
+                          </span>
+                        )}
+                        {(fusionDiagnostics.uaState === 'UNAVAILABLE' || fusionDiagnostics.faState === 'UNAVAILABLE') && (
+                          <span className="text-xs px-1.5 py-0.5 rounded bg-red-900/80 text-red-300 font-semibold">Unavailable</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
           );
         })()}
 
-        {!isBothCamerasActive && <p className="text-sm text-yellow-400">Start both cameras in Camera Setup first.</p>}
-        {isBothCamerasActive && !calibration && <p className="text-sm text-yellow-400">Load a calibration file above to enable reconstruction.</p>}
-        {isBothCamerasActive && calibration && trackedCorrected === 0 && poseLoaded && <p className="text-sm text-gray-500">Move into view of both cameras...</p>}
+        {/* ── Fusion Diagnostics ──────────────────────────────────── */}
+        {fusionDiagnostics && (
+          <div className="mt-2">
+            <div className="flex items-center gap-2 mb-2">
+              <Zap className="h-3.5 w-3.5 text-teal-400" />
+              <span className="text-xs font-semibold text-teal-400 uppercase tracking-wide">Pipeline 4 Fusion State</span>
+            </div>
+            <FusionDiagPanel diag={fusionDiagnostics} />
+          </div>
+        )}
+
+        {/* ── Simulation Controls ─────────────────────────────────── */}
+        {onSimulatedFailuresChange && (
+          <div className="mt-4 p-3 rounded-lg border border-yellow-900/50 bg-yellow-950/20">
+            <div className="flex items-center gap-2 mb-2">
+              <span className="text-xs font-semibold text-yellow-400 uppercase tracking-wide">Trigger Test Mode</span>
+              <span className="text-xs text-gray-600">— simulates stereo occlusion through same fusion logic as real failures</span>
+            </div>
+            <SimulationPanel simulated={simulatedFailures} onChange={onSimulatedFailuresChange} />
+          </div>
+        )}
+
+        {!isBothCamerasActive && <p className="text-sm text-yellow-400 mt-3">Start both cameras in Camera Setup first.</p>}
+        {isBothCamerasActive && !calibration && <p className="text-sm text-yellow-400 mt-3">Load a calibration file above to enable reconstruction.</p>}
+        {isBothCamerasActive && calibration && trackedCorrected === 0 && poseLoaded && <p className="text-sm text-gray-500 mt-3">Move into view of both cameras...</p>}
       </Card>
 
       {/* ── Joint status ─────────────────────────────────────────────── */}
