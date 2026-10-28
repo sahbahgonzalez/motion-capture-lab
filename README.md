@@ -1163,184 +1163,954 @@ Position error and angular error are only meaningful when the stereo arm is simu
 
 ## Pipeline 4 — Failure-Triggered IMU Fusion
 
-Pipeline 4 (`useIMUFusionController`) is the segment-level fusion state machine that sits on top of Pipelines 1–3. It produces a single continuous arm reconstruction by blending corrected stereo positions with IMU-derived positions per arm segment, independently for the upper arm (UA: shoulder→elbow) and forearm (FA: elbow→wrist).
+Pipeline 4 (`useIMUFusionController`) is the segment-level fusion state machine that sits on top of Pipelines 1–3. It produces a single continuous arm reconstruction by blending corrected stereo positions with IMU-derived positions per arm segment, independently for the upper arm (UA: shoulder→elbow) and forearm (FA: elbow→wrist). This section provides a complete technical reference for the pipeline: the mathematical formulations used to determine IMU orientation, the exact trigger and recovery conditions, and a step-by-step code-level walkthrough of every frame-processing stage.
 
-**Source:** `src/app/hooks/useIMUFusionController.ts`
-
----
-
-### Fusion Overview
-
-The fusion controller runs every stereo frame and decides, independently per segment, whether the output position should come from stereo, IMU, or a blend of the two. It maintains a shoulder anchor (the last known reliable stereo shoulder position) that anchors the entire kinematic chain when stereo is temporarily unavailable.
-
-Key design invariants:
-- One reliable stereo frame during occlusion never affects the fused output
-- Stereo is always preferred over IMU when both are available
-- A failed or missing calibration produces null outputs — no fabricated coordinates
-- Simulation overrides are applied before anchor updates so simulated failures are indistinguishable from real ones
+**Primary sources:**
+- `src/app/hooks/useIMUFusionController.ts` — fusion state machine, per-frame computation
+- `src/app/components/IMULabView.tsx` — ALS calibration engine, absolute FK reconstruction, integration point
+- `src/app/utils/quaternionUtils.ts` — all quaternion mathematics
 
 ---
 
-### Fusion State Machine
+### Coordinate Systems
 
-Each segment (UA and FA) runs an independent state machine with four states:
+Understanding the coordinate conventions is prerequisite to understanding every formula.
 
-| State | Condition | Output |
-|---|---|---|
-| `STEREO` | Stereo tracking reliable | Stereo position |
-| `IMU_CORRECTION` | Stereo failed; IMU available | Linear blend from last stereo → current IMU |
-| `RECOVERY` | Stereo returned after failure | **Phase 1 (confirming):** IMU output unchanged; **Phase 2 (blending):** lerp IMU → stereo |
-| `UNAVAILABLE` | Neither stereo nor IMU available | `null` |
+**BNO085 IMU (ENU / Z-up):**
+- X = East, Y = North, Z = Up
+- Gravity direction in sensor frame: [0, 0, −1] (gravity pulls in the −Z direction)
+- The sensor reports a rotation-vector quaternion q that maps the **sensor body frame → ENU world frame**. Concretely, if the sensor is lying flat on a table, q is the identity quaternion and the sensor body axes align with ENU world axes.
 
-#### State Transition Diagram
+**Stereo / OpenCV world frame (Y-down / right-hand):**
+- X = right (from the perspective of camera 1)
+- Y = down
+- Z = depth (into the scene, away from the cameras)
+- Gravity direction in this frame: [0, +1, 0] (gravity pulls in the +Y direction)
+- All joint positions output by the DLT triangulation hook are in this frame, in millimetres.
 
-```
-STEREO ──────────── stereo fails + IMU available ──────────► IMU_CORRECTION
-  ▲                                                                  │
-  │                                                     stereo fails + no IMU
-  │                                                                  │
-  │                                                                  ▼
-  └─── blend complete ◄── RECOVERY ◄─ stereo returns ───────── UNAVAILABLE
-                                                         ◄─ stereo returns ──┘
-                                          (stereo-first: RECOVERY before IMU)
-```
-
-When stereo is lost from `STEREO` and IMU is also unavailable, the transition goes directly to `UNAVAILABLE`. From `UNAVAILABLE`, when both stereo and IMU become available simultaneously, stereo recovery (`RECOVERY` state) takes priority over IMU correction.
+The ALS calibration produces a 3×3 rotation matrix `A` (per segment) that maps from IMU world frame → stereo world frame. Gravity provides the primary constraint: `A · [0,0,−1] ≈ [0,1,0]`.
 
 ---
 
-### Recovery Hysteresis (Two-Phase RECOVERY)
+### Part 1 — ALS Calibration
 
-A naive implementation would immediately begin blending toward stereo as soon as one reliable stereo frame arrives. This is problematic because MediaPipe often emits one or two spurious reliable frames at the edge of an occlusion before settling. Blending toward a momentary stereo reading and then immediately reverting creates visible snapping.
+Before Pipeline 4 can run, each segment (UA and FA) must be calibrated. Calibration is performed interactively in the IMU Lab tab of `IMULabView.tsx` and produces per-segment outputs stored in `armCalibrationRef.current`.
 
-The RECOVERY state is split into two explicit phases:
+#### 1.1 What is Being Solved
 
-**Phase 1 — Confirming (`recoveryPhase: 'confirming'`):**
-- `recoveryFrame` counts consecutive reliable stereo frames
-- Output remains the current IMU position (no change to the arm)
-- Phase 2 begins only after `recoveryConfirmFrames` (default: 5) consecutive reliable frames
+For each segment, the calibration finds two unknowns simultaneously:
 
-**Phase 2 — Blending (`recoveryPhase: 'blending'`):**
-- `blendFrom` is captured as the IMU position at the moment Phase 2 begins
-- Output linearly interpolates from `blendFrom` toward the live stereo position
-- After `blendFrames` (default: 4) frames the segment transitions to `STEREO`
+- **A** — a 3×3 proper rotation matrix (SO(3)) that rotates a vector from the IMU world frame into the stereo world frame
+- **b** — a unit vector in the sensor body frame pointing along the bone axis (the "bone local direction")
 
-**Interruption:** if stereo becomes unreliable again during Phase 1, `recoveryFrame` resets and the state reverts to `IMU_CORRECTION`. A reliable frame in Phase 2 does not interrupt blending.
+The model equation is:
 
 ```
-IMU_CORRECTION  →  [stereo reliable]  →  RECOVERY/confirming
-                                                │  × recoveryConfirmFrames
-                                                ▼
-                                         RECOVERY/blending
-                                                │  × blendFrames
-                                                ▼
-                                             STEREO
+d_stereo ≈ A · R(q) · b
 ```
 
----
+Where:
+- `d_stereo` — the measured bone direction in stereo world coordinates (unit vector from proximal joint to distal joint, computed from triangulated positions)
+- `q` — the quaternion reported by the IMU sensor at the moment of the observation
+- `R(q)` — the rotation matrix corresponding to q, which rotates a vector from the sensor body frame to the ENU world frame
+- `b` — the bone direction in the sensor body frame (unknown)
+- `A` — the IMU world → stereo world rotation (unknown)
 
-### Shoulder Anchor Management
+The product `A · R(q) · b` rotates b from the sensor body frame, through ENU world space, into stereo world space. This should match the stereo-measured bone direction `d_stereo`.
 
-The shoulder anchor is the single authoritative 3D reference position for the entire kinematic chain. Prior to this fix, `IMULabView.tsx` maintained its own `shoulderAnchorRef` in parallel with the fusion controller's shoulder state, which diverged when simulated shoulder failures were active.
+Three calibration poses are collected (three distinct arm orientations that are geometrically diverse), yielding three (q_i, d_i) observation pairs per segment. The system is underdetermined with only three poses but the gravity regularizer (see §1.3) provides the additional constraint to make it well-conditioned.
 
-**Current design:**
-- The fusion controller is the **sole owner** of the shoulder anchor
-- The anchor updates only when `rightShoulder` stereo status is reliable **and** `simulated.shoulder` is `false`
-- The anchor expires after `shoulderAnchorMaxAgeMs` (default: 500 ms)
-- `getEffectiveShoulder(nowMs)` is a **read-only query** — it does not advance any state
-- `IMULabView` calls `getEffectiveShoulderRef.current(nowMs)` to anchor its IMU reconstruction before calling `processFusionFrame`; the resulting one-frame lag is negligible
+#### 1.2 The Wahba Solver (`wahbaFromPairs`)
 
-Anchor states reported in diagnostics:
+**Source:** `IMULabView.tsx` lines 316–346
 
-| `shoulderAnchorState` | Meaning |
-|---|---|
-| `live` | Shoulder visible and reliable this frame; anchor just updated |
-| `frozen` | Shoulder not visible this frame; anchor is still valid (not expired) |
-| `expired` | Anchor is older than `shoulderAnchorMaxAgeMs`; returns `null` |
-
----
-
-### Forearm Wrist Computation
-
-**The bug this fixes:** prior to Pipeline 4, the wrist IMU position was pre-computed in `IMULabView.tsx` using the independently reconstructed IMU elbow as the anchor:
+The core rotation-fitting primitive is a weighted Wahba problem solved by SVD (Kabsch algorithm). Given a set of unit-vector pairs {(s_i, d_i)} with weights w_i, find the rotation R ∈ SO(3) that minimizes:
 
 ```
-// OLD (incorrect when UA uses stereo, FA uses IMU)
-imuWrist = imuElbow + calibFaLengthMm × imuFAWorldDir
+J(R) = Σ_i  w_i · |d_i − R · s_i|²
 ```
 
-When the upper arm segment remained in STEREO mode but the forearm segment switched to IMU_CORRECTION, the `imuElbow` used to anchor the wrist was computed from the raw IMU reconstruction (anchored to the stereo shoulder only), not from the **fused** elbow that the fusion controller actually output. The two elbow positions could differ significantly, causing the fused wrist to float relative to the visually displayed elbow.
+The optimal R is found as follows:
 
-**Current design:** `IMULabView.tsx` now passes `imuFADir: [number, number, number] | null` — the normalized forearm world direction only. The fusion controller computes the target wrist position using its own `finalElbow` (the output of the UA segment's state machine, which may be stereo or IMU-blended):
+**Step 1 — Accumulate the cross-covariance matrix H:**
+
+```
+H = Σ_i  w_i · s_i · d_i^T       (3×3 matrix)
+
+H_00 = Σ w_i · s_ix · d_ix
+H_01 = Σ w_i · s_ix · d_iy
+H_02 = Σ w_i · s_ix · d_iz
+H_10 = Σ w_i · s_iy · d_ix
+...etc
+```
+
+Note the outer-product ordering: s is the source vector (in sensor/IMU space), d is the destination vector (in stereo space). The rows index the source coordinate, the columns index the destination coordinate.
+
+**Step 2 — Singular Value Decomposition:**
+
+```
+SVD(H) = U · Σ · V^T
+```
+
+The optimal rotation (in the absence of reflections) is:
+
+```
+R = V · U^T
+```
+
+**Step 3 — Determinant correction (ensuring proper rotation):**
+
+The SVD solution can produce a reflection (det(R) = −1) if the data has noise or near-degeneracy. This is corrected by flipping the sign of the third column of V before the final multiplication:
+
+```
+if det(R) < 0:
+    V[:, 2] = −V[:, 2]
+    R = V · U^T
+```
+
+This ensures R ∈ SO(3) (det = +1, orthonormal) in all cases.
 
 ```typescript
-imuTargetWrist = finalElbow + calibFaLengthMm × imuFADir
+// From wahbaFromPairs in IMULabView.tsx
+const Rraw = V.mmul(U.transpose());
+const det = ...;          // 3×3 determinant
+if (det < 0) {
+    Vf = V.clone();
+    Vf.col(2) *= -1;      // flip last column
+    R = Vf.mmul(U.transpose());
+}
 ```
 
-This guarantees the fused wrist is always geometrically consistent with the fused elbow, regardless of which source each segment uses.
+#### 1.3 Alternating Least-Squares (`solveALS`)
 
-FA availability is gated on `imuFABaseAvailable && finalElbow !== null`: if the fused elbow is not available (UA is UNAVAILABLE), the FA segment also cannot produce an IMU target.
+**Source:** `IMULabView.tsx` lines 362–440
 
----
+The two unknowns A and b appear multiplicatively in the model equation, so a direct closed-form solution does not exist. The ALS algorithm decouples the problem by alternating between two linear sub-problems:
 
-### Source Priority from UNAVAILABLE
+**b-step — update bone direction given current A:**
 
-In the `UNAVAILABLE` case, the controller checks:
-1. **Stereo first** — if stereo is reliable, transition to `RECOVERY`
-2. **IMU second** — only if stereo is not reliable and IMU is available, transition to `IMU_CORRECTION`
+With A fixed, each observation gives a predicted direction for b in sensor space:
 
-```typescript
-case 'UNAVAILABLE':
-  if (stereoReliable) {
-    seg.state = 'RECOVERY';   // stereo-first
-    ...
-  } else if (imuAvailable) {
-    seg.state = 'IMU_CORRECTION';  // IMU fallback
-    ...
-  }
-  break;
+```
+b_i^(sensor) = R(q_i)^{-1} · A^T · d_stereo_i
+             = R(q_i^*) · A^T · d_stereo_i      (quaternion inverse = conjugate for unit quats)
 ```
 
-This ordering ensures that when both sources become available simultaneously (e.g. after a full dropout), the path taken is always through RECOVERY (with confirmation hysteresis) rather than immediately trusting an unchecked IMU position.
+The optimal b is the normalized average of all b_i^(sensor):
 
----
+```
+b^(raw) = Σ_i  R(q_i^*) · A^T · d_stereo_i
+b = b^(raw) / |b^(raw)|
+```
 
-### Fusion Configuration
+This is the solution to the L2-minimization of |b − b_i^(sensor)|² over the unit sphere.
 
-All parameters are configurable via `FusionConfig` (passed as `configOverrides` to the hook or `createFusionController`):
+**A-step — update world rotation given current b:**
 
-| Parameter | Default | Description |
-|---|---|---|
-| `shoulderAnchorMaxAgeMs` | `500` | ms before the frozen shoulder anchor expires |
-| `recoveryConfirmFrames` | `5` | Consecutive reliable stereo frames required before Phase 2 begins |
-| `blendFrames` | `4` | Number of frames for the linear blend transition |
-| `imuFreshnessMs` | `150` | Maximum IMU packet age (ms) for fusion; stale IMU → UNAVAILABLE |
-| `segLengthTolerance` | `0.25` | Max fractional deviation of stereo segment length from calibrated value |
+With b fixed, each observation provides a source vector in IMU world space:
 
-The `imuFreshnessMs` threshold is stricter than the calibration freshness gate (500 ms) because stale orientation data during an occlusion causes visible position drift.
+```
+s_i = R(q_i) · b       (rotate bone direction from sensor frame into IMU world frame)
+```
 
----
+We then solve the Wahba problem with source vectors s_i and destination vectors d_stereo_i:
 
-### Fusion Diagnostics
+```
+A = wahbaFromPairs({ (s_i, d_stereo_i, w=1) } ∪ gravity_regularizer)
+```
 
-`processFusionFrame` returns a `FusionDiagnostics` object alongside the final positions:
+**Gravity regularizer:**
+
+The gravity observation provides an independent, physics-grounded constraint:
+
+```
+s_gravity = [0, 0, −1]     (gravity in IMU ENU world: −Z direction)
+d_gravity = [0, 1,  0]     (gravity in stereo world: +Y direction, since Y is down)
+w_gravity = 20
+```
+
+This single synthetic pair, weighted at 20× a normal observation, is added to every A-step solve. With ~3 calibration observations of weight 1 each, the gravity constraint contributes approximately 20/23 ≈ 87% of the total Wahba cost — strongly constraining the tilt axis while leaving the yaw axis to be determined by the arm pose data. Without this regularizer, solutions with correct residuals but physically impossible gravity mappings (e.g. gravity pointing sideways) can dominate.
+
+**Convergence criterion:**
+
+After each iteration, the rotation angle between A_old and A_new is measured via the trace of A_old^T · A_new:
+
+```
+angle = arccos( clamp((trace(A_old^T · A_new) − 1) / 2, [−1, 1]) ) × (180/π)
+```
+
+Convergence is declared when `angle < 0.05°`. Maximum 100 iterations. Stagnation is detected when `|Δangle| < 1e-4°` for 10 consecutive iterations (local minimum — further iterations are wasted).
+
+**Final b refinement:**
+
+When convergence is reached, one additional b-step is performed using the final converged A to maximize the quality of the bone direction estimate.
+
+#### 1.4 Multi-Initialization (`solveALSMultiInit`)
+
+**Source:** `IMULabView.tsx` lines 451–522
+
+ALS can converge to local minima. Since the gravity axis (Z in IMU world) is constrained, the remaining degree of freedom is the **yaw** around gravity. The multi-initialization strategy tries 12 starting orientations spaced 30° apart in yaw:
+
+```
+A_BASE = [[1,0,0],[0,0,−1],[0,1,0]]    // maps IMU Z-up gravity to stereo Y-down gravity
+θ_k = 2π × k / 12,    k = 0, 1, ..., 11
+
+Yaw(θ_k) = [[cos θ_k,  −sin θ_k,  0],    // rotation around IMU Z-axis
+             [sin θ_k,   cos θ_k,  0],
+             [     0,         0,   1]]
+
+A_init_k = A_BASE × Yaw(θ_k)
+```
+
+Each initialization is gravity-consistent by construction (`A_init_k · [0,0,−1] = [0,1,0]` exactly). The 12 candidates are ranked by a combined score:
+
+```
+score = perFrameResidualMeanDeg + 0.05 × gravityAlignmentErrorDeg
+```
+
+where `perFrameResidualMeanDeg` is the mean angular error across all calibration frames (`angleBetween(A·R(q)·b, d_stereo)`), and the 0.05 gravity penalty gently prefers solutions that maintain better gravity alignment.
+
+**Ambiguity detection:** if a second candidate has a score within 1° of the winner but differs from it by more than 15° of rotation, the calibration is flagged as ambiguous — the arm poses do not uniquely determine the yaw. The user is warned to recollect with more diverse arm orientations.
+
+#### 1.5 Calibration Outputs
+
+After `solveALSMultiInit` converges for both segments, the following values are stored in `armCalibrationRef.current`:
 
 | Field | Type | Description |
 |---|---|---|
-| `uaState` / `faState` | `SegmentState` | Current state of each segment |
-| `uaRecoveryPhase` / `faRecoveryPhase` | `'confirming' \| 'blending' \| null` | Sub-phase within RECOVERY |
-| `shoulderAnchorState` | `'live' \| 'frozen' \| 'expired'` | Shoulder anchor status |
-| `shoulderAnchorAgeMs` | `number` | ms since last anchor update |
-| `uaFailureReason` / `faFailureReason` | `string \| null` | Human-readable failure description |
-| `uaCorrectionActiveMs` / `faCorrectionActiveMs` | `number` | ms spent in IMU_CORRECTION |
-| `uaRecoveryFrame` / `faRecoveryFrame` | `number` | Confirmation frame counter within RECOVERY |
-| `blendAlphaUA` / `blendAlphaFA` | `0–1` | Current blend fraction (0 = IMU, 1 = stereo) |
-| `imu01AgeMs` / `imu02AgeMs` | `number` | Age of last IMU packet from each sensor |
-| `imuCalibrationValid` | `boolean` | Whether a non-failed calibration is loaded |
-| `fullyAvailable` | `boolean` | All three joints (shoulder, elbow, wrist) are non-null |
-| `simulated` | `SimulatedFailures` | Which joints had simulation overrides active |
+| `R_ua` | `Mat3` | IMU world → stereo world rotation for upper arm |
+| `R_fa` | `Mat3` | IMU world → stereo world rotation for forearm |
+| `uaBoneLocalDir` | `Vec3` | Upper arm bone axis in imu_01 sensor body frame |
+| `faBoneLocalDir` | `Vec3` | Forearm bone axis in imu_02 sensor body frame |
+| `uaLengthMm` | `number` | Calibrated upper arm length in mm (median over poses) |
+| `faLengthMm` | `number` | Calibrated forearm length in mm (median over poses) |
+| `quality` | `string` | `'good'` / `'ok'` / `'poor'` / `'failed'` |
 
-The `IMUReconstructionView` Pipeline 4 overlay uses `uaRecoveryPhase` and `faRecoveryPhase` to distinguish "Confirming" from "Blending" badge labels in the live UI.
+---
+
+### Part 2 — Runtime IMU Orientation Reconstruction
+
+Each stereo frame, `onCorrectedPose` in `IMULabView.tsx` performs an absolute forward-kinematics reconstruction from the current IMU sensor quaternions. This is independent of any previous frame — there is no ΔQ, no reference snapshot, and no drift accumulation.
+
+#### 2.1 Upper Arm Reconstruction (imu_01)
+
+**Source:** `IMULabView.tsx` lines 1585–1613
+
+Given the current quaternion `q_ua` from imu_01 sensor (right upper arm):
+
+**Step 1 — Rotate bone direction from sensor body frame into IMU ENU world frame:**
+
+```
+boneInImuWorld = R(q_ua) · uaBoneLocalDir
+```
+
+This is computed using the optimized quaternion sandwich product:
+
+```
+boneInImuWorld = q_ua ⊗ [0, uaBoneLocalDir] ⊗ q_ua*
+```
+
+Where `⊗` denotes Hamilton quaternion multiplication and `q_ua*` is the conjugate. In `rotateVectorByQuaternion` this is implemented via the cross-product form for efficiency:
+
+```
+t = 2 · (q.xyz × v)
+v' = v + q.w · t + (q.xyz × t)
+```
+
+**Step 2 — Rotate from IMU world frame into stereo world frame:**
+
+```
+worldDirUA = normalize(R_ua · boneInImuWorld)
+```
+
+Where `R_ua` is the calibrated IMU world → stereo world matrix. The normalization is defensive (R_ua is a rotation so the magnitude should already be 1, but floating-point drift is corrected).
+
+**Step 3 — Project from shoulder anchor along bone direction:**
+
+```
+reconElbow = effectiveShoulder + uaLengthMm × worldDirUA
+```
+
+The shoulder anchor (`effectiveShoulder`) is the last confirmed stereo shoulder position managed by the fusion controller (see §4.1). This is read-only before calling `processFusionFrame`.
+
+#### 2.2 Forearm Reconstruction (imu_02)
+
+**Source:** `IMULabView.tsx` lines 1625–1663
+
+The same three-step process applies for the forearm, using `q_fa` from imu_02 (forearm):
+
+```
+boneInImuWorld_FA = R(q_fa) · faBoneLocalDir
+worldDirFA        = normalize(R_fa · boneInImuWorld_FA)
+```
+
+The normalized direction `worldDirFA` is stored as `imuFAWorldDir` — a `[x, y, z]` tuple — and passed to the fusion controller. The fusion controller computes the final wrist position internally using the fused elbow (see §4.5). For the pure IMU display panel, the wrist is also computed locally for visualization:
+
+```
+reconWrist = reconElbow + faLengthMm × worldDirFA     // IMU display panel only
+```
+
+The critical distinction: for Pipeline 4, only the **direction** is passed. The fusion controller re-computes the wrist position itself using its own `finalElbow` output. This prevents the wrist from floating relative to the fused elbow when UA and FA use different sources.
+
+#### 2.3 Quaternion Convention
+
+The BNO085 sensor reports quaternions as `[qw, qx, qy, qz]` via the WebSocket packet fields `{qw, qx, qy, qz}`. The `packetToQuat` function converts this directly to the internal `Quaternion = [w, x, y, z]` type used by `quaternionUtils.ts`.
+
+The quaternion represents the rotation from the sensor body frame to the ENU world frame. When the sensor is upright with its Y-axis pointing North, q is the identity [1, 0, 0, 0]. The sandwich product `q ⊗ v ⊗ q*` then returns v unchanged — the sensor body frame coincides with the world frame.
+
+---
+
+### Part 3 — Stereo Reliability Evaluation (`evalStereoReliable`)
+
+**Source:** `useIMUFusionController.ts` lines 236–259
+
+Before the state machine can decide whether to trigger IMU correction, it must know whether the current stereo reading is trustworthy. The `evalStereoReliable` function applies a cascade of gates in order. The first failing gate short-circuits and returns the failure reason.
+
+#### Gate 1 — Simulation Override
+
+```
+if (simProx) → { reliable: false, reason: 'Simulated proximal joint failure' }
+if (simDist) → { reliable: false, reason: 'Simulated distal joint failure' }
+```
+
+Simulation overrides are applied first, before any real data checks, so that simulated failures are indistinguishable from real ones throughout the entire pipeline.
+
+#### Gate 2 — Joint Presence
+
+```
+if (!proxJoint) → { reliable: false, reason: 'Proximal joint missing' }
+if (!distJoint) → { reliable: false, reason: 'Distal joint missing' }
+```
+
+If either joint coordinate is null (MediaPipe did not return it), the segment is not usable.
+
+#### Gate 3 — Jitter Status (`reliable` flag from `usePoseFailureCorrection`)
+
+```
+if (!proxStatus?.reliable) → { reliable: false, reason: 'Proximal joint unreliable (failureType)' }
+if (!distStatus?.reliable) → { reliable: false, reason: 'Distal joint unreliable (failureType)' }
+```
+
+The `JointFailureStatus.reliable` field from `usePoseFailureCorrection` encodes the outcome of the EMA jitter corrector:
+
+| `failureType` | `reliable` | Meaning |
+|---|---|---|
+| `'none'` | `true` | Normal frame; EMA applied at `normalSmoothingAlpha = 0.9` |
+| `'light_jitter'` | `true` | Spike detected; corrected with `lightSmoothingAlpha = 0.6`; still usable |
+| `'heavy_jitter'` | `false` | Large spike; corrected with `heavySmoothingAlpha = 0.3`; not trusted |
+| `'occlusion'` | `false` | Joint returned null; EMA state reset |
+
+Light jitter joints are corrected and still passed through; only heavy jitter and occlusion set `reliable = false` and trigger IMU fallback.
+
+#### Gate 4 — Anatomical Segment Length
+
+```
+if (calibLength > 0):
+    len = dist3d(proxJoint, distJoint)          // Euclidean distance in mm
+    if |len − calibLength| / calibLength > tolerance:
+        → { reliable: false, reason: 'Segment length Xmm vs calib Ymm (>25% deviation)' }
+```
+
+This gate is active only after a successful calibration (`calibLength > 0`). It detects when MediaPipe tracks the wrong joint (e.g. mistaking the elbow for the wrist, producing a wildly incorrect segment length). The default tolerance is 0.25 (25%). The segment length is the straight-line Euclidean distance:
+
+```
+len = sqrt((prox.x − dist.x)² + (prox.y − dist.y)² + (prox.z − dist.z)²)
+```
+
+If all four gates pass, the function returns `{ reliable: true, reason: null }`.
+
+#### FA-specific evaluation (inline in `_processFusionFrame`)
+
+The forearm segment has a modified evaluation that uses `finalElbow` (the output of the UA state machine) as its reference point rather than the raw stereo elbow:
+
+```
+if (!effectiveElbow)       → { reliable: false, reason: 'Elbow unavailable' }
+if (!effStereoWrist)       → { reliable: false, reason: 'Wrist missing' / 'Simulated wrist failure' }
+if (!wristStatus?.reliable)→ { reliable: false, reason: 'Wrist unreliable (failureType)' }
+if (calibFaLengthMm > 0):
+    faLen = dist3d(effectiveElbow, effStereoWrist)
+    if |faLen − calibFaLengthMm| / calibFaLengthMm > tolerance:
+        → { reliable: false, reason: 'FA length ...' }
+```
+
+Using `finalElbow` (not `stereoElbow`) for the FA length check ensures geometric consistency: if UA is in IMU_CORRECTION and stereo elbow is missing, the FA segment correctly sees `effectiveElbow = null` and immediately returns `reliable: false`.
+
+---
+
+### Part 4 — Frame-by-Frame Processing (`_processFusionFrame`)
+
+**Source:** `useIMUFusionController.ts` lines 472–606
+
+`_processFusionFrame` is the single function that executes all fusion logic. It is called once per stereo frame from `IMULabView.onCorrectedPose`. The following describes every step in execution order.
+
+#### 4.1 Input Preparation and Simulation Overrides
+
+The function receives a `FusionFrameInput` struct (see §6.2 for the full interface). The first action is to apply simulation overrides:
+
+```typescript
+const effStereoShoulder = simulated.shoulder ? null : stereoShoulder;
+const effStereoElbow    = simulated.elbow    ? null : stereoElbow;
+const effStereoWrist    = simulated.wrist    ? null : stereoWrist;
+```
+
+`simulated` is a `SimulatedFailures` struct `{ shoulder: boolean, elbow: boolean, wrist: boolean }`. Setting a field to true replaces the corresponding stereo position with null for the entire remainder of the frame — the simulated dropout is physically indistinguishable from a real MediaPipe failure at every downstream gate.
+
+#### 4.2 Shoulder Anchor Update
+
+The anchor update decision requires three conditions all to be true simultaneously:
+
+```
+shoulderStatusReliable = (!simulated.shoulder)
+                       && (stereoShoulder !== null)
+                       && (byJoint['rightShoulder']?.reliable !== false)
+```
+
+If all three hold, the anchor is updated:
+
+```typescript
+s.shoulder = {
+    pos:        { x: stereoShoulder.x, y: stereoShoulder.y, z: stereoShoulder.z },
+    capturedAt: nowMs,    // performance.now() timestamp
+};
+```
+
+Note that the update uses the raw `stereoShoulder` (not `effStereoShoulder`). The simulation override has already been captured in the `shoulderStatusReliable` condition: if `simulated.shoulder = true`, the condition short-circuits to false and no update occurs.
+
+#### 4.3 Effective Shoulder Computation
+
+After the potential update, the anchor age is checked:
+
+```
+anchorAgeMs = nowMs − s.shoulder.capturedAt    (or Infinity if no anchor)
+anchorValid = anchorAgeMs ≤ shoulderAnchorMaxAgeMs    (default: 500 ms)
+effectiveShoulder = anchorValid ? s.shoulder.pos : null
+```
+
+The `shoulderAnchorState` diagnostic field is set based on two conditions:
+
+```
+if (!anchorValid) → 'expired'
+else if (shoulderStatusReliable this frame) → 'live'
+else → 'frozen'
+```
+
+#### 4.4 IMU Availability Gates
+
+**Upper arm (UA) IMU availability:**
+
+```
+imuUAAvailable = (imuElbow !== null)
+               && calibrationValid
+               && (imu01AgeMs ≤ imuFreshnessMs)     // default: 150 ms
+               && (effectiveShoulder !== null)
+```
+
+All four conditions must hold. An expired shoulder anchor makes IMU UA unavailable even if the sensor data is fresh, because the elbow position cannot be computed without an anchor:
+
+```
+reconElbow = effectiveShoulder + uaLength × worldDirUA     // requires effectiveShoulder
+```
+
+**Forearm base availability (direction only, before knowing finalElbow):**
+
+```
+imuFABaseAvailable = (imuFADir !== null)
+                   && calibrationValid
+                   && (imu02AgeMs ≤ imuFreshnessMs)     // default: 150 ms
+```
+
+**Forearm full availability (after UA state machine produces finalElbow):**
+
+```
+imuFAAvailable = imuFABaseAvailable && (finalElbow !== null)
+```
+
+This is evaluated after the UA state machine runs. If UA output is null (UA is UNAVAILABLE), FA cannot produce a wrist position even if the forearm sensor data is perfectly fresh — there is no elbow to attach the forearm to.
+
+#### 4.5 UA State Machine and Output (`advanceSeg`)
+
+`evalStereoReliable` is called for the upper arm segment using `effStereoShoulder` and `effStereoElbow`. The result is passed to `advanceSeg` for the UA segment. See §5 for the full state machine logic. The output is assigned:
+
+```typescript
+const finalElbow = advanceSeg(
+    s.ua, effStereoElbow, imuElbow,
+    uaEval.reliable, uaEval.reason,
+    imuUAAvailable, cfg, nowMs,
+);
+```
+
+#### 4.6 IMU Target Wrist Computation
+
+After `finalElbow` is known, the IMU wrist target for the FA segment is computed:
+
+```typescript
+const imuTargetWrist: Pt3 | null =
+    (imuFADir && finalElbow && calibFaLengthMm > 0)
+    ? {
+        x: finalElbow.x + calibFaLengthMm * imuFADir[0],
+        y: finalElbow.y + calibFaLengthMm * imuFADir[1],
+        z: finalElbow.z + calibFaLengthMm * imuFADir[2],
+      }
+    : null;
+```
+
+The formula is: **fused elbow position + calibrated forearm length × normalized forearm world direction.** The critical property is that `finalElbow` is the output of the UA state machine — it may be a stereo position, an IMU position, or a blended value. The wrist is always geometrically attached to whatever the elbow actually is, not to an independent IMU-only reconstruction.
+
+#### 4.7 FA State Machine and Output
+
+FA stereo reliability is evaluated inline (not via `evalStereoReliable`, because the FA proximal joint is the fused elbow, not a raw stereo joint). Then `advanceSeg` runs for the forearm:
+
+```typescript
+const finalWrist = advanceSeg(
+    s.fa, effStereoWrist, imuTargetWrist,
+    faEval.reliable, faEval.reason,
+    imuFAAvailable, cfg, nowMs,
+);
+```
+
+#### 4.8 Diagnostics Computation and Output
+
+Blend alphas for the UI overlay are computed as:
+
+```typescript
+blendAlphaUA = (ua.state === 'IMU_CORRECTION')
+    ? min(1, ua.transitionFrame / blendFrames)
+    : (ua.state === 'RECOVERY' && ua.recoveryConfirmed)
+    ? min(1, ua.transitionFrame / blendFrames)
+    : 0
+```
+
+In `IMU_CORRECTION`, `blendAlpha = 0` means fully at the old stereo position (first frame), `blendAlpha = 1` means fully at the IMU position (from frame `blendFrames` onward). In RECOVERY blending phase, `blendAlpha = 1` means fully stereo (fully recovered). The diagnostic naming is consistent: alpha tracks how far along the current transition is.
+
+The function returns a `FusionFrameResult`:
+
+```typescript
+{
+    finalShoulder: effectiveShoulder,
+    finalElbow,
+    finalWrist,
+    effectiveShoulder,
+    diagnostics,
+}
+```
+
+---
+
+### Part 5 — State Machine (`advanceSeg`)
+
+**Source:** `useIMUFusionController.ts` lines 270–429
+
+`advanceSeg` advances one segment's state machine by one frame. It is a pure function of the current state plus the per-frame inputs; it mutates the `SegState` in-place and returns the output position.
+
+The internal state per segment is:
+
+```typescript
+interface SegState {
+    state:              SegmentState;      // 'STEREO' | 'IMU_CORRECTION' | 'RECOVERY' | 'UNAVAILABLE'
+    failureReason:      string | null;     // human-readable reason for current failure
+    correctionStartedAt: number | null;   // performance.now() when IMU_CORRECTION began
+    recoveryFrame:      number;           // Phase 1 frame counter within RECOVERY
+    recoveryConfirmed:  boolean;          // true once Phase 1 is complete
+    transitionFrame:    number;           // blend frame counter (IMU_CORRECTION or RECOVERY/blending)
+    blendFrom:          Pt3 | null;       // captured position at start of blend
+    lastPos:            Pt3 | null;       // output from previous frame
+}
+```
+
+#### 5.1 Trigger Conditions (STEREO → IMU_CORRECTION)
+
+The fusion trigger fires when stereo reliability fails and IMU data is available:
+
+```
+FROM STEREO:
+  if (!stereoReliable):
+      if (imuAvailable):
+          → IMU_CORRECTION
+              failureReason = stereoReason         // from evalStereoReliable
+              correctionStartedAt = nowMs
+              recoveryFrame = 0
+              recoveryConfirmed = false
+              transitionFrame = 0
+              blendFrom = lastPos ?? stereoPos     // start of outgoing blend
+      else:
+          → UNAVAILABLE
+              failureReason = stereoReason ?? 'IMU also unavailable'
+              correctionStartedAt = null
+  else:
+      failureReason = null    // clear any stale reason; stay in STEREO
+```
+
+The `blendFrom` assignment — `lastPos ?? stereoPos` — captures the elbow/wrist position at the exact frame when the trigger fires. `lastPos` is the output from the previous frame (which was a stereo reading), so the blend starts smoothly from where stereo left off. If `lastPos` is null (very first frame), it falls back to the current stereo position.
+
+**Practical triggers (common causes of stereoReliable = false):**
+1. MediaPipe returns null for the elbow or wrist (heavy occlusion, limb outside frame)
+2. Jitter corrector flags heavy jitter (`failureType = 'heavy_jitter'`, `reliable = false`)
+3. Anatomical segment length deviation > 25% (MediaPipe tracking the wrong joint)
+4. Simulation override active on the joint
+
+#### 5.2 IMU_CORRECTION Output and Blend-In
+
+During IMU_CORRECTION, `transitionFrame` increments each frame (starting from 0 on entry, incrementing at the bottom of `advanceSeg` so frame 1 has `transitionFrame = 1` when the blend alpha is computed):
+
+```
+transitionFrame++ each frame in IMU_CORRECTION
+alpha = min(1, transitionFrame / blendFrames)      // clamp to [0, 1]
+output = lerp(blendFrom, imuPos, alpha)
+```
+
+The lerp function:
+
+```
+lerp(a, b, t) = a + t × (b − a)
+              = { x: a.x + t×(b.x − a.x), y: ..., z: ... }
+              with t = clamp(alpha, 0, 1)
+```
+
+Frame-by-frame example with default `blendFrames = 4`:
+
+| Frame in IMU_CORRECTION | transitionFrame | alpha | Output |
+|---|---|---|---|
+| 1 (trigger frame) | 1 | 0.25 | 75% last stereo + 25% IMU |
+| 2 | 2 | 0.50 | 50% last stereo + 50% IMU |
+| 3 | 3 | 0.75 | 25% last stereo + 75% IMU |
+| 4+ | ≥4 | 1.00 | 100% IMU (fully fused) |
+
+The blend-in prevents a visible pop when the trigger fires. After `blendFrames` frames, the output is indistinguishable from pure IMU.
+
+#### 5.3 Transition from IMU_CORRECTION
+
+```
+FROM IMU_CORRECTION:
+  if (stereoReliable):
+      → RECOVERY
+          recoveryFrame = 0
+          recoveryConfirmed = false
+          transitionFrame = 0
+          // blendFrom will be captured when Phase 1 completes
+  else if (!imuAvailable):
+      → UNAVAILABLE
+          correctionStartedAt = null
+  else:
+      stay in IMU_CORRECTION (stereo still unreliable, IMU still fresh)
+```
+
+#### 5.4 Reversion Conditions — RECOVERY State
+
+The reversion from IMU back to stereo happens through two explicit phases:
+
+**Phase 1 — Confirming:**
+
+```
+FROM IMU_CORRECTION → RECOVERY (stereo returns):
+  recoveryFrame = 0
+  recoveryConfirmed = false
+
+Each frame in RECOVERY where stereoReliable:
+  recoveryFrame++
+  if (recoveryFrame >= recoveryConfirmFrames):    // default: 5
+      recoveryConfirmed = true
+      transitionFrame = 0
+      blendFrom = lastPos ?? imuPos               // capture current position for blend
+
+Output during Phase 1:
+  imuPos ?? lastPos     // pure IMU; no blending toward stereo yet
+```
+
+Phase 1 requires `recoveryConfirmFrames` (default: 5) consecutive reliable stereo frames before anything changes in the output. A single transient stereo frame at the edge of an occlusion has zero effect on the arm's displayed position.
+
+**Phase 2 — Blending:**
+
+```
+Each frame in RECOVERY where recoveryConfirmed and stereoReliable:
+  transitionFrame++
+  if (transitionFrame >= blendFrames):    // default: 4
+      → STEREO
+          failureReason = null
+          correctionStartedAt = null
+          recoveryFrame = 0
+          recoveryConfirmed = false
+          transitionFrame = 0
+          blendFrom = null
+
+Output during Phase 2:
+  lerp(blendFrom, stereoPos, alpha)     // alpha = min(1, transitionFrame / blendFrames)
+```
+
+Phase 2 blends from the captured IMU position (at the moment Phase 1 completed) toward the current live stereo position. After `blendFrames` frames the blend is complete and the segment returns to pure STEREO.
+
+Frame-by-frame example of full recovery cycle (confirm=5, blend=4):
+
+| Frame | Event | Phase | Output |
+|---|---|---|---|
+| 0 | Stereo fails | → IMU_CORRECTION | Blend-in toward IMU |
+| 1–4 | IMU active | IMU_CORRECTION | 100% IMU (blended in) |
+| 5 | Stereo returns | → RECOVERY/confirming | 100% IMU (unchanged) |
+| 6 | | confirming (2/5) | 100% IMU |
+| 7 | | confirming (3/5) | 100% IMU |
+| 8 | | confirming (4/5) | 100% IMU |
+| 9 | 5th good frame | → RECOVERY/blending (1/4) | 75% IMU + 25% stereo |
+| 10 | | blending (2/4) | 50% IMU + 50% stereo |
+| 11 | | blending (3/4) | 25% IMU + 75% stereo |
+| 12 | | blending (4/4) | → STEREO; 100% stereo |
+
+**RECOVERY interruption:**
+
+```
+FROM RECOVERY, if (!stereoReliable):
+  recoveryConfirmed = false
+  if (imuAvailable):
+      → IMU_CORRECTION
+          blendFrom = lastPos ?? imuPos    // smooth re-entry at current output position
+  else:
+      → UNAVAILABLE
+```
+
+If stereo fails during Phase 1, the segment reverts immediately to IMU_CORRECTION. The `recoveryFrame` counter is reset so the next recovery attempt requires the full confirmation window again. If stereo fails during Phase 2, the same reversion occurs (Phase 2 does not have special interruption protection — by Phase 2, stereo has been confirmed reliable for 5 consecutive frames, making interruption unlikely in practice).
+
+#### 5.5 UNAVAILABLE State
+
+```
+FROM UNAVAILABLE:
+  if (stereoReliable):
+      → RECOVERY               // stereo-first priority
+          recoveryFrame = 0
+          recoveryConfirmed = false
+          transitionFrame = 0
+          blendFrom = null      // null means "snap to target" in computeBlended
+  else if (imuAvailable):
+      → IMU_CORRECTION
+          correctionStartedAt = nowMs
+          blendFrom = null      // snap to IMU immediately (no prior position)
+  else:
+      stay in UNAVAILABLE; output = null
+```
+
+The stereo-first priority is enforced by the if/else-if ordering. When both stereo and IMU become available simultaneously after a complete dropout, the path is always through RECOVERY (with the 5-frame confirmation requirement) rather than immediately snapping to IMU.
+
+When `blendFrom = null` on entry to either RECOVERY or IMU_CORRECTION (the case from UNAVAILABLE), the `computeBlended` function snaps immediately to the target rather than blending from a ghost position:
+
+```typescript
+function computeBlended(seg, liveTarget, blendFrames) {
+    if (!liveTarget) return seg.lastPos;       // hold last position if target is missing
+    if (!seg.blendFrom) return liveTarget;     // snap: no known starting position
+    const alpha = min(1, seg.transitionFrame / max(1, blendFrames));
+    return lerp3(seg.blendFrom, liveTarget, alpha);
+}
+```
+
+---
+
+### Part 6 — Integration: How `IMULabView` Drives Pipeline 4
+
+**Source:** `IMULabView.tsx` lines 1473–1699
+
+The full per-frame integration sequence, executed inside `onCorrectedPose` on every stereo frame:
+
+```
+1. Receive (correctedPose, trackedCount, jointStatuses) from Pipeline 3
+2. Extract shoulder, elbow, wrist from correctedPose
+3. Compute arm geometry: uaLen = dist3D(shoulder, elbow), faLen = dist3D(elbow, wrist)
+4. Validate geometry: segOk = (SEG_MIN_MM < uaLen < SEG_MAX_MM) && ...
+5. Evaluate jitter gates: rightArmClean, rightArmCalibOk from jointStatuses
+6. Evaluate calibrated length gate: segCalibOk = ±20% of calibrated lengths
+7. Evaluate position velocity gate: 120mm/frame threshold on elbow and wrist
+8. Update lastReliableRef if armReliable
+9. Call getEffectiveShoulderRef.current(nowMs) → effectiveShoulder
+10. Compute imu01ReconAgeMs, imu02ReconAgeMs from getRawIMU packet timestamps
+11. If imu01ReconAvail (500ms freshness for display):
+    a. q_ua = packetToQuat(imu01Packet)
+    b. boneInImuWorld = rotateVectorByQuaternion(q_ua, calibData.uaBoneLocalDir)
+    c. worldDirUA = normalize(R_ua · boneInImuWorld)
+    d. reconElbow = effectiveShoulder + uaLengthMm × worldDirUA
+12. If imu02ReconAvail (500ms freshness for display):
+    a. q_fa = packetToQuat(imu02Packet)
+    b. boneInImuWorld_FA = rotateVectorByQuaternion(q_fa, calibData.faBoneLocalDir)
+    c. worldDirFA = normalize(R_fa · boneInImuWorld_FA)
+    d. imuFAWorldDir = [worldDirFA.x, worldDirFA.y, worldDirFA.z]     ← direction only
+    e. reconWrist = reconElbow + faLengthMm × worldDirFA               ← for display only
+13. Write pure IMU pose to imuReconPoseRef (center panel display)
+14. Call processFusionFrameRef.current(fusionInput) → fusionResult
+15. Build fusedPose: replace rightShoulder/Elbow/Wrist in correctedPose with fusionResult
+16. Write fusedPose, fusionResult.diagnostics to state
+```
+
+**Important freshness distinction:** steps 11 and 12 use a 500ms IMU freshness gate for the pure IMU display panel. Step 14 uses the fusion controller's `imuFreshnessMs = 150ms` gate internally. This means IMU data that is 200–500ms old will appear in the pure IMU display panel but will not trigger Pipeline 4 fusion — the fusion controller will treat it as stale and enter UNAVAILABLE instead.
+
+#### 6.1 The One-Frame Lag
+
+`getEffectiveShoulderRef.current(nowMs)` (step 9) is called **before** `processFusionFrame` (step 14). This means `effectiveShoulder` used for IMU reconstruction in step 11 is the anchor from the **previous** frame's update. When `processFusionFrame` runs, it may update the anchor with the new stereo shoulder — but that update is not visible until the next frame.
+
+This one-frame lag is acceptable because:
+- At 30 fps, one frame is ~33ms — negligible for a shoulder position that changes slowly
+- The alternative (reading the anchor after `processFusionFrame`) would require restructuring the data flow significantly
+- The fusion controller's own output uses the freshly-updated anchor internally (`finalElbow` uses the just-updated `effectiveShoulder` from within `_processFusionFrame`)
+
+#### 6.2 `FusionFrameInput` Interface
+
+```typescript
+interface FusionFrameInput {
+    stereoShoulder:   Pt3 | null;       // raw stereo shoulder (null = not tracked)
+    stereoElbow:      Pt3 | null;       // raw stereo elbow
+    stereoWrist:      Pt3 | null;       // raw stereo wrist
+    imuElbow:         Pt3 | null;       // IMU-reconstructed elbow (reconElbow from step 11d)
+    imuFADir:         [number,number,number] | null;  // normalized forearm direction (worldDirFA)
+    jointStatuses:    JointFailureStatus[];    // per-joint reliable/failureType from Pipeline 3
+    calibrationValid: boolean;          // true if calibration exists and quality !== 'failed'
+    calibUaLengthMm:  number;           // upper arm calibrated length (0 = invalid)
+    calibFaLengthMm:  number;           // forearm calibrated length (0 = invalid)
+    imu01AgeMs:       number;           // ms since last packet from imu_01
+    imu02AgeMs:       number;           // ms since last packet from imu_02
+    simulated:        SimulatedFailures; // { shoulder, elbow, wrist } boolean flags
+    nowMs:            number;           // performance.now() timestamp
+}
+```
+
+#### 6.3 `FusionFrameResult` Interface
+
+```typescript
+interface FusionFrameResult {
+    finalShoulder:    Pt3 | null;       // effective shoulder anchor (live or frozen)
+    finalElbow:       Pt3 | null;       // fused elbow output (stereo, IMU, or blend)
+    finalWrist:       Pt3 | null;       // fused wrist output
+    effectiveShoulder: Pt3 | null;      // same as finalShoulder (convenience alias)
+    diagnostics:      FusionDiagnostics;
+}
+```
+
+---
+
+### Part 7 — How to Use Pipeline 4
+
+This section provides a practical guide for integrating and configuring Pipeline 4 in the application.
+
+#### 7.1 Prerequisites
+
+Before Pipeline 4 can produce IMU output, all of the following must be true:
+
+1. **Two cameras calibrated** — stereo calibration JSON loaded; DLT triangulation producing metric 3D positions
+2. **MediaPipe running** — pose detection active; joints being tracked
+3. **Both IMU sensors connected** — `imu_01` (upper arm) and `imu_02` (forearm) sending packets to the WebSocket endpoint
+4. **ALS calibration completed** — three poses collected and solved; `armCalibration.quality !== 'failed'`; both `uaLengthMm` and `faLengthMm` > 0
+
+The IMU Lab tab in the application walks through all four prerequisites with real-time status indicators.
+
+#### 7.2 Performing the ALS Calibration
+
+1. **Pose 1** — extend the arm to a specific orientation (e.g. arm straight out in front). Hold still for the countdown. The app samples ~50 frames of IMU quaternions and the stereo joint directions.
+2. **Pose 2** — move the arm to a clearly different orientation (e.g. arm raised above head). Diverse poses improve the conditioning of the Wahba solve.
+3. **Pose 3** — a third distinct orientation (e.g. arm out to the side). The three poses should cover different positions in 3D space.
+4. The solver (`solveALSMultiInit`) runs automatically after pose 3 and displays:
+   - Mean residual (target: < 5°; excellent: < 2°)
+   - Gravity alignment error (target: < 2°)
+   - Calibration quality badge (Good / OK / Poor / Failed)
+   - Ambiguity warning if two solutions produce similar residuals but different physical predictions
+
+If the calibration shows Poor quality or an ambiguity warning, recollect with more geometrically diverse poses — avoid three poses that all lie in the same plane.
+
+#### 7.3 Runtime Monitoring
+
+The Pipeline 4 diagnostics panel (visible in the IMU Reconstruction tab) shows:
+
+- **UA / FA state badges** — current state of each segment (STEREO / IMU / RECOVERY / UNAVAILABLE)
+- **Recovery phase** — CONFIRMING (counting frames) or BLENDING (lerping back)
+- **Shoulder anchor** — LIVE / FROZEN / EXPIRED with age in ms
+- **IMU sensor ages** — time since last packet from each sensor
+- **Failure reasons** — the exact gate that caused each segment to switch away from stereo
+
+Watch for:
+- `'expired'` shoulder anchor → IMU elbow will be unavailable; check if the subject's shoulder is visible
+- `imu01AgeMs > 150` → upper arm IMU is stale; check WebSocket connection
+- Repeated `'heavy_jitter'` failures → camera/lighting issue causing pose instability
+- `'Segment length Xmm vs calib Ymm'` → significant segment length mismatch; may indicate calibration drift or extreme occlusion
+
+#### 7.4 `createFusionController()` Factory API
+
+For testing and non-React use cases:
+
+```typescript
+import { createFusionController } from './useIMUFusionController';
+
+const ctrl = createFusionController({
+    recoveryConfirmFrames: 5,     // optional overrides
+    blendFrames: 4,
+    imuFreshnessMs: 150,
+    shoulderAnchorMaxAgeMs: 500,
+    segLengthTolerance: 0.25,
+});
+
+// Per-frame call:
+const result: FusionFrameResult = ctrl.processFusionFrame(input);
+
+// Read shoulder anchor without advancing state:
+const shoulder: Pt3 | null = ctrl.getEffectiveShoulder(performance.now());
+
+// Reset all state (e.g. after subject change or calibration update):
+ctrl.reset();
+```
+
+The factory is identical in behavior to the React hook (`useIMUFusionController`). The hook is a thin wrapper that stores the same internal `FusionState` in a `useRef` and delegates all computation to the shared `_processFusionFrame` function. State is never stored in React component state — it lives in refs to avoid re-renders on every frame.
+
+---
+
+### Fusion State Machine — Complete Transition Table
+
+| From | Condition | To | Action |
+|---|---|---|---|
+| STEREO | `!stereoReliable && imuAvailable` | IMU_CORRECTION | `blendFrom = lastPos ?? stereoPos`; `transitionFrame = 0` |
+| STEREO | `!stereoReliable && !imuAvailable` | UNAVAILABLE | `correctionStartedAt = null` |
+| STEREO | `stereoReliable` | STEREO | Stay; `failureReason = null` |
+| IMU_CORRECTION | `stereoReliable` | RECOVERY | `recoveryFrame = 0`; `recoveryConfirmed = false` |
+| IMU_CORRECTION | `!imuAvailable` | UNAVAILABLE | `correctionStartedAt = null` |
+| IMU_CORRECTION | `!stereoReliable && imuAvailable` | IMU_CORRECTION | Stay; `transitionFrame++`; blend toward IMU |
+| RECOVERY/confirming | `!stereoReliable && imuAvailable` | IMU_CORRECTION | `recoveryConfirmed = false`; `blendFrom = lastPos ?? imuPos` |
+| RECOVERY/confirming | `!stereoReliable && !imuAvailable` | UNAVAILABLE | |
+| RECOVERY/confirming | `stereoReliable` (not enough frames) | RECOVERY/confirming | `recoveryFrame++` |
+| RECOVERY/confirming | `recoveryFrame >= recoveryConfirmFrames` | RECOVERY/blending | `blendFrom = lastPos ?? imuPos`; `transitionFrame = 0` |
+| RECOVERY/blending | `!stereoReliable && imuAvailable` | IMU_CORRECTION | `recoveryConfirmed = false`; `blendFrom = lastPos` |
+| RECOVERY/blending | `!stereoReliable && !imuAvailable` | UNAVAILABLE | |
+| RECOVERY/blending | `stereoReliable` (not complete) | RECOVERY/blending | `transitionFrame++`; blend toward stereo |
+| RECOVERY/blending | `transitionFrame >= blendFrames` | STEREO | Clear all blend state |
+| UNAVAILABLE | `stereoReliable` | RECOVERY | `blendFrom = null`; `recoveryFrame = 0` |
+| UNAVAILABLE | `!stereoReliable && imuAvailable` | IMU_CORRECTION | `blendFrom = null`; snap to IMU |
+| UNAVAILABLE | `!stereoReliable && !imuAvailable` | UNAVAILABLE | Stay; `output = null` |
+
+---
+
+### Fusion Configuration Reference
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `shoulderAnchorMaxAgeMs` | `number` | `500` | Milliseconds before a frozen shoulder anchor expires. At 50 Hz IMU rate, 500 ms ≈ 25 packets. After expiry, `effectiveShoulder = null` and `imuUAAvailable` is false. |
+| `recoveryConfirmFrames` | `number` | `5` | Consecutive reliable stereo frames required before Phase 2 (blending) begins. One or two transient frames at occlusion boundary have no effect. At 30 fps, 5 frames ≈ 167 ms of confirmed stereo. |
+| `blendFrames` | `number` | `4` | Number of frames for each linear blend transition. Applies to both the trigger blend-in (stereo → IMU) and the recovery blend-out (IMU → stereo). 4 frames ≈ 133 ms at 30 fps. |
+| `imuFreshnessMs` | `number` | `150` | Maximum age (ms) of a BNO085 packet for it to be considered fresh for fusion. Stale IMU data causes visible drift during occlusion. Much stricter than the 500 ms display threshold. |
+| `segLengthTolerance` | `number` | `0.25` | Maximum fractional deviation of the current stereo segment length from the calibrated length before stereo is considered unreliable. At 25%, an upper arm calibrated to 300 mm must measure between 225 mm and 375 mm. |
+
+---
+
+### Fusion Diagnostics Reference
+
+| Field | Type | Description |
+|---|---|---|
+| `uaState` | `SegmentState` | Current state of the upper arm segment |
+| `faState` | `SegmentState` | Current state of the forearm segment |
+| `uaRecoveryPhase` | `'confirming' \| 'blending' \| null` | Sub-phase within RECOVERY; null when not in RECOVERY |
+| `faRecoveryPhase` | `'confirming' \| 'blending' \| null` | Sub-phase for forearm RECOVERY |
+| `shoulderAnchorState` | `'live' \| 'frozen' \| 'expired'` | Whether the shoulder anchor was updated this frame (live), is held from a previous frame (frozen), or has expired |
+| `shoulderAnchorAgeMs` | `number` | Milliseconds since the shoulder anchor was last updated; 9999 if no anchor |
+| `uaFailureReason` | `string \| null` | Human-readable string from the gate that caused the UA trigger; null in STEREO |
+| `faFailureReason` | `string \| null` | Human-readable failure reason for the forearm segment |
+| `uaCorrectionActiveMs` | `number` | Milliseconds elapsed in IMU_CORRECTION for the upper arm; 0 otherwise |
+| `faCorrectionActiveMs` | `number` | Same for the forearm |
+| `uaRecoveryFrame` | `number` | Phase 1 confirmation frame counter; 0 when not confirming |
+| `faRecoveryFrame` | `number` | Same for forearm |
+| `blendAlphaUA` | `0–1` | Blend fraction for upper arm: 0 = at start of transition, 1 = at target (IMU or stereo) |
+| `blendAlphaFA` | `0–1` | Same for forearm |
+| `imu01AgeMs` | `number` | Age of last imu_01 WebSocket packet in ms; 9999 if never received |
+| `imu02AgeMs` | `number` | Age of last imu_02 WebSocket packet in ms |
+| `imuCalibrationValid` | `boolean` | Whether a non-failed calibration with positive segment lengths is loaded |
+| `fullyAvailable` | `boolean` | All three joints (shoulder, elbow, wrist) are non-null this frame |
+| `simulated` | `SimulatedFailures` | Echo of the `{ shoulder, elbow, wrist }` simulation overrides applied this frame |
 
 ---
 
@@ -1368,7 +2138,7 @@ Eight issues were identified and resolved. The first four are critical/high corr
 
 **Before:** The RECOVERY state immediately began blending toward stereo on the first reliable stereo frame after occlusion. One transient reliable frame from MediaPipe at the edge of an occlusion was enough to trigger a visible blend, which then reversed as occlusion continued.
 
-**After:** Two-phase RECOVERY with `recoveryConfirmFrames` confirmation gate (see [Recovery Hysteresis](#recovery-hysteresis-two-phase-recovery) above).
+**After:** Two-phase RECOVERY with `recoveryConfirmFrames` confirmation gate (5 frames by default).
 
 ---
 
@@ -1376,7 +2146,7 @@ Eight issues were identified and resolved. The first four are critical/high corr
 
 **Before:** In the UNAVAILABLE case, the controller checked IMU availability before stereo, so when both became available simultaneously the arm would enter IMU_CORRECTION instead of RECOVERY.
 
-**After:** Stereo checked first (see [Source Priority from UNAVAILABLE](#source-priority-from-unavailable) above).
+**After:** Stereo checked first — the if/else-if ordering in the UNAVAILABLE case ensures the path is always through RECOVERY (with hysteresis) when stereo is available.
 
 ---
 
@@ -1386,7 +2156,7 @@ Eight issues were identified and resolved. The first four are critical/high corr
 
 **After:** `validationArm` returns `{ shoulder: null, elbow: null, wrist: null }` when IMU is unavailable.
 
-**Before (IMUReconstructionView):** The IMU skeleton panel mirrored stereo joint positions when `imuReconstructionPose` was null, falsely representing stereo as an independent estimate.
+**Before (IMUReconstructionView):** The IMU skeleton panel mirrored stereo joint positions when `imuReconstructionPose` was null.
 
 **After:** When IMU reconstruction is unavailable, the panel shows an explicit "IMU reconstruction unavailable" placeholder instead of a skeleton.
 
@@ -1451,19 +2221,6 @@ Vitest 5.x auto-merges with `vite.config.ts`. The `@tailwindcss/vite` plugin exp
 | — | Simulated shoulder | Anchor not updated when `simulated.shoulder = true` |
 | — | `getEffectiveShoulder` expiry | Returns null after `shoulderAnchorMaxAgeMs` |
 | — | `reset()` | Clears all state and anchor; next frame starts fresh in STEREO |
-
-#### `createFusionController()` factory
-
-The factory is exported from `useIMUFusionController.ts` alongside the React hook and shares the same `_processFusionFrame` internal function:
-
-```typescript
-const ctrl = createFusionController({ recoveryConfirmFrames: 3, blendFrames: 4 });
-ctrl.processFusionFrame(input);       // returns FusionFrameResult
-ctrl.getEffectiveShoulder(nowMs);     // Pt3 | null
-ctrl.reset();                         // clears all state
-```
-
-The hook (`useIMUFusionController`) is a thin wrapper that stores the same `FusionState` in a `useRef` and delegates all computation to `_processFusionFrame`.
 
 ---
 

@@ -734,18 +734,7 @@ export function IMUReconstructionView({
           </div>
         )}
 
-        {/* ── Simulation Controls ─────────────────────────────────── */}
-        {onSimulatedFailuresChange && (
-          <div className="mt-4 p-3 rounded-lg border border-yellow-900/50 bg-yellow-950/20">
-            <div className="flex items-center gap-2 mb-2">
-              <span className="text-xs font-semibold text-yellow-400 uppercase tracking-wide">Trigger Test Mode</span>
-              <span className="text-xs text-gray-600">— simulates stereo occlusion through same fusion logic as real failures</span>
-            </div>
-            <SimulationPanel simulated={simulatedFailures} onChange={onSimulatedFailuresChange} />
-          </div>
-        )}
-
-        {!isBothCamerasActive && <p className="text-sm text-yellow-400 mt-3">Start both cameras in Camera Setup first.</p>}
+{!isBothCamerasActive && <p className="text-sm text-yellow-400 mt-3">Start both cameras in Camera Setup first.</p>}
         {isBothCamerasActive && !calibration && <p className="text-sm text-yellow-400 mt-3">Load a calibration file above to enable reconstruction.</p>}
         {isBothCamerasActive && calibration && trackedCorrected === 0 && poseLoaded && <p className="text-sm text-gray-500 mt-3">Move into view of both cameras...</p>}
       </Card>
