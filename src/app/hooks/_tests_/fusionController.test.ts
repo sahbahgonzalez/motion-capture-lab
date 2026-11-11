@@ -26,8 +26,8 @@ const shoulder: Pt3 = { x: 0,   y: 0,    z: 0  };
 const elbow: Pt3    = { x: 300, y: -50,  z: 10 };
 const wrist: Pt3    = { x: 540, y: -100, z: 20 };
 
-// IMU-derived elbow — distinct from stereo to catch source confusion
-const imuElbow: Pt3 = { x: 295, y: -48, z: 12 };
+// IMU upper-arm direction — distinct from stereo to catch source confusion
+const imuUADir: [number, number, number] = [0.986, -0.160, 0.040];
 // Normalized forearm direction (unit vector)
 const imuFADir: [number, number, number] = [0.942, -0.196, 0.274];
 const calibFaLengthMm = 260;
@@ -49,7 +49,7 @@ function baseInput(overrides: Partial<FusionFrameInput> = {}): FusionFrameInput 
     stereoShoulder: shoulder,
     stereoElbow:    elbow,
     stereoWrist:    wrist,
-    imuElbow,
+    imuUADir,
     imuFADir,
     jointStatuses:    allReliable(),
     calibrationValid: true,
@@ -195,7 +195,7 @@ describe('Fusion controller state machine', () => {
       stereoWrist: null,
       jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), unreliable('rightWrist')],
       calibrationValid: false,
-      imuElbow: null,
+      imuUADir: null,
       imuFADir: null,
       nowMs: 2000,
     }));
@@ -282,7 +282,7 @@ describe('Fusion controller state machine', () => {
     // Drive to UNAVAILABLE: stereo fails, no IMU
     ctrl.processFusionFrame(baseInput({
       stereoElbow: null,
-      imuElbow: null,
+      imuUADir: null,
       imuFADir: null,
       calibrationValid: false,
       jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), reliable('rightWrist')],
@@ -326,7 +326,7 @@ describe('Fusion controller state machine', () => {
     const result = ctrl.processFusionFrame(baseInput({
       stereoElbow: null,
       stereoWrist: null,
-      imuElbow: null,
+      imuUADir: null,
       imuFADir: null,
       jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), unreliable('rightWrist')],
       nowMs: 2000,
@@ -345,7 +345,7 @@ describe('Fusion controller state machine', () => {
     for (let i = 0; i < 2; i++) {
       ctrl.processFusionFrame(baseInput({
         stereoElbow: null,
-        imuElbow: null,
+        imuUADir: null,
         imuFADir: null,
         calibrationValid: false,
         jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), reliable('rightWrist')],
@@ -407,6 +407,47 @@ describe('Fusion controller state machine', () => {
     const result = ctrl.processFusionFrame(baseInput({ nowMs: 3000 }));
     expect(result.diagnostics.uaState).toBe('STEREO');
     expect(result.diagnostics.faState).toBe('STEREO');
+  });
+
+  it('moving live shoulder does not stretch the IMU upper arm', () => {
+    const ctrl = createFusionController({ blendFrames: 4 });
+    runFrames(ctrl, 8, {});
+    const movedShoulder = { x: 80, y: 20, z: -10 };
+    const result = ctrl.processFusionFrame(baseInput({
+      stereoShoulder: movedShoulder,
+      stereoElbow: null,
+      jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), reliable('rightWrist')],
+      nowMs: 2000,
+    }));
+
+    expect(result.finalElbow).not.toBeNull();
+    if (result.finalElbow) {
+      expect(dist3(movedShoulder, result.finalElbow)).toBeCloseTo(result.diagnostics.uaReferenceLengthMm, 8);
+    }
+  });
+
+  it('freezes vision-derived segment lengths during IMU correction', () => {
+    const ctrl = createFusionController({ visionLengthEmaAlpha: 1 });
+    const cameraElbow = { x: 280, y: 0, z: 0 };
+    const cameraWrist = { x: 510, y: 0, z: 0 };
+    runFrames(ctrl, 5, {
+      stereoElbow: cameraElbow,
+      stereoWrist: cameraWrist,
+      calibUaLengthMm: 300,
+      calibFaLengthMm: 260,
+    });
+
+    const result = ctrl.processFusionFrame(baseInput({
+      stereoElbow: null,
+      stereoWrist: null,
+      jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), unreliable('rightWrist')],
+      nowMs: 2000,
+    }));
+
+    expect(result.diagnostics.uaReferenceLengthMm).toBeCloseTo(280, 8);
+    expect(result.diagnostics.faReferenceLengthMm).toBeCloseTo(230, 8);
+    expect(result.diagnostics.uaOutputLengthMm).toBeCloseTo(280, 8);
+    expect(result.diagnostics.faOutputLengthMm).toBeCloseTo(230, 8);
   });
 
 });

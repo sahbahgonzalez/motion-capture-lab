@@ -1681,12 +1681,13 @@ export function IMULabView() {
     // Runs on every stereo frame regardless of IMU availability.
     // When stereo is reliable: output = corrected stereo (identical to Pipeline 3).
     // When stereo fails: output = IMU reconstruction (if available) or UNAVAILABLE.
-    // Passes imuFADir (direction) not imuWrist so fusion can anchor wrist to finalElbow.
+    // Pass directions rather than pre-anchored endpoints. The controller anchors
+    // UA to the current-frame shoulder and FA to the fused elbow.
     const fusionResult = processFusionFrameRef.current({
       stereoShoulder: shoulderOk ? shoulder! : null,
       stereoElbow:    elbowOk    ? elbow!    : null,
       stereoWrist:    wristOk    ? wrist!    : null,
-      imuElbow:       reconElbow,
+      imuUADir:       uaDebug.worldDir,
       imuFADir:       imuFAWorldDir,
       jointStatuses:  statuses,
       calibrationValid: !!imuReconValid,

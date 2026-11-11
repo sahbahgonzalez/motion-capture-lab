@@ -28,12 +28,12 @@
  *   Expires after shoulderAnchorMaxAgeMs. Callers obtain effectiveShoulder via
  *   getEffectiveShoulder() — a read-only query that does not advance state.
  *
- * FOREARM DEPENDENCY (Issue 1 fix):
- *   FA IMU target wrist = finalElbow + calibFaLengthMm * imuFADir
- *   Input is the normalized forearm direction (imuFADir), not a pre-computed
- *   wrist position anchored to the independently-reconstructed IMU elbow.
- *   This ensures the fused wrist stays attached to the correct (fused) elbow
- *   when UA and FA use different sources.
+ * FORWARD-KINEMATIC DEPENDENCIES:
+ *   UA target = effectiveShoulder + visionUaLength * imuUADir
+ *   FA target = finalElbow       + visionFaLength * imuFADir
+ *   Both IMUs provide directions, not pre-anchored endpoints. Reliable stereo
+ *   continuously learns the expected segment lengths; they freeze on occlusion.
+ *   Blended endpoints are projected back to those fixed-length spheres.
  *
  * SOURCE PRIORITY:
  *   Stereo > IMU. From UNAVAILABLE, stereo recovery is checked before IMU fallback.
@@ -72,6 +72,8 @@ export interface FusionConfig {
    * (fraction, e.g. 0.25 = 25%). Catches MediaPipe grabbing the wrong joint.
    */
   segLengthTolerance: number;
+  /** EMA factor for learning current segment lengths from reliable stereo. */
+  visionLengthEmaAlpha: number;
 }
 
 export const DEFAULT_FUSION_CONFIG: FusionConfig = {
@@ -80,6 +82,7 @@ export const DEFAULT_FUSION_CONFIG: FusionConfig = {
   blendFrames: 4,
   imuFreshnessMs: 150,
   segLengthTolerance: 0.25,
+  visionLengthEmaAlpha: 0.08,
 };
 
 export interface SimulatedFailures {
@@ -111,11 +114,16 @@ export interface FusionDiagnostics {
   imu02AgeMs: number;
   blendAlphaUA: number;
   blendAlphaFA: number;
+  uaReferenceLengthMm: number;
+  faReferenceLengthMm: number;
+  uaOutputLengthMm: number;
+  faOutputLengthMm: number;
   fullyAvailable: boolean;
   simulated: SimulatedFailures;
 }
 
 type Pt3 = { x: number; y: number; z: number };
+type Direction3 = readonly [number, number, number];
 
 export interface FusionFrameInput {
   /** Corrected stereo position for right shoulder (null = missing/unreliable). */
@@ -124,20 +132,16 @@ export interface FusionFrameInput {
   stereoElbow: Pt3 | null;
   /** Corrected stereo position for right wrist. */
   stereoWrist: Pt3 | null;
-  /**
-   * IMU-reconstructed elbow position, anchored to the fusion controller's
-   * effectiveShoulder (obtained via getEffectiveShoulder before the IMU
-   * reconstruction step). null when calibration invalid or imu_01 stale.
-   */
-  imuElbow: Pt3 | null;
+  /** Normalized IMU upper-arm world direction in stereo coordinates. */
+  imuUADir: Direction3 | null;
   /**
    * Normalized IMU forearm world direction in stereo coordinate frame.
    * The fusion controller computes:
-   *   imuTargetWrist = finalElbow + calibFaLengthMm * imuFADir
+   *   imuTargetWrist = finalElbow + visionFaLengthMm * imuFADir
    * ensuring wrist stays attached to the FUSED elbow, not the IMU-only elbow.
    * null when imu_02 stale, unavailable, or calibration invalid.
    */
-  imuFADir: [number, number, number] | null;
+  imuFADir: Direction3 | null;
   /** Per-joint failure statuses from jitter correction (reliable, failureType). */
   jointStatuses: JointFailureStatus[];
   /** Whether a valid (non-failed) calibration with positive lengths is present. */
@@ -188,6 +192,8 @@ interface FusionState {
   ua: SegState;
   fa: SegState;
   shoulder: ShoulderAnchor | null;
+  uaReferenceLengthMm: number | null;
+  faReferenceLengthMm: number | null;
   config: FusionConfig;
 }
 
@@ -215,6 +221,56 @@ function lerp3(a: Pt3, b: Pt3, t: number): Pt3 {
 
 function dist3d(a: Pt3, b: Pt3): number {
   return Math.sqrt((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2);
+}
+
+function normalizedDir(dir: Direction3 | null): [number, number, number] | null {
+  if (!dir || !dir.every(Number.isFinite)) return null;
+  const length = Math.hypot(dir[0], dir[1], dir[2]);
+  if (length < 1e-9) return null;
+  return [dir[0] / length, dir[1] / length, dir[2] / length];
+}
+
+function pointAlong(origin: Pt3, dir: [number, number, number], length: number): Pt3 {
+  return {
+    x: origin.x + dir[0] * length,
+    y: origin.y + dir[1] * length,
+    z: origin.z + dir[2] * length,
+  };
+}
+
+/** Keep a blended endpoint on the fixed-length sphere around its parent. */
+function constrainEndpoint(origin: Pt3, endpoint: Pt3 | null, length: number, fallback: Pt3 | null): Pt3 | null {
+  if (!endpoint || !(length > 0)) return endpoint;
+  const dx = endpoint.x - origin.x;
+  const dy = endpoint.y - origin.y;
+  const dz = endpoint.z - origin.z;
+  const magnitude = Math.hypot(dx, dy, dz);
+  if (magnitude > 1e-9) {
+    return {
+      x: origin.x + dx / magnitude * length,
+      y: origin.y + dy / magnitude * length,
+      z: origin.z + dz / magnitude * length,
+    };
+  }
+  if (!fallback) return endpoint;
+  const fx = fallback.x - origin.x;
+  const fy = fallback.y - origin.y;
+  const fz = fallback.z - origin.z;
+  const fallbackMagnitude = Math.hypot(fx, fy, fz);
+  return fallbackMagnitude > 1e-9
+    ? {
+        x: origin.x + fx / fallbackMagnitude * length,
+        y: origin.y + fy / fallbackMagnitude * length,
+        z: origin.z + fz / fallbackMagnitude * length,
+      }
+    : endpoint;
+}
+
+function updateReferenceLength(previous: number | null, measured: number, alpha: number): number {
+  if (!(measured > 0) || !Number.isFinite(measured)) return previous ?? 0;
+  if (previous === null || !(previous > 0)) return measured;
+  const a = Math.max(0, Math.min(1, alpha));
+  return previous + a * (measured - previous);
 }
 
 /**
@@ -440,6 +496,8 @@ export function createFusionController(configOverrides?: Partial<FusionConfig>) 
     ua: makeSeg(),
     fa: makeSeg(),
     shoulder: null,
+    uaReferenceLengthMm: null,
+    faReferenceLengthMm: null,
     config: { ...DEFAULT_FUSION_CONFIG, ...configOverrides },
   };
 
@@ -462,6 +520,8 @@ export function createFusionController(configOverrides?: Partial<FusionConfig>) 
     state.ua = makeSeg();
     state.fa = makeSeg();
     state.shoulder = null;
+    state.uaReferenceLengthMm = null;
+    state.faReferenceLengthMm = null;
   };
 
   return { processFusionFrame, getEffectiveShoulder, reset };
@@ -473,7 +533,7 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
   const cfg = s.config;
   const {
     stereoShoulder, stereoElbow, stereoWrist,
-    imuElbow, imuFADir,
+    imuUADir, imuFADir,
     jointStatuses, calibrationValid, calibUaLengthMm, calibFaLengthMm,
     imu01AgeMs, imu02AgeMs, simulated, nowMs,
   } = input;
@@ -501,15 +561,6 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
     : shoulderStatusReliable ? 'live'
     : 'frozen';
 
-  const imuUAAvailable = imuElbow !== null
-    && calibrationValid
-    && imu01AgeMs <= cfg.imuFreshnessMs
-    && effectiveShoulder !== null;
-
-  const imuFABaseAvailable = imuFADir !== null
-    && calibrationValid
-    && imu02AgeMs <= cfg.imuFreshnessMs;
-
   const uaEval = evalStereoReliable(
     effStereoShoulder, effStereoElbow,
     byJoint['rightShoulder'], byJoint['rightElbow'],
@@ -517,18 +568,58 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
     simulated.shoulder, simulated.elbow,
   );
 
-  const finalElbow = advanceSeg(
-    s.ua, effStereoElbow, imuElbow,
+  if (uaEval.reliable && effStereoShoulder && effStereoElbow) {
+    s.uaReferenceLengthMm = updateReferenceLength(
+      s.uaReferenceLengthMm,
+      dist3d(effStereoShoulder, effStereoElbow),
+      cfg.visionLengthEmaAlpha,
+    );
+  }
+
+  const faVisionEval = evalStereoReliable(
+    effStereoElbow, effStereoWrist,
+    byJoint['rightElbow'], byJoint['rightWrist'],
+    calibFaLengthMm, cfg.segLengthTolerance,
+    simulated.elbow, simulated.wrist,
+  );
+  if (faVisionEval.reliable && effStereoElbow && effStereoWrist) {
+    s.faReferenceLengthMm = updateReferenceLength(
+      s.faReferenceLengthMm,
+      dist3d(effStereoElbow, effStereoWrist),
+      cfg.visionLengthEmaAlpha,
+    );
+  }
+
+  const uaReferenceLengthMm = s.uaReferenceLengthMm ?? calibUaLengthMm;
+  const faReferenceLengthMm = s.faReferenceLengthMm ?? calibFaLengthMm;
+  const normalizedUADir = normalizedDir(imuUADir);
+  const normalizedFADir = normalizedDir(imuFADir);
+
+  const imuTargetElbow = effectiveShoulder && normalizedUADir && uaReferenceLengthMm > 0
+    ? pointAlong(effectiveShoulder, normalizedUADir, uaReferenceLengthMm)
+    : null;
+
+  const imuUAAvailable = imuTargetElbow !== null
+    && calibrationValid
+    && imu01AgeMs <= cfg.imuFreshnessMs;
+
+  const imuFABaseAvailable = normalizedFADir !== null
+    && calibrationValid
+    && imu02AgeMs <= cfg.imuFreshnessMs;
+
+  let finalElbow = advanceSeg(
+    s.ua, effStereoElbow, imuTargetElbow,
     uaEval.reliable, uaEval.reason,
     imuUAAvailable, cfg, nowMs,
   );
 
-  const imuTargetWrist: Pt3 | null = (imuFADir && finalElbow && calibFaLengthMm > 0)
-    ? {
-        x: finalElbow.x + calibFaLengthMm * imuFADir[0],
-        y: finalElbow.y + calibFaLengthMm * imuFADir[1],
-        z: finalElbow.z + calibFaLengthMm * imuFADir[2],
-      }
+  if (s.ua.state !== 'STEREO' && effectiveShoulder && uaReferenceLengthMm > 0) {
+    finalElbow = constrainEndpoint(effectiveShoulder, finalElbow, uaReferenceLengthMm, imuTargetElbow);
+    s.ua.lastPos = finalElbow;
+  }
+
+  const imuTargetWrist: Pt3 | null = (normalizedFADir && finalElbow && faReferenceLengthMm > 0)
+    ? pointAlong(finalElbow, normalizedFADir, faReferenceLengthMm)
     : null;
 
   const imuFAAvailable = imuFABaseAvailable && finalElbow !== null;
@@ -552,11 +643,16 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
     faEval = { reliable: true, reason: null };
   }
 
-  const finalWrist = advanceSeg(
+  let finalWrist = advanceSeg(
     s.fa, effStereoWrist, imuTargetWrist,
     faEval.reliable, faEval.reason,
     imuFAAvailable, cfg, nowMs,
   );
+
+  if (s.fa.state !== 'STEREO' && finalElbow && faReferenceLengthMm > 0) {
+    finalWrist = constrainEndpoint(finalElbow, finalWrist, faReferenceLengthMm, imuTargetWrist);
+    s.fa.lastPos = finalWrist;
+  }
 
   const finalShoulder: Pt3 | null = effectiveShoulder;
 
@@ -598,6 +694,10 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
     imu02AgeMs:           isFinite(imu02AgeMs) ? Math.round(imu02AgeMs) : 9999,
     blendAlphaUA:         uaBlendAlpha,
     blendAlphaFA:         faBlendAlpha,
+    uaReferenceLengthMm:  uaReferenceLengthMm > 0 ? uaReferenceLengthMm : 0,
+    faReferenceLengthMm:  faReferenceLengthMm > 0 ? faReferenceLengthMm : 0,
+    uaOutputLengthMm:     finalShoulder && finalElbow ? dist3d(finalShoulder, finalElbow) : 0,
+    faOutputLengthMm:     finalElbow && finalWrist ? dist3d(finalElbow, finalWrist) : 0,
     fullyAvailable:       finalShoulder !== null && finalElbow !== null && finalWrist !== null,
     simulated,
   };
@@ -612,6 +712,8 @@ export function useIMUFusionController(configOverrides?: Partial<FusionConfig>) 
     ua: makeSeg(),
     fa: makeSeg(),
     shoulder: null,
+    uaReferenceLengthMm: null,
+    faReferenceLengthMm: null,
     config: { ...DEFAULT_FUSION_CONFIG, ...configOverrides },
   });
 
@@ -639,6 +741,8 @@ export function useIMUFusionController(configOverrides?: Partial<FusionConfig>) 
     stateRef.current.ua = makeSeg();
     stateRef.current.fa = makeSeg();
     stateRef.current.shoulder = null;
+    stateRef.current.uaReferenceLengthMm = null;
+    stateRef.current.faReferenceLengthMm = null;
   };
 
   return { processFusionFrame, getEffectiveShoulder, reset };

@@ -21,7 +21,7 @@ type Pt3 = { x: number; y: number; z: number };
 const shoulder: Pt3 = { x: 0,   y: 0,    z: 0  };
 const elbow: Pt3    = { x: 300, y: -50,  z: 10 };
 const wrist: Pt3    = { x: 540, y: -100, z: 20 };
-const imuElbow: Pt3 = { x: 295, y: -48,  z: 12 };
+const imuUADir: [number, number, number] = [0.986, -0.160, 0.040];
 const imuFADir: [number, number, number] = [0.942, -0.196, 0.274];
 const calibFaLengthMm = 260;
 
@@ -39,7 +39,7 @@ function baseInput(overrides: Partial<FusionFrameInput> = {}): FusionFrameInput 
     stereoShoulder: shoulder,
     stereoElbow: elbow,
     stereoWrist: wrist,
-    imuElbow,
+    imuUADir,
     imuFADir,
     jointStatuses: allReliable(),
     calibrationValid: true,
@@ -168,7 +168,7 @@ test('8. Calibration invalid: no IMU correction', () => {
   const r = ctrl.processFusionFrame(baseInput({
     stereoElbow: null, stereoWrist: null,
     jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), unreliable('rightWrist')],
-    calibrationValid: false, imuElbow: null, imuFADir: null, nowMs: 2000,
+    calibrationValid: false, imuUADir: null, imuFADir: null, nowMs: 2000,
   }));
   assert(r.diagnostics.imuCalibrationValid === false, 'calibrationValid');
   eq(r.diagnostics.uaState, 'UNAVAILABLE', 'uaState');
@@ -229,7 +229,7 @@ test('11. Intermittent stereo during recovery: resets counter', () => {
 test('12. Both return from UNAVAILABLE: stereo path takes priority', () => {
   const ctrl = createFusionController();
   ctrl.processFusionFrame(baseInput({
-    stereoElbow: null, imuElbow: null, imuFADir: null, calibrationValid: false,
+    stereoElbow: null, imuUADir: null, imuFADir: null, calibrationValid: false,
     jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), reliable('rightWrist')],
     nowMs: 1000,
   }));
@@ -261,7 +261,7 @@ test('14. IMU unavailable: UNAVAILABLE, no fabricated output', () => {
   runFrames(ctrl, 5, {});
   const r = ctrl.processFusionFrame(baseInput({
     stereoElbow: null, stereoWrist: null,
-    imuElbow: null, imuFADir: null,
+    imuUADir: null, imuFADir: null,
     jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), unreliable('rightWrist')],
     nowMs: 2000,
   }));
@@ -275,7 +275,7 @@ test('15. Full recovery from UNAVAILABLE: finite coordinates', () => {
   const ctrl = createFusionController({ recoveryConfirmFrames: 2, blendFrames: 2 });
   for (let i = 0; i < 2; i++) {
     ctrl.processFusionFrame(baseInput({
-      stereoElbow: null, imuElbow: null, imuFADir: null, calibrationValid: false,
+      stereoElbow: null, imuUADir: null, imuFADir: null, calibrationValid: false,
       jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), reliable('rightWrist')],
       nowMs: 1000 + i * 16,
     }));
@@ -324,6 +324,48 @@ test('reset: clears state and anchor', () => {
   const r = ctrl.processFusionFrame(baseInput({ nowMs: 3000 }));
   eq(r.diagnostics.uaState, 'STEREO', 'uaState after reset');
   eq(r.diagnostics.faState, 'STEREO', 'faState after reset');
+});
+
+test('19. Moving live shoulder does not stretch IMU upper arm', () => {
+  const ctrl = createFusionController({ blendFrames: 4 });
+  runFrames(ctrl, 8, {});
+  const movedShoulder = { x: 80, y: 20, z: -10 };
+  const r = ctrl.processFusionFrame(baseInput({
+    stereoShoulder: movedShoulder,
+    stereoElbow: null,
+    jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), reliable('rightWrist')],
+    nowMs: 2000,
+  }));
+  assert(r.finalElbow !== null, 'finalElbow must exist');
+  if (r.finalElbow) {
+    const outputLength = dist3(movedShoulder, r.finalElbow);
+    assert(
+      Math.abs(outputLength - r.diagnostics.uaReferenceLengthMm) < 1e-6,
+      `UA must remain at reference length (got ${outputLength}, expected ${r.diagnostics.uaReferenceLengthMm})`,
+    );
+  }
+});
+
+test('20. IMU correction freezes the latest vision-derived arm lengths', () => {
+  const ctrl = createFusionController({ visionLengthEmaAlpha: 1 });
+  const cameraElbow = { x: 280, y: 0, z: 0 };
+  const cameraWrist = { x: 510, y: 0, z: 0 };
+  runFrames(ctrl, 5, {
+    stereoElbow: cameraElbow,
+    stereoWrist: cameraWrist,
+    calibUaLengthMm: 300,
+    calibFaLengthMm: 260,
+  });
+  const r = ctrl.processFusionFrame(baseInput({
+    stereoElbow: null,
+    stereoWrist: null,
+    jointStatuses: [reliable('rightShoulder'), unreliable('rightElbow'), unreliable('rightWrist')],
+    nowMs: 2000,
+  }));
+  assert(Math.abs(r.diagnostics.uaReferenceLengthMm - 280) < 1e-6, 'UA reference must come from vision');
+  assert(Math.abs(r.diagnostics.faReferenceLengthMm - 230) < 1e-6, 'FA reference must come from vision');
+  assert(Math.abs(r.diagnostics.uaOutputLengthMm - 280) < 1e-6, 'UA output must keep vision length');
+  assert(Math.abs(r.diagnostics.faOutputLengthMm - 230) < 1e-6, 'FA output must keep vision length');
 });
 
 // ── Runner ────────────────────────────────────────────────────────────────────

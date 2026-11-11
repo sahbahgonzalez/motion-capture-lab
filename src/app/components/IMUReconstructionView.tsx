@@ -269,6 +269,8 @@ function FusionDiagPanel({ diag }: { diag: FusionDiagnostics }) {
           <div className="text-xs text-orange-300 mb-2 leading-tight">{diag.uaFailureReason}</div>
         )}
         {row('Blend α', `${(diag.blendAlphaUA * 100).toFixed(0)}%`)}
+        {row('Length', `${diag.uaOutputLengthMm.toFixed(1)} / ${diag.uaReferenceLengthMm.toFixed(1)} mm`,
+          Math.abs(diag.uaOutputLengthMm - diag.uaReferenceLengthMm) < 1 ? 'text-green-400' : 'text-yellow-400')}
         {diag.uaState === 'IMU_CORRECTION' && row('Active', `${diag.uaCorrectionActiveMs}ms`, 'text-orange-400')}
         {diag.uaState === 'RECOVERY' && diag.uaRecoveryPhase === 'confirming' && row('Confirming', `${diag.uaRecoveryFrame} / frames`, 'text-yellow-400')}
         {diag.uaState === 'RECOVERY' && diag.uaRecoveryPhase === 'blending' && row('Blending →', `${(diag.blendAlphaUA * 100).toFixed(0)}%`, 'text-cyan-400')}
@@ -285,6 +287,8 @@ function FusionDiagPanel({ diag }: { diag: FusionDiagnostics }) {
           <div className="text-xs text-orange-300 mb-2 leading-tight">{diag.faFailureReason}</div>
         )}
         {row('Blend α', `${(diag.blendAlphaFA * 100).toFixed(0)}%`)}
+        {row('Length', `${diag.faOutputLengthMm.toFixed(1)} / ${diag.faReferenceLengthMm.toFixed(1)} mm`,
+          Math.abs(diag.faOutputLengthMm - diag.faReferenceLengthMm) < 1 ? 'text-green-400' : 'text-yellow-400')}
         {diag.faState === 'IMU_CORRECTION' && row('Active', `${diag.faCorrectionActiveMs}ms`, 'text-orange-400')}
         {diag.faState === 'RECOVERY' && diag.faRecoveryPhase === 'confirming' && row('Confirming', `${diag.faRecoveryFrame} / frames`, 'text-yellow-400')}
         {diag.faState === 'RECOVERY' && diag.faRecoveryPhase === 'blending' && row('Blending →', `${(diag.blendAlphaFA * 100).toFixed(0)}%`, 'text-cyan-400')}
