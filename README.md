@@ -31,19 +31,26 @@ A web-based 2D and 3D motion capture application powered by MediaPipe Pose Landm
    - [Debug Panel Reference](#debug-panel-reference)
    - [Key Source Files](#key-source-files-imu-system)
 7. [Pipeline 4 — Failure-Triggered IMU Fusion](#pipeline-4--failure-triggered-imu-fusion)
-   - [Overview](#fusion-overview)
-   - [State Machine](#fusion-state-machine)
-   - [Recovery Hysteresis (Two-Phase RECOVERY)](#recovery-hysteresis-two-phase-recovery)
-   - [Shoulder Anchor Management](#shoulder-anchor-management)
-   - [Forearm Wrist Computation](#forearm-wrist-computation)
-   - [Source Priority from UNAVAILABLE](#source-priority-from-unavailable)
-   - [Fusion Configuration](#fusion-configuration)
-   - [Diagnostics](#fusion-diagnostics)
+   - [State Machine](#fusion-state-machine--complete-transition-table)
+   - [Recovery Hysteresis (Two-Phase RECOVERY)](#issue-3--recovery-hysteresis-high)
+   - [Shoulder Anchor Management](#42-shoulder-anchor-update)
+   - [Forearm Wrist Computation](#46-imu-target-wrist-computation)
+   - [Source Priority from UNAVAILABLE](#55-unavailable-state)
+   - [Fusion Configuration](#fusion-configuration-reference)
+   - [Diagnostics](#fusion-diagnostics-reference)
    - [Bug Fixes Implemented](#pipeline-4-bug-fixes)
    - [Automated Test Suite](#automated-test-suite)
-8. [Data Format](#data-format)
+8. [Standardized Thesis Experiment Protocol](#standardized-thesis-experiment-protocol)
+   - [Implementation Status](#experiment-framework-implementation-status)
+   - [Uniform Cross-Pipeline Rules](#uniform-cross-pipeline-rules)
+   - [Experiment Lifecycle](#standardized-experiment-lifecycle)
+   - [Physical Camera Timing Findings](#physical-camera-timing-findings)
+   - [Stage 1 — Experiment Infrastructure](#stage-1--standardized-thesis-experiment-infrastructure)
+   - [Stage 2A — Dual-Camera Timing](#stage-2a--standardized-dual-camera-recording-and-timing)
+   - [Uniform Physical Camera Retest Procedure](#uniform-physical-camera-retest-procedure)
 9. [Technology Stack](#technology-stack)
-10. [Troubleshooting](#troubleshooting)
+10. [Data Format](#data-format)
+11. [Troubleshooting](#troubleshooting)
 
 ---
 
@@ -629,7 +636,7 @@ rVFC available   →  fires once per new decoded frame (precise)
 rVFC unavailable →  rAF loop + currentTime guard (conservative fallback)
 ```
 
-Camera 1's rVFC drives the stereo cycle. Camera 2 is processed immediately after in the same callback, maintaining temporal alignment between the two views.
+Camera 1's rVFC drives the stereo processing cycle. Camera 2 is processed immediately afterward in the same browser callback. This places both inference calls in one processing cycle; it does not prove simultaneous presentation, physical exposure alignment, or hardware synchronization.
 
 ---
 
@@ -639,7 +646,7 @@ Camera 1's rVFC drives the stereo cycle. Camera 2 is processed immediately after
 
 **Root cause:** Both the `onStereoFrame` callback and a `useTriangulation` useMemo hook were wired into the live pipeline simultaneously. Any time the rVFC callback updated landmark state, the useMemo recomputed — doubling the triangulation work and creating a second, slightly-later result that was being recorded instead of the first.
 
-**Fix:** Removed `useTriangulation` from the live pipeline entirely. `onStereoFrameRef.current` now calls `triangulateAllLandmarks` once and routes the single result to both the recorder and `setPose3D`. The `useTriangulation` hook is retained only for the playback path (`StereoVideoPlayback`) where double-computation is not a concern.
+**Fix:** Removed `useTriangulation` from the live pipeline entirely. `onStereoFrameRef.current` now calls `triangulateAllLandmarks` once and routes the single result to both the recorder and `setPose3D`. The `useTriangulation` hook is retained only for the existing `StereoVideoPlayback` path where double-computation is not a concern. That component is not the pending deterministic, shared-clock P1–P4 thesis replay system described later in this document.
 
 ---
 
@@ -708,7 +715,7 @@ The tab contains six inner sub-tabs:
 | Reconstruction + Correction | Side-by-side: Corrected Stereo (left) vs IMU Reconstruction (right) |
 | IMU Health | Live per-sensor status, packet rate, raw quaternion values, derived Euler angles |
 | Calibration | 3-pose IMU arm calibration workflow and stored calibration data |
-| Video Recording | Synchronized dual-camera recording |
+| Video Recording | Dual-camera recording with browser timing diagnostics |
 | Playback | Playback with IMU correction overlay |
 | Debug | Per-segment debug dump, error metrics, ALS solver diagnostics |
 
@@ -1117,7 +1124,7 @@ The physical location of the sensor chip along the arm segment does not affect t
 
 ## Side-by-Side View
 
-The Reconstruction + Correction sub-tab shows two synchronized 3D projections with the same spatial bounds:
+The Reconstruction + Correction sub-tab shows two side-by-side 3D projections with the same spatial bounds:
 
 | Left Panel | Right Panel |
 |---|---|
@@ -1599,16 +1606,19 @@ else → 'frozen'
 **Upper arm (UA) IMU availability:**
 
 ```
-imuUAAvailable = (imuElbow !== null)
+normalizedUADir = normalize(imuUADir)
+imuTargetElbow = effectiveShoulder
+               + uaReferenceLengthMm × normalizedUADir
+
+imuUAAvailable = (imuTargetElbow !== null)
                && calibrationValid
                && (imu01AgeMs ≤ imuFreshnessMs)     // default: 150 ms
-               && (effectiveShoulder !== null)
 ```
 
-All four conditions must hold. An expired shoulder anchor makes IMU UA unavailable even if the sensor data is fresh, because the elbow position cannot be computed without an anchor:
+The target is only constructed when the direction is finite and non-zero, the vision-derived reference length is positive, and the shoulder anchor is valid. An expired shoulder anchor therefore makes IMU UA unavailable even if the sensor packet is fresh.
 
 ```
-reconElbow = effectiveShoulder + uaLength × worldDirUA     // requires effectiveShoulder
+imuTargetElbow = effectiveShoulder + uaReferenceLengthMm × imuUADir
 ```
 
 **Forearm base availability (direction only, before knowing finalElbow):**
@@ -1632,12 +1642,20 @@ This is evaluated after the UA state machine runs. If UA output is null (UA is U
 `evalStereoReliable` is called for the upper arm segment using `effStereoShoulder` and `effStereoElbow`. The result is passed to `advanceSeg` for the UA segment. See §5 for the full state machine logic. The output is assigned:
 
 ```typescript
-const finalElbow = advanceSeg(
-    s.ua, effStereoElbow, imuElbow,
+const imuTargetElbow = pointAlong(
+    effectiveShoulder, normalizedUADir, uaReferenceLengthMm
+);
+let finalElbow = advanceSeg(
+    s.ua, effStereoElbow, imuTargetElbow,
     uaEval.reliable, uaEval.reason,
     imuUAAvailable, cfg, nowMs,
 );
+finalElbow = constrainEndpoint(
+    effectiveShoulder, finalElbow, uaReferenceLengthMm, imuTargetElbow
+);
 ```
+
+Reliable stereo frames update `uaReferenceLengthMm` using an EMA. When stereo becomes unreliable, that value freezes. `constrainEndpoint` projects the blended elbow back onto the fixed-length sphere around the current authoritative shoulder, so Cartesian blending cannot stretch or shrink the upper arm.
 
 #### 4.6 IMU Target Wrist Computation
 
@@ -1645,26 +1663,25 @@ After `finalElbow` is known, the IMU wrist target for the FA segment is computed
 
 ```typescript
 const imuTargetWrist: Pt3 | null =
-    (imuFADir && finalElbow && calibFaLengthMm > 0)
-    ? {
-        x: finalElbow.x + calibFaLengthMm * imuFADir[0],
-        y: finalElbow.y + calibFaLengthMm * imuFADir[1],
-        z: finalElbow.z + calibFaLengthMm * imuFADir[2],
-      }
+    (normalizedFADir && finalElbow && faReferenceLengthMm > 0)
+    ? pointAlong(finalElbow, normalizedFADir, faReferenceLengthMm)
     : null;
 ```
 
-The formula is: **fused elbow position + calibrated forearm length × normalized forearm world direction.** The critical property is that `finalElbow` is the output of the UA state machine — it may be a stereo position, an IMU position, or a blended value. The wrist is always geometrically attached to whatever the elbow actually is, not to an independent IMU-only reconstruction.
+The formula is: **fused elbow position + frozen vision-derived forearm length × normalized forearm world direction.** The reference length is learned only from reliable stereo frames and freezes during occlusion. The wrist is always attached to the fused elbow, not to an independent IMU-only reconstruction.
 
 #### 4.7 FA State Machine and Output
 
 FA stereo reliability is evaluated inline (not via `evalStereoReliable`, because the FA proximal joint is the fused elbow, not a raw stereo joint). Then `advanceSeg` runs for the forearm:
 
 ```typescript
-const finalWrist = advanceSeg(
+let finalWrist = advanceSeg(
     s.fa, effStereoWrist, imuTargetWrist,
     faEval.reliable, faEval.reason,
     imuFAAvailable, cfg, nowMs,
+);
+finalWrist = constrainEndpoint(
+    finalElbow, finalWrist, faReferenceLengthMm, imuTargetWrist
 );
 ```
 
@@ -1921,7 +1938,7 @@ The full per-frame integration sequence, executed inside `onCorrectedPose` on ev
     a. q_ua = packetToQuat(imu01Packet)
     b. boneInImuWorld = rotateVectorByQuaternion(q_ua, calibData.uaBoneLocalDir)
     c. worldDirUA = normalize(R_ua · boneInImuWorld)
-    d. reconElbow = effectiveShoulder + uaLengthMm × worldDirUA
+    d. reconElbow = effectiveShoulder + uaLengthMm × worldDirUA ← independent preview only
 12. If imu02ReconAvail (500ms freshness for display):
     a. q_fa = packetToQuat(imu02Packet)
     b. boneInImuWorld_FA = rotateVectorByQuaternion(q_fa, calibData.faBoneLocalDir)
@@ -1929,21 +1946,18 @@ The full per-frame integration sequence, executed inside `onCorrectedPose` on ev
     d. imuFAWorldDir = [worldDirFA.x, worldDirFA.y, worldDirFA.z]     ← direction only
     e. reconWrist = reconElbow + faLengthMm × worldDirFA               ← for display only
 13. Write pure IMU pose to imuReconPoseRef (center panel display)
-14. Call processFusionFrameRef.current(fusionInput) → fusionResult
+14. Call processFusionFrameRef.current with imuUADir and imuFADir → fusionResult
 15. Build fusedPose: replace rightShoulder/Elbow/Wrist in correctedPose with fusionResult
 16. Write fusedPose, fusionResult.diagnostics to state
 ```
 
 **Important freshness distinction:** steps 11 and 12 use a 500ms IMU freshness gate for the pure IMU display panel. Step 14 uses the fusion controller's `imuFreshnessMs = 150ms` gate internally. This means IMU data that is 200–500ms old will appear in the pure IMU display panel but will not trigger Pipeline 4 fusion — the fusion controller will treat it as stale and enter UNAVAILABLE instead.
 
-#### 6.1 The One-Frame Lag
+#### 6.1 Independent Preview Lag vs. Fusion Anchor
 
 `getEffectiveShoulderRef.current(nowMs)` (step 9) is called **before** `processFusionFrame` (step 14). This means `effectiveShoulder` used for IMU reconstruction in step 11 is the anchor from the **previous** frame's update. When `processFusionFrame` runs, it may update the anchor with the new stereo shoulder — but that update is not visible until the next frame.
 
-This one-frame lag is acceptable because:
-- At 30 fps, one frame is ~33ms — negligible for a shoulder position that changes slowly
-- The alternative (reading the anchor after `processFusionFrame`) would require restructuring the data flow significantly
-- The fusion controller's own output uses the freshly-updated anchor internally (`finalElbow` uses the just-updated `effectiveShoulder` from within `_processFusionFrame`)
+This lag affects only the independent pure-IMU preview. Pipeline 4 passes `imuUADir` rather than the pre-anchored `reconElbow`; the fusion controller computes its upper-arm target from the freshly updated current-frame shoulder. This prevents shoulder movement between frames from appearing as upper-arm growth.
 
 #### 6.2 `FusionFrameInput` Interface
 
@@ -1952,8 +1966,8 @@ interface FusionFrameInput {
     stereoShoulder:   Pt3 | null;       // raw stereo shoulder (null = not tracked)
     stereoElbow:      Pt3 | null;       // raw stereo elbow
     stereoWrist:      Pt3 | null;       // raw stereo wrist
-    imuElbow:         Pt3 | null;       // IMU-reconstructed elbow (reconElbow from step 11d)
-    imuFADir:         [number,number,number] | null;  // normalized forearm direction (worldDirFA)
+    imuUADir:         readonly [number,number,number] | null;  // normalized upper-arm direction (worldDirUA)
+    imuFADir:         readonly [number,number,number] | null;  // normalized forearm direction (worldDirFA)
     jointStatuses:    JointFailureStatus[];    // per-joint reliable/failureType from Pipeline 3
     calibrationValid: boolean;          // true if calibration exists and quality !== 'failed'
     calibUaLengthMm:  number;           // upper arm calibrated length (0 = invalid)
@@ -2085,6 +2099,7 @@ The factory is identical in behavior to the React hook (`useIMUFusionController`
 | `blendFrames` | `number` | `4` | Number of frames for each linear blend transition. Applies to both the trigger blend-in (stereo → IMU) and the recovery blend-out (IMU → stereo). 4 frames ≈ 133 ms at 30 fps. |
 | `imuFreshnessMs` | `number` | `150` | Maximum age (ms) of a BNO085 packet for it to be considered fresh for fusion. Stale IMU data causes visible drift during occlusion. Much stricter than the 500 ms display threshold. |
 | `segLengthTolerance` | `number` | `0.25` | Maximum fractional deviation of the current stereo segment length from the calibrated length before stereo is considered unreliable. At 25%, an upper arm calibrated to 300 mm must measure between 225 mm and 375 mm. |
+| `visionLengthEmaAlpha` | `number` | `0.08` | EMA factor used to learn the current upper-arm and forearm lengths from reliable stereo frames. These references freeze while stereo is unavailable and drive IMU forward kinematics. |
 
 ---
 
@@ -2106,6 +2121,10 @@ The factory is identical in behavior to the React hook (`useIMUFusionController`
 | `faRecoveryFrame` | `number` | Same for forearm |
 | `blendAlphaUA` | `0–1` | Blend fraction for upper arm: 0 = at start of transition, 1 = at target (IMU or stereo) |
 | `blendAlphaFA` | `0–1` | Same for forearm |
+| `uaReferenceLengthMm` | `number` | Vision-derived upper-arm length used by IMU forward kinematics and frozen during occlusion |
+| `faReferenceLengthMm` | `number` | Vision-derived forearm length used by IMU forward kinematics and frozen during occlusion |
+| `uaOutputLengthMm` | `number` | Actual fused shoulder-to-elbow distance for transition diagnostics |
+| `faOutputLengthMm` | `number` | Actual fused elbow-to-wrist distance for transition diagnostics |
 | `imu01AgeMs` | `number` | Age of last imu_01 WebSocket packet in ms; 9999 if never received |
 | `imu02AgeMs` | `number` | Age of last imu_02 WebSocket packet in ms |
 | `imuCalibrationValid` | `boolean` | Whether a non-failed calibration with positive segment lengths is loaded |
@@ -2116,13 +2135,13 @@ The factory is identical in behavior to the React hook (`useIMUFusionController`
 
 ### Pipeline 4 Bug Fixes
 
-Eight issues were identified and resolved. The first four are critical/high correctness bugs; the remainder cover visualization integrity, timestamp validation, geometric consistency, and test coverage.
+Nine issues were identified and resolved. The critical/high correctness fixes cover positional dependencies, anchor ownership, recovery behavior, source priority, and fixed segment-length enforcement; the remainder cover visualization integrity, timestamp validation, geometric consistency, and test coverage.
 
 #### Issue 1 — Forearm Positional Dependency (Critical)
 
 **Before:** `imuWrist` was pre-computed from `reconElbow` in `IMULabView.tsx` using the independently reconstructed IMU elbow. When the UA segment stayed in STEREO but the FA segment switched to IMU_CORRECTION, the wrist was anchored to the IMU-only elbow rather than the fused elbow, causing visible geometric inconsistency.
 
-**After:** `imuFADir` (a normalized direction vector) is passed instead. The fusion controller computes `imuTargetWrist = finalElbow + calibFaLengthMm × imuFADir` using the fused elbow.
+**After:** `imuFADir` (a normalized direction vector) is passed instead. The fusion controller computes `imuTargetWrist = finalElbow + faReferenceLengthMm × imuFADir` using the fused elbow.
 
 ---
 
@@ -2164,22 +2183,33 @@ Eight issues were identified and resolved. The first four are critical/high corr
 
 #### Issue 6 — Timestamp Synchronization
 
-The existing freshness gates (150 ms for fusion, 500 ms for display) handle the practical synchronization requirement at 30 fps stereo and 50–100 Hz IMU. Hardware-level synchronization is not possible with the current architecture (WebSocket receipt time ≠ sensor acquisition time). This limitation is documented in the hook source.
+The existing freshness gates (150 ms for fusion, 500 ms for display) bound stale receipt-time data at 30 fps stereo and 50–100 Hz IMU, but they do not synchronize sensor acquisition. Hardware-level synchronization is not established by the current architecture because WebSocket receipt time is not sensor acquisition time. This limitation is documented in the hook source.
 
 ---
 
 #### Issue 7 — Geometric Consistency
 
-Segment-length consistency is maintained as a consequence of Issues 1 and 3:
-- The forearm wrist is always derived from the fused elbow (Issue 1 fix), ensuring no gap between elbow and wrist
-- The confirmation gate prevents premature blending to an unchecked stereo position (Issue 3 fix)
-- The existing segment-length gate (`segLengthTolerance = 0.25`) continues to reject stereo frames where MediaPipe grabs the wrong joint
+Segment-length consistency is enforced explicitly:
+- Reliable stereo frames update vision-derived UA and FA reference lengths with `visionLengthEmaAlpha`
+- Reference lengths freeze as soon as stereo becomes unreliable
+- The upper-arm target is derived from the current authoritative shoulder and `imuUADir`
+- The forearm target is always derived from the fused elbow and `imuFADir`
+- During IMU correction and recovery, blended endpoints are projected back onto their fixed-length spheres
+- The existing segment-length gate (`segLengthTolerance = 0.25`) still rejects stereo frames where MediaPipe grabs the wrong joint
 
 ---
 
 #### Issue 8 — Automated Test Suite
 
 See [Automated Test Suite](#automated-test-suite) below.
+
+---
+
+#### Issue 9 — Upper-Arm Anchor Mismatch and Segment-Length Growth (Critical)
+
+**Before:** `IMULabView` precomputed `reconElbow` from the previous frame's shoulder anchor, then the fusion controller paired that elbow with its freshly updated current-frame shoulder. During shoulder motion, the resulting shoulder-to-elbow distance was no longer the intended arm length. Cartesian endpoint blending could also stretch or shrink both arm segments during source transitions.
+
+**After:** Pipeline 4 receives `imuUADir`, computes the elbow target from its current authoritative shoulder, learns segment lengths only from reliable stereo frames, freezes those lengths during occlusion, and projects blended endpoints back onto fixed-length spheres. IMU takeover therefore preserves the arm dimensions last established by the cameras.
 
 ---
 
@@ -2199,7 +2229,7 @@ pnpm exec tsx src/app/hooks/__tests__/runTests.ts
 
 Vitest 5.x auto-merges with `vite.config.ts`. The `@tailwindcss/vite` plugin exposes a function in its `assetsInclude` option, which Vitest passes to `path.resolve()` internally — causing a crash (`The "path" argument must be of type string. Received function`). Extracting `createFusionController()` as a pure TypeScript factory (no React import) and running tests with `tsx` avoids the plugin entirely.
 
-#### Test cases (18 total)
+#### Pipeline 4 regression cases (20)
 
 | # | Test | What it verifies |
 |---|---|---|
@@ -2218,9 +2248,511 @@ Vitest 5.x auto-merges with `vite.config.ts`. The `@tailwindcss/vite` plugin exp
 | 13 | Wrist correction with stereo elbow | Wrist anchored to fused stereo elbow (Issue 1 regression) |
 | 14 | IMU unavailable | UNAVAILABLE; no fabricated output |
 | 15 | Full recovery from UNAVAILABLE | Reaches STEREO; coordinates are finite |
-| — | Simulated shoulder | Anchor not updated when `simulated.shoulder = true` |
-| — | `getEffectiveShoulder` expiry | Returns null after `shoulderAnchorMaxAgeMs` |
-| — | `reset()` | Clears all state and anchor; next frame starts fresh in STEREO |
+| 16 | Simulated shoulder | Anchor not updated when `simulated.shoulder = true` |
+| 17 | `getEffectiveShoulder` expiry | Returns null after `shoulderAnchorMaxAgeMs` |
+| 18 | `reset()` | Clears all state and anchor; next frame starts fresh in STEREO |
+| 19 | Moving live shoulder during IMU takeover | Current-frame shoulder anchoring cannot stretch the upper arm |
+| 20 | Vision-derived lengths freeze during occlusion | IMU output preserves the latest reliable camera upper-arm and forearm lengths |
+
+---
+
+## Standardized Thesis Experiment Protocol
+
+The thesis evaluation is being built around a **single reusable experiment session**, not four independently recorded lab runs. One master input session will eventually be replayed through all four pipelines:
+
+| Pipeline | Standardized input | Standardized output |
+|---|---|---|
+| **P1 — Monocular MediaPipe** | Camera A video only | Camera-A 2D landmarks |
+| **P2 — Stereo triangulation** | Camera A + Camera B from the same master recording | Raw triangulated 3D pose |
+| **P3 — Stereo correction** | The same Camera A + B cycle used by P2 | Corrected stereo 3D pose |
+| **P4 — Failure-triggered IMU fusion** | The same corrected stereo cycle plus recorded `imu_01` and `imu_02` samples | Full-body P3 pose with the fused right arm |
+
+This design prevents differences in subject motion, camera timing, warm-up, occlusion timing, or metric intervals from being mistaken for pipeline differences.
+
+### Experiment framework implementation status
+
+| Capability | Status | Notes |
+|---|---|---|
+| Versioned `ExperimentSession` schema | **Implemented** | Stage 1 |
+| One authoritative `experimentTimeMs` definition | **Implemented in schema and recorders** | Live capture uses `performance.now()` relative to one origin |
+| Backward-compatible explicit motion timestamps | **Implemented** | Existing live recorders still work |
+| One reusable Camera A + B video bundle | **Implemented** | Stage 2A |
+| Independent Camera A/B timing sidecars | **Implemented** | rVFC preferred, explicitly marked fallback otherwise |
+| Camera timing gap/startup instrumentation | **Implemented** | Stage 2A hardening |
+| Recorded `imu_01` and `imu_02` streams | **Pending Stage 2B** | Do not infer IMU replay from current live WebSocket state |
+| One capture controller for camera + IMU | **Pending** | Will use the existing video recorder rather than replace it |
+| Shared deterministic playback clock | **Pending** | Camera A media time is the planned playback authority |
+| Central warm-up and measurement enforcement | **Schema defined; runtime pending** | Metrics are not yet automatically gated by the protocol |
+| Timestamp-driven occlusion schedules | **Schema defined; runtime pending** | No scheduled injection is active yet |
+| P4 fused-pose time-series recording/replay | **Pending** | Current P4 fusion remains live |
+| Identical metric window across P1–P4 | **Target protocol; runtime pending** | Existing metric formulas will be reused unchanged |
+
+The current app therefore has a standardized camera master and experiment contracts, but it does **not yet** provide a fully synchronized camera+IMU replay session. Thesis data collection should wait until the pending capture and playback stages are complete.
+
+### Uniform cross-pipeline rules
+
+Every standardized thesis run will follow these invariants:
+
+1. **One master input session.** P1–P4 must not use separately performed motions.
+2. **One experiment clock.** Pipelines may not generate independent analysis clocks.
+3. **One cycle identity.** Each processed camera cycle has one `cycleId` and one `experimentTimeMs`.
+4. **Same camera evidence.** P1 uses Camera A from the same pair used by P2–P4.
+5. **Same warm-up boundary.** Warm-up frames may initialize MediaPipe, correction history, and fusion state, but are excluded from metric collection.
+6. **Same measurement interval.** All pipeline recordings use the configured `measurementStartMs` and `measurementEndMs`.
+7. **Same occlusion schedule.** Scheduled events use experiment timestamps, never UI timers or pipeline-local frame counts.
+8. **Explicit occlusion semantics.** `fusion_trigger_only` must not be presented as equivalent visual dropout in P1–P3. Cross-pipeline visual-dropout tests must use `shared_landmark_dropout`.
+9. **Deterministic reset.** Replay from zero, file replacement, restart, or backward seek must reset correction, fusion, status, and metric buffers while retaining completed calibration unless explicitly cleared.
+10. **No fabricated samples.** Missing frames, joints, IMU packets, and pipeline outputs remain explicitly missing. Timestamps and coordinates are never interpolated silently.
+11. **Same analysis implementation.** Existing `MotionRecording`, `MotionDataVisualizer`, and `motionQualityMetrics.ts` definitions remain the analysis authority.
+12. **Calibration is part of the experiment.** Stereo and IMU ALS calibration must be embedded or referenced by verifiable content hash, not recovered only from localStorage.
+
+### Standardized experiment lifecycle
+
+The complete intended lifecycle is:
+
+```text
+1. PREPARE
+   ├─ identify software/commit version
+   ├─ load and snapshot stereo calibration
+   ├─ load and snapshot completed IMU ALS calibration
+   └─ define warm-up, measurement, and occlusion schedule
+
+2. ARM SESSION
+   ├─ allocate sessionId and schemaVersion
+   ├─ capture one monotonic performance.now() origin
+   ├─ reset camera/IMU buffers
+   └─ verify Camera A, Camera B, imu_01, and imu_02 availability
+
+3. CAPTURE MASTER INPUT
+   ├─ Camera A WebM + independent timing sidecar
+   ├─ Camera B WebM + independent timing sidecar
+   ├─ shared recording-clock metadata
+   ├─ camera synchronization diagnostics
+   └─ imu_01 / imu_02 packet streams (Stage 2B, pending)
+
+4. FINALIZE AND VALIDATE
+   ├─ stop all producers transactionally
+   ├─ label session complete, partial, or failed
+   ├─ verify recording IDs and calibration references
+   ├─ inspect timing gaps and unmatched observations
+   └─ independently inspect encoded WebM frame timestamps
+
+5. DETERMINISTIC REPLAY (pending)
+   ├─ reset all pipeline state
+   ├─ detector warm-up: process, do not measure
+   ├─ measurement: process and record P1–P4 at shared timestamps
+   ├─ apply timestamp-driven occlusion schedule
+   └─ complete at one shared measurementEndMs
+
+6. ANALYZE
+   ├─ adapt each output to MotionRecording without changing coordinates
+   ├─ run the same existing metric calculator
+   ├─ compare identical timestamp intervals
+   └─ retain missing-data and fusion-state diagnostics
+```
+
+#### Warm-up and measurement policy
+
+The protocol fields are:
+
+```typescript
+warmupStartMs
+measurementStartMs
+measurementEndMs
+```
+
+Warm-up is **not** a period where processing is disabled. MediaPipe detection, P3 correction history, and P4 fusion state must receive warm-up frames so their internal state is initialized. Only metric-frame collection is suppressed until `measurementStartMs`. This avoids including detector bootstrap or empty correction histories in the measured interval while keeping every pipeline initialized from the same evidence.
+
+#### Standard output alignment
+
+For each future shared-clock replay cycle:
+
+```text
+ExperimentCycle
+  cycleId
+  experimentTimeMs
+  ├─ P1 Camera-A landmark reference
+  ├─ P2 raw stereo reference
+  ├─ P3 corrected stereo reference
+  ├─ P4 fused pose reference
+  ├─ Camera A/B frame references
+  ├─ imu_01 / imu_02 sample references
+  └─ optional P4 fusion diagnostics
+```
+
+The parent cycle owns the timestamp. Pipeline references do not create their own time values. A pipeline may report `missing` for a cycle without a fabricated zero pose.
+
+### Physical camera timing findings
+
+Two physical recordings were inspected before Stage 2A hardening:
+
+| Observation | Recording 1 | Recording 2 |
+|---|---:|---:|
+| Camera A encoded FPS | ~27.54 | ~28.90 |
+| Camera B encoded FPS | ~27.86 | ~28.88 |
+| Encoded frames per video | 235 | 463 |
+| Shared startup timestamp gap | ~650 ms | ~500 ms |
+| Additional shorter encoded gaps | Not highlighted | Present |
+| Browser observations near 10.6 s | — | A: 168, B: 221 |
+| Old matched-pair count | — | 209 |
+| Old mean callback offset | — | ~1.39 ms |
+| Old maximum absolute offset | — | ~135.1 ms |
+| Camera A observations lacking B within 33 ms | — | 18 of 209 |
+
+These are observations, not proof of physical exposure loss or a single root cause.
+
+#### Findings confirmed by code inspection
+
+- The old synchronization matcher had no pairing tolerance and could reuse one Camera B observation for multiple Camera A observations.
+- Raw camera media times were subtracted even though their clock origins had not been shown equivalent.
+- Maximum browser callback offset was exported as `timingUncertaintyMs`, which could be misread as exposure uncertainty.
+- Browser timing-observation rate could be confused with encoded-video FPS.
+- The temporary `"Timing observer has not started."` limitation was not cleared after a successful observer start.
+- A failure starting the second MediaRecorder could leave the first recorder running.
+- Stop promises depended on receiving both stop events and had no timeout/error settlement.
+
+These defects have been corrected.
+
+#### Findings that remain hypotheses
+
+The encoded startup gaps may involve one or more of:
+
+- USB camera or driver buffering
+- Camera exposure/auto-exposure startup
+- Initial `MediaStreamTrack` frame delivery
+- MediaRecorder encoder startup
+- WebM timestamp or muxing behavior
+- Browser encoder buffering
+- Main-thread callback delays
+- MediaPipe/reconstruction workload
+
+The application cannot identify the cause from rVFC metadata alone. MediaRecorder does not expose reliable encoded-frame timestamps to this code. New startup markers and timing-discontinuity records narrow the possibilities, while encoded WebM timing must still be measured externally.
+
+#### Interpretation rules for retesting
+
+| Evidence | Safe interpretation |
+|---|---|
+| Browser callback gap, smooth camera media time | Callback/main-thread delay is plausible |
+| Browser callback gap and camera media-time gap | Browser presentation/media timeline discontinuity occurred |
+| Encoded gap without sidecar media-time gap | Encoder/container behavior is plausible |
+| Encoded and sidecar media-time gaps together | Upstream stream or camera timeline behavior is plausible |
+| Similar Camera A/B encoded gaps | Shared browser/capture behavior is plausible, not proven |
+| Small callback-pair offsets | Browser callback receipt times were close; exposures are still unverified |
+
+### Standard thesis run acceptance checklist
+
+Before accepting a run for cross-pipeline analysis:
+
+- [ ] Recording status is `complete`, not `partial` or `failed`.
+- [ ] Both videos, both sidecars, clock metadata, and synchronization diagnostics share the same recording ID.
+- [ ] Camera IDs, resolution, requested FPS, and track-reported FPS are present.
+- [ ] Both sidecars contain observations or explicitly document why timing is unavailable.
+- [ ] No valid sidecar retains `"Timing observer has not started."`.
+- [ ] Browser callback FPS is not reported as encoded-video FPS.
+- [ ] Encoded FPS and encoded timestamp gaps have been measured independently.
+- [ ] Pairing uses the documented tolerance and reports unmatched counts for both cameras.
+- [ ] No Camera B observation is reused in one-to-one matching.
+- [ ] `hardwareExposureSynchronizationVerified` remains `false` unless established independently.
+- [ ] Calibration snapshots or hashed references are retained.
+- [ ] Warm-up and measurement boundaries are fixed before replay.
+- [ ] Every P1–P4 metric result uses the same measurement timestamps.
+- [ ] Missing outputs remain missing rather than being replaced by valid-looking zeros.
+
+---
+
+## Stage 1 — Standardized Thesis Experiment Infrastructure
+
+Stage 1 defines the versioned experiment contract and adds explicit experiment timestamps to the existing motion recorders. It does **not** implement synchronized capture, IMU buffering, playback orchestration, scheduled occlusion, or new metrics.
+
+### Experiment schema
+
+**Source:** `src/app/types/experiment.ts`
+
+`ExperimentSession` is the top-level V1 session structure (`schemaVersion: "1.0.0"`). It contains:
+
+- Session identity, ISO creation time, optional application/commit identifiers, and recording configuration
+- An authoritative clock declaration for either live `performance.now()` capture or camera-A media-time playback
+- Separate browser, camera, and IMU clock relationship metadata with `unknown`, `unverified`, `estimated`, or `verified` status
+- Camera A/B identities, video references, resolution/frame-rate metadata, timestamp observations, presentation metadata, and pair timing uncertainty
+- An explicit distinction between observed camera-B `currentTime` and verified camera-B frame-callback timing
+- Typed `imu_01` and `imu_02` packet streams with sensor time, sequence, browser receiver time, experiment-relative arrival time, normalized quaternion validity, and synchronization metadata
+- Reproducible stereo and IMU ALS calibration artifacts, represented either as embedded snapshots or external references with required content hashes
+- Warm-up and measurement boundaries
+- Right-arm occlusion schedule definitions
+- Per-cycle camera, IMU, P1, P2, P3, and P4 references
+- Optional Pipeline 4 fusion diagnostics
+- Existing `MotionRecording` objects for pipeline analysis
+
+`ExperimentCycle` owns the single authoritative `cycleId` and `experimentTimeMs`. Pipeline output references deliberately do not carry independent timestamps. Each output is a discriminated union:
+
+```typescript
+type PipelineCycleOutputReference =
+  | {
+      status: "available";
+      recordingId: string;
+      frameNumber: number;
+    }
+  | {
+      status: "missing";
+      reason: PipelineOutputMissingReason;
+      detail?: string;
+    };
+```
+
+This allows any pipeline to be missing without fabricating a zero-coordinate pose.
+
+Two occlusion definitions are available as schema-only discriminated unions:
+
+- `fusion_trigger_only` at `pipeline4_simulated_failures_input`: triggers P4 fusion logic without claiming equivalent visual dropout in P1–P3
+- `shared_landmark_dropout` at `shared_visual_observation_boundary`: documents removal of designated visual observations before pipeline branching
+
+Neither mode is executed in Stage 1.
+
+### Explicit motion timestamps
+
+**Sources:**
+
+- `src/app/hooks/useMotionRecorder.ts`
+- `src/app/hooks/useStereoMotionRecorder.ts`
+
+The original APIs remain unchanged:
+
+```typescript
+recordFrame(landmarks);
+recordStereoFrame(pose3D, camera1Landmarks);
+```
+
+They continue using the existing `Date.now() - recordingStartTime` timestamps.
+
+Standardized experiments can use:
+
+```typescript
+startRecording({
+  clockMode: "explicit-experiment",
+  experimentSessionId: session.sessionId,
+});
+
+recordFrameAtTime(landmarks, experimentTimeMs);
+recordStereoFrameAtTime(pose3D, camera1Landmarks, experimentTimeMs);
+```
+
+Explicit timestamps are stored exactly. They must be finite, non-negative, and strictly increasing. Rejected frames return a typed `MotionFrameRecordResult` with one of:
+
+- `not_recording`
+- `invalid_timestamp`
+- `non_monotonic_timestamp`
+- `clock_mode_mismatch`
+- `missing_experiment_session`
+
+A recording cannot silently mix the legacy wall-clock-relative path with the explicit experiment-clock path. Starting a new recording resets the selected clock mode.
+
+Every newly created recording writes `metadata.clockMode`. An explicit recording must also declare `metadata.experimentSessionId`; the recorder writes `metadata.experimentClockReference = "ExperimentSession.clock"`. Old serialized `MotionRecording` objects remain compatible because these metadata fields are optional in the type.
+
+For explicit recordings, `MotionRecording.duration` is derived from the first and last accepted experiment timestamps. Average FPS uses the number of frame intervals:
+
+```text
+frameRate = (frameCount - 1) / elapsedSeconds
+```
+
+The legacy live path retains its original `frameCount / wallClockDurationSeconds` calculation. Explicit frame timestamps remain relative to the experiment origin and are not rebased.
+
+Recording activity is also mirrored in a synchronous ref. A frame delivered in the same JavaScript turn as `startRecording()` is accepted, `stopRecording()` can finalize without waiting for a React render, and callbacks after stop are rejected immediately. React state remains available for UI rendering as before.
+
+Stereo conversion is centralized in `triangulatedPoseToMotionLandmarks()`. Existing millimetre coordinates, camera-A visibility values, missing-joint visibility-zero behavior, and both shoulder landmarks are preserved.
+
+### Stage 1 tests
+
+The framework-free runner includes 11 Stage 1 tests in addition to the existing 20 fusion tests.
+
+| # | Stage 1 test | What it verifies |
+|---|---|---|
+| 21 | Legacy live frame creation | Existing relative timestamps and same-millisecond behavior remain available |
+| 22 | Explicit timestamp preservation | Fractional `experimentTimeMs` values are stored exactly |
+| 23 | Timestamp rejection | Invalid, duplicate, and backwards explicit timestamps are rejected |
+| 24 | Stereo conversion | Both shoulders, coordinates, and visibility conventions are preserved |
+| 25 | Shared experiment cycle | P1–P4 references share one cycle ID and experiment timestamp |
+| 26 | Missing output representation | Missing pipeline output contains no fabricated frame or landmarks |
+| 27 | Calibration reproducibility | Stereo and IMU calibrations support snapshots or hashed external references |
+| 28 | Analyzer compatibility | Existing `MotionRecording` and shoulder-width jitter normalization remain unchanged |
+| 29 | Explicit and legacy FPS | Explicit FPS uses frame intervals while legacy FPS remains unchanged |
+| 30 | Synchronous recorder lifecycle | Immediate post-start frames are accepted, immediate stop finalizes, and post-stop frames are rejected |
+| 31 | Session clock association | Explicit recordings identify their `ExperimentSession.clock` and session ID |
+
+---
+
+## Stage 2A — Standardized Dual-Camera Recording and Timing
+
+Stage 2A extends the existing dual-camera `MediaRecorder` workflow into one reusable master camera recording format. The same Camera A and Camera B videos can later drive P1–P4; no lab-specific video format is introduced.
+
+### Shared recording clock
+
+**Source:** `src/app/hooks/useStereoVideoRecorder.ts`
+
+At recording start, the hook captures one monotonic origin:
+
+```typescript
+const experimentStartPerformanceNowMs = performance.now();
+```
+
+Every camera observation uses:
+
+```typescript
+experimentTimeMs =
+  browserObservedPerformanceNowMs - experimentStartPerformanceNowMs;
+```
+
+Both camera sidecars and `ExperimentClockMetadata.liveCaptureOrigin` store the same origin. `Date.now()` is retained only for filenames and optional human-readable correlation. It is not the authoritative experiment clock.
+
+### Independent camera timing
+
+Camera A and Camera B each run their own timing observer on their own video element:
+
+- Preferred: `requestVideoFrameCallback`
+- Fallback: `requestAnimationFrame` plus deduplicated `video.currentTime`
+- Unavailable: an explicit empty sidecar with a documented limitation
+
+Each frame-specific observation records:
+
+- Camera-specific frame reference and sequence
+- Original camera media timestamp
+- Experiment-relative observation time
+- Browser `performance.now()` and optional wall-clock observation time
+- `presentedFrames`
+- Presentation and expected-display timestamps
+- Processing duration
+- Media-time delta
+- Detected skipped frames since the prior callback
+
+Camera B observations are not copied from Camera A and are not assumed to represent the same exposure.
+
+### Camera timing sidecars
+
+Each `StereoVideoRecording` contains:
+
+- `cam1Blob`
+- `cam2Blob`
+- `clockMetadata`
+- `cameraATiming`
+- `cameraBTiming`
+- `synchronizationDiagnostics`
+
+The timing sidecars include the recording ID, camera ID, associated video asset ID, resolution, requested and track-reported frame rates, metadata availability, all observations, and summaries for browser callback FPS, interval variation, gaps, and skipped presentation observations.
+
+Callback FPS is not encoded-video FPS. Encoded frame count, encoded FPS, and encoded timestamp gaps are exported as unavailable unless supplied by an independent container/frame analysis tool such as `ffprobe`.
+
+Synchronization uses a 33 ms default tolerance and a monotonic one-to-one greedy policy. Pairing uses each callback's browser `performance.now()` receipt timestamp. A Camera B observation cannot be reused for multiple Camera A observations. Diagnostics include:
+
+- Matched and unmatched counts for both cameras
+- Signed mean callback offset
+- Mean, median, nearest-rank 95th percentile, and maximum absolute callback offsets
+- Pairing tolerance, policy, and time basis
+
+Raw camera media timestamps remain in their own sidecars but are not subtracted as if the two camera media-time origins were synchronized. The deprecated `timingUncertaintyMs` and `cameraPairMetadata.uncertaintyMs` fields are no longer populated by new exports.
+
+Synchronization diagnostics always retain:
+
+```typescript
+hardwareExposureSynchronizationVerified: false
+cameraMediaTimeOriginsComparable: false
+browserCallbackReceiptAlignmentOnly: true
+```
+
+Browser callback receipt alignment is not represented as presentation, exposure, or hardware synchronization.
+
+### Startup and discontinuity instrumentation
+
+The recording metadata now captures lightweight timing markers for each encoder:
+
+- `MediaRecorder.start()` call time
+- MediaRecorder `start` event time
+- First non-empty encoded data-chunk event time
+- Timing-observer registration time
+- First timing observation time
+
+Each camera sidecar also records significant browser-observation or camera-media-time discontinuities above a configurable threshold (100 ms by default), plus any `presentedFrames` gaps. These measurements can distinguish browser callback stalls from media-timeline discontinuities, but they do not identify encoded frame timestamps. Encoded startup gaps still require external inspection of the WebM frame timestamps.
+
+### Recorder failure behavior
+
+- If either encoder fails during startup, any encoder that already started is stopped and timing observers are cancelled.
+- Stop and error events settle independently for Camera A and Camera B.
+- A five-second stop timeout prevents unresolved stop promises.
+- Final recordings are labelled `complete`, `partial`, or `failed`, with per-camera encoding status and errors.
+- Every start resets chunks, timing observations, counters, errors, and startup instrumentation.
+- A frame-specific timing observer clears the temporary `"Timing observer has not started."` limitation before export.
+
+### Download bundle
+
+The existing Video Recording tabs now download six associated files:
+
+1. Camera A video (`*_cam1.webm` or MP4)
+2. Camera B video (`*_cam2.webm` or MP4)
+3. Camera A timing sidecar
+4. Camera B timing sidecar
+5. Shared recording clock metadata
+6. Camera synchronization diagnostics
+
+All metadata files contain or inherit the stereo recording ID needed for future `ExperimentSession` association.
+
+### Recording diagnostics UI
+
+The Video Recording tabs for the stereo, correction, and IMU labs display:
+
+- Per-camera recorder status
+- Per-camera observed frame count
+- Requested camera FPS
+- Browser-observed callback FPS
+- Skipped presentation observations
+- Encoded FPS availability
+- Timing metadata availability
+- Monotonic recording duration
+- Synchronization status
+- A warning that browser timing does not verify simultaneous exposure
+
+### Stage 2A tests
+
+The framework-free runner now executes **44 tests**. Tests 32–44 verify:
+
+| # | Test | What it verifies |
+|---|---|---|
+| 32 | Shared camera clock | Both sidecars derive experiment time from one monotonic origin |
+| 33 | Media timestamp preservation | Camera media and presentation timestamps are retained exactly |
+| 34 | Independent Camera B observations | Camera B has its own frame reference, media time, and observation time |
+| 35 | Frame-gap detection | `presentedFrames` gaps produce skipped-frame diagnostics |
+| 36 | Missing timing metadata | Unavailable metadata produces an explicit empty sidecar without invented frames |
+| 37 | Existing recording behavior | Both video blobs, MIME type, and duration remain intact |
+| 38 | Export association | Camera sidecars and synchronization diagnostics retain the correct recording ID |
+| 39 | Pairing tolerance and uniqueness | Matching is one-to-one, tolerance-bounded, and reports both unmatched counts |
+| 40 | Offset statistics | Mean, median, nearest-rank p95, and maximum absolute callback offsets are correct |
+| 41 | Empty and irregular streams | Missing observations and callback interval variation are handled explicitly |
+| 42 | Large discontinuities | Browser and camera-media timeline gaps are instrumented without interpolation |
+| 43 | Recorder failures | Safe cleanup and partial/failed status classification remain deterministic |
+| 44 | Final metadata consistency | Stale startup text is cleared and encoded metrics remain honestly unavailable |
+
+### Uniform physical camera retest procedure
+
+Use the same procedure for every camera-timing validation run:
+
+1. Fix camera mounting, resolution, USB ports, lighting, and calibration.
+2. Start both cameras and allow at least five seconds for stream and exposure stabilization.
+3. Record a 15–20 second baseline from the Video Recording tab.
+4. Record a second 15–20 second run while reconstruction processing is active.
+5. Repeat the predefined number of trials for both conditions; do not choose a different repetition count per pipeline.
+6. Download the complete six-file bundle after every trial.
+7. Reject or separately classify `partial` and `failed` recordings.
+8. Compare startup markers and significant discontinuities between baseline and processing-load conditions.
+9. Inspect each WebM independently with a container-aware tool:
+
+```bash
+ffprobe -v error \
+  -select_streams v:0 \
+  -show_entries frame=best_effort_timestamp_time \
+  -of csv=p=0 \
+  camera.webm > frame_timestamps.txt
+```
+
+10. Calculate encoded frame count, encoded FPS, and consecutive encoded timestamp gaps from that output. Do not substitute sidecar callback FPS.
+11. Retain the raw bundle and derived external timing report under the same recording/session ID.
+12. Once common replay is implemented, run P1–P4 from this one accepted master bundle rather than recapturing the movement in each lab.
 
 ---
 

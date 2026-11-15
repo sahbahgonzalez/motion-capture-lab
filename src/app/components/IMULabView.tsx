@@ -41,6 +41,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { useDualCamera } from '../hooks/useDualCamera';
 import { useCameraCalibration } from '../hooks/useCameraCalibration';
 import { useStereoVideoRecorder } from '../hooks/useStereoVideoRecorder';
+import { StereoRecordingDiagnosticsPanel } from './StereoRecordingDiagnosticsPanel';
 import { CalibrationView } from './CalibrationView';
 import { IMUReconstructionView } from './IMUReconstructionView';
 import { FailureCorrectionPlayback } from './FailureCorrectionPlayback';
@@ -981,14 +982,18 @@ export function IMULabView() {
     stopRecording: stopVideoRecording,
     downloadRecording: downloadVideoRecording,
     deleteRecording: deleteVideoRecording,
-  } = useStereoVideoRecorder(camera1Stream, camera2Stream);
+    recordingDiagnostics,
+  } = useStereoVideoRecorder(camera1Stream, camera2Stream, {
+    cameraA: { videoRef: camera1Ref, cameraId: selectedCamera1 },
+    cameraB: { videoRef: camera2Ref, cameraId: selectedCamera2 },
+  });
 
   const [videoRecordingMs, setVideoRecordingMs] = useState(0);
   const videoRecordStartRef = useRef<number>(0);
   useEffect(() => {
     if (!isVideoRecording) { setVideoRecordingMs(0); return; }
-    videoRecordStartRef.current = Date.now();
-    const interval = setInterval(() => setVideoRecordingMs(Date.now() - videoRecordStartRef.current), 100);
+    videoRecordStartRef.current = performance.now();
+    const interval = setInterval(() => setVideoRecordingMs(performance.now() - videoRecordStartRef.current), 100);
     return () => clearInterval(interval);
   }, [isVideoRecording]);
 
@@ -2612,6 +2617,7 @@ export function IMULabView() {
                   </Button>
                 )}
               </div>
+              <StereoRecordingDiagnosticsPanel diagnostics={recordingDiagnostics} />
             </Card>
 
             {videoRecordings.length > 0 && (
@@ -2629,7 +2635,7 @@ export function IMULabView() {
                       <div className="flex gap-2">
                         <Button size="sm" variant="outline" className="border-gray-600 text-gray-300 hover:text-white"
                           onClick={() => downloadVideoRecording(rec)}>
-                          <Download className="h-4 w-4 mr-1" /> Download Both
+                          <Download className="h-4 w-4 mr-1" /> Download Bundle
                         </Button>
                         <Button size="sm" variant="destructive" onClick={() => deleteVideoRecording(rec.id)}>Delete</Button>
                       </div>

@@ -7,6 +7,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { useDualCamera } from '../hooks/useDualCamera';
 import { useCameraCalibration } from '../hooks/useCameraCalibration';
 import { useStereoVideoRecorder } from '../hooks/useStereoVideoRecorder';
+import { StereoRecordingDiagnosticsPanel } from './StereoRecordingDiagnosticsPanel';
 import { CalibrationView } from './CalibrationView';
 import { TriangulationView } from './TriangulationView';
 import { StereoVideoPlayback } from './StereoVideoPlayback';
@@ -45,16 +46,20 @@ export function ThreeDMotionCaptureView() {
     stopRecording: stopVideoRecording,
     downloadRecording: downloadVideoRecording,
     deleteRecording: deleteVideoRecording,
-  } = useStereoVideoRecorder(camera1Stream, camera2Stream);
+    recordingDiagnostics,
+  } = useStereoVideoRecorder(camera1Stream, camera2Stream, {
+    cameraA: { videoRef: camera1Ref, cameraId: selectedCamera1 },
+    cameraB: { videoRef: camera2Ref, cameraId: selectedCamera2 },
+  });
 
   const [videoRecordingMs, setVideoRecordingMs] = useState(0);
   const videoRecordStartRef = useRef<number>(0);
 
   useEffect(() => {
     if (!isVideoRecording) { setVideoRecordingMs(0); return; }
-    videoRecordStartRef.current = Date.now();
+    videoRecordStartRef.current = performance.now();
     const interval = setInterval(() => {
-      setVideoRecordingMs(Date.now() - videoRecordStartRef.current);
+      setVideoRecordingMs(performance.now() - videoRecordStartRef.current);
     }, 100);
     return () => clearInterval(interval);
   }, [isVideoRecording]);
@@ -326,7 +331,7 @@ export function ThreeDMotionCaptureView() {
                 <div>
                   <h3 className="text-lg font-semibold">Synchronized Dual-Camera Recording</h3>
                   <p className="text-sm text-gray-400 mt-1">
-                    Both streams start in the same JS tick — sub-millisecond synchronization.
+                    One reusable camera pair with independent frame timing sidecars.
                   </p>
                 </div>
                 {isVideoRecording && (
@@ -370,6 +375,7 @@ export function ThreeDMotionCaptureView() {
                   </Button>
                 )}
               </div>
+              <StereoRecordingDiagnosticsPanel diagnostics={recordingDiagnostics} />
             </Card>
 
             {/* Recordings list */}
@@ -397,7 +403,7 @@ export function ThreeDMotionCaptureView() {
                             onClick={() => downloadVideoRecording(rec)}
                           >
                             <Download className="h-4 w-4 mr-1" />
-                            Download Both
+                            Download Bundle
                           </Button>
                           <Button
                             size="sm"
