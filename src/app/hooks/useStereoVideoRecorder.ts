@@ -26,6 +26,32 @@ export type CameraRecordingStatus =
   | 'unavailable'
   | 'error';
 
+export const DEFAULT_PAIRING_TOLERANCE_MS = 33;
+export const DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS = 100;
+const RECORDER_STOP_TIMEOUT_MS = 5000;
+
+export type EncodedVideoMetrics =
+  | {
+      status: 'unavailable';
+      reason: string;
+      externalMeasurementRecommended: true;
+    }
+  | {
+      status: 'measured_externally';
+      measurementTool: string;
+      encodedFrameCount: number;
+      encodedFramesPerSecond: number;
+      timestampGapsMs: number[];
+    };
+
+export interface CameraTimingDiscontinuity {
+  afterSequence: number;
+  browserObservationGapMs: number;
+  cameraMediaTimeGapMs?: number;
+  skippedPresentationFrames: number;
+  thresholdMs: number;
+}
+
 export interface RecordedCameraTimingObservation extends CameraTimestampObservation {
   sequence: number;
   observationMethod: 'request_video_frame_callback' | 'request_animation_frame_current_time';
@@ -40,11 +66,16 @@ export interface CameraTimingSummary {
   lastExperimentTimeMs?: number;
   firstMediaTimeSeconds?: number;
   lastMediaTimeSeconds?: number;
+  browserObservedCallbackFps?: number;
+  /** @deprecated Alias of browserObservedCallbackFps; never encoded-video FPS. */
   observedFrameRate?: number;
   meanObservationIntervalMs?: number;
   observationIntervalStdDevMs?: number;
   frameGapCount: number;
   skippedFrameCount: number;
+  largestObservationIntervalMs?: number;
+  largestMediaTimeDeltaMs?: number;
+  significantGapCount: number;
 }
 
 export interface CameraTimingSidecar {
@@ -58,27 +89,71 @@ export interface CameraTimingSidecar {
     height: number;
   };
   nominalFrameRate?: number;
+  requestedFrameRate?: number;
+  trackReportedFrameRate?: number;
   experimentStartPerformanceNowMs: number;
   metadataAvailability: CameraTimingMetadataAvailability;
   synchronizationStatus: SynchronizationStatus;
   limitation?: string;
   observations: RecordedCameraTimingObservation[];
   summary: CameraTimingSummary;
+  significantGapThresholdMs: number;
+  significantDiscontinuities: CameraTimingDiscontinuity[];
+  encodedVideoMetrics: EncodedVideoMetrics;
+}
+
+export interface RecorderStartupTiming {
+  startCallExperimentTimeMs?: number;
+  startEventExperimentTimeMs?: number;
+  firstDataAvailableExperimentTimeMs?: number;
+  timingObserverRegisteredExperimentTimeMs?: number;
+  firstTimingObservationExperimentTimeMs?: number;
+}
+
+export interface StereoRecorderInstrumentation {
+  recordingId: string;
+  experimentStartPerformanceNowMs: number;
+  cameraA: RecorderStartupTiming;
+  cameraB: RecorderStartupTiming;
+  notes: string[];
+}
+
+export interface CameraObservationPair {
+  cameraASequence: number;
+  cameraBSequence: number;
+  browserCallbackOffsetMs: number;
 }
 
 export interface StereoSynchronizationDiagnostics {
   recordingId: string;
   status: SynchronizationStatus;
-  basis: 'nearest_browser_presentation_observation';
-  browserPresentationAlignmentOnly: true;
+  basis: 'one_to_one_browser_callback_receipt';
+  /** @deprecated Pairing no longer uses this interpretation. */
+  browserPresentationAlignmentOnly: false;
+  browserCallbackReceiptAlignmentOnly: true;
   hardwareExposureSynchronizationVerified: false;
+  pairingPolicy: 'monotonic_one_to_one_greedy';
+  pairingTimeBasis: 'browser_callback_receipt_performance_now';
+  pairingToleranceMs: number;
   pairedObservationCount: number;
+  matchedObservationCount: number;
+  unmatchedCameraAObservationCount: number;
+  unmatchedCameraBObservationCount: number;
+  matchedPairs: CameraObservationPair[];
   meanBrowserObservationOffsetMs?: number;
+  meanAbsoluteBrowserObservationOffsetMs?: number;
+  medianAbsoluteBrowserObservationOffsetMs?: number;
+  p95AbsoluteBrowserObservationOffsetMs?: number;
   maxAbsoluteBrowserObservationOffsetMs?: number;
+  /** @deprecated Raw camera media-time origins are not assumed comparable. */
   meanMediaTimeOffsetMs?: number;
+  /** @deprecated Raw camera media-time origins are not assumed comparable. */
   maxAbsoluteMediaTimeOffsetMs?: number;
+  /** @deprecated This was browser pairing residual, not exposure uncertainty. */
   timingUncertaintyMs?: number;
+  cameraMediaTimeOriginsComparable: false;
   cameraPairMetadata: CameraPairTimingMetadata;
+  startupInstrumentation?: StereoRecorderInstrumentation;
   limitations: string[];
 }
 
@@ -88,6 +163,14 @@ export interface StereoRecordingDiagnostics {
   cameraBStatus: CameraRecordingStatus;
   cameraAObservedFrameCount: number;
   cameraBObservedFrameCount: number;
+  cameraARequestedFps?: number;
+  cameraBRequestedFps?: number;
+  cameraABrowserObservedCallbackFps?: number;
+  cameraBBrowserObservedCallbackFps?: number;
+  cameraASkippedPresentationFrames: number;
+  cameraBSkippedPresentationFrames: number;
+  cameraAEncodedFpsAvailable: boolean;
+  cameraBEncodedFpsAvailable: boolean;
   durationMs: number;
   cameraAMetadataAvailability: CameraTimingMetadataAvailability;
   cameraBMetadataAvailability: CameraTimingMetadataAvailability;
@@ -109,6 +192,11 @@ export interface StereoVideoRecording {
   cameraATiming: CameraTimingSidecar;
   cameraBTiming: CameraTimingSidecar;
   synchronizationDiagnostics: StereoSynchronizationDiagnostics;
+  startupInstrumentation: StereoRecorderInstrumentation;
+  status: 'complete' | 'partial' | 'failed';
+  cameraAEncodingStatus: 'complete' | 'failed';
+  cameraBEncodingStatus: 'complete' | 'failed';
+  errors: string[];
 }
 
 export interface StereoVideoRecorderOptions {
@@ -121,6 +209,8 @@ export interface StereoVideoRecorderOptions {
     cameraId?: string;
   };
   experimentSessionId?: string;
+  pairingToleranceMs?: number;
+  significantGapThresholdMs?: number;
 }
 
 interface VideoFrameCallbackMetadataLike {
@@ -161,6 +251,10 @@ const EMPTY_DIAGNOSTICS: StereoRecordingDiagnostics = {
   cameraBStatus: 'inactive',
   cameraAObservedFrameCount: 0,
   cameraBObservedFrameCount: 0,
+  cameraASkippedPresentationFrames: 0,
+  cameraBSkippedPresentationFrames: 0,
+  cameraAEncodedFpsAvailable: false,
+  cameraBEncodedFpsAvailable: false,
   durationMs: 0,
   cameraAMetadataAvailability: 'unavailable',
   cameraBMetadataAvailability: 'unavailable',
@@ -227,12 +321,14 @@ function calculateStdDev(values: number[], mean: number | undefined): number | u
 
 export function summarizeCameraTiming(
   observations: RecordedCameraTimingObservation[],
+  significantGapThresholdMs = DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS,
 ): CameraTimingSummary {
   if (observations.length === 0) {
     return {
       observedFrameCount: 0,
       frameGapCount: 0,
       skippedFrameCount: 0,
+      significantGapCount: 0,
     };
   }
 
@@ -242,7 +338,11 @@ export function summarizeCameraTiming(
     (observation, index) => observation.experimentTimeMs - observations[index].experimentTimeMs,
   );
   const meanInterval = calculateMean(experimentIntervals);
-  const mediaElapsedSeconds = last.mediaTimeSeconds - first.mediaTimeSeconds;
+  const browserObservationElapsedSeconds =
+    (last.browserObservedPerformanceNowMs - first.browserObservedPerformanceNowMs) / 1000;
+  const mediaIntervals = observations.slice(1)
+    .map(observation => observation.mediaTimeDeltaMs)
+    .filter((value): value is number => value !== undefined && Number.isFinite(value));
 
   return {
     observedFrameCount: observations.length,
@@ -250,8 +350,12 @@ export function summarizeCameraTiming(
     lastExperimentTimeMs: last.experimentTimeMs,
     firstMediaTimeSeconds: first.mediaTimeSeconds,
     lastMediaTimeSeconds: last.mediaTimeSeconds,
-    observedFrameRate: observations.length >= 2 && mediaElapsedSeconds > 0
-      ? (observations.length - 1) / mediaElapsedSeconds
+    browserObservedCallbackFps:
+      observations.length >= 2 && browserObservationElapsedSeconds > 0
+        ? (observations.length - 1) / browserObservationElapsedSeconds
+        : undefined,
+    observedFrameRate: observations.length >= 2 && browserObservationElapsedSeconds > 0
+      ? (observations.length - 1) / browserObservationElapsedSeconds
       : undefined,
     meanObservationIntervalMs: meanInterval,
     observationIntervalStdDevMs: calculateStdDev(experimentIntervals, meanInterval),
@@ -262,7 +366,49 @@ export function summarizeCameraTiming(
       (sum, observation) => sum + observation.skippedFramesSincePrevious,
       0,
     ),
+    largestObservationIntervalMs: experimentIntervals.length > 0
+      ? Math.max(...experimentIntervals)
+      : undefined,
+    largestMediaTimeDeltaMs: mediaIntervals.length > 0
+      ? Math.max(...mediaIntervals)
+      : undefined,
+    significantGapCount: observations.filter((observation, index) => {
+      if (index === 0) return false;
+      const browserGap =
+        observation.experimentTimeMs - observations[index - 1].experimentTimeMs;
+      return browserGap >= significantGapThresholdMs
+        || (observation.mediaTimeDeltaMs ?? 0) >= significantGapThresholdMs
+        || observation.skippedFramesSincePrevious > 0;
+    }).length,
   };
+}
+
+export function detectTimingDiscontinuities(
+  observations: RecordedCameraTimingObservation[],
+  thresholdMs = DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS,
+): CameraTimingDiscontinuity[] {
+  const discontinuities: CameraTimingDiscontinuity[] = [];
+  for (let index = 1; index < observations.length; index += 1) {
+    const previous = observations[index - 1];
+    const current = observations[index];
+    const browserGap =
+      current.browserObservedPerformanceNowMs - previous.browserObservedPerformanceNowMs;
+    const mediaGap = current.mediaTimeDeltaMs;
+    if (
+      browserGap >= thresholdMs
+      || (mediaGap ?? 0) >= thresholdMs
+      || current.skippedFramesSincePrevious > 0
+    ) {
+      discontinuities.push({
+        afterSequence: previous.sequence,
+        browserObservationGapMs: browserGap,
+        cameraMediaTimeGapMs: mediaGap,
+        skippedPresentationFrames: current.skippedFramesSincePrevious,
+        thresholdMs,
+      });
+    }
+  }
+  return discontinuities;
 }
 
 export function createUnavailableCameraTimingSidecar(
@@ -284,39 +430,102 @@ export function createUnavailableCameraTimingSidecar(
     limitation: reason,
     observations: [],
     summary: summarizeCameraTiming([]),
+    significantGapThresholdMs: DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS,
+    significantDiscontinuities: [],
+    encodedVideoMetrics: {
+      status: 'unavailable',
+      reason:
+        'Encoded frame count, FPS, and encoded timestamp gaps require independent container/frame analysis.',
+      externalMeasurementRecommended: true,
+    },
   };
 }
 
-function nearestObservation(
-  target: RecordedCameraTimingObservation,
-  candidates: RecordedCameraTimingObservation[],
-): RecordedCameraTimingObservation | null {
-  let nearest: RecordedCameraTimingObservation | null = null;
-  let nearestDistance = Infinity;
-  for (const candidate of candidates) {
-    const distance = Math.abs(candidate.experimentTimeMs - target.experimentTimeMs);
-    if (distance < nearestDistance) {
-      nearest = candidate;
-      nearestDistance = distance;
+function median(values: number[]): number | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? (sorted[middle - 1] + sorted[middle]) / 2
+    : sorted[middle];
+}
+
+function nearestRankPercentile(values: number[], percentile: number): number | undefined {
+  if (values.length === 0) return undefined;
+  const sorted = [...values].sort((a, b) => a - b);
+  const rank = Math.max(1, Math.ceil(percentile * sorted.length));
+  return sorted[Math.min(sorted.length - 1, rank - 1)];
+}
+
+export function pairCameraObservationsOneToOne(
+  cameraAObservations: RecordedCameraTimingObservation[],
+  cameraBObservations: RecordedCameraTimingObservation[],
+  toleranceMs = DEFAULT_PAIRING_TOLERANCE_MS,
+): {
+  matches: CameraObservationPair[];
+  unmatchedCameraAObservationCount: number;
+  unmatchedCameraBObservationCount: number;
+} {
+  const cameraA = [...cameraAObservations].sort(
+    (a, b) => a.browserObservedPerformanceNowMs - b.browserObservedPerformanceNowMs,
+  );
+  const cameraB = [...cameraBObservations].sort(
+    (a, b) => a.browserObservedPerformanceNowMs - b.browserObservedPerformanceNowMs,
+  );
+  const matches: CameraObservationPair[] = [];
+  let unmatchedCameraAObservationCount = 0;
+  let unmatchedCameraBObservationCount = 0;
+  let indexA = 0;
+  let indexB = 0;
+
+  while (indexA < cameraA.length && indexB < cameraB.length) {
+    const observationA = cameraA[indexA];
+    const observationB = cameraB[indexB];
+    const offset =
+      observationB.browserObservedPerformanceNowMs
+      - observationA.browserObservedPerformanceNowMs;
+
+    if (Math.abs(offset) <= toleranceMs) {
+      matches.push({
+        cameraASequence: observationA.sequence,
+        cameraBSequence: observationB.sequence,
+        browserCallbackOffsetMs: offset,
+      });
+      indexA += 1;
+      indexB += 1;
+    } else if (observationA.browserObservedPerformanceNowMs < observationB.browserObservedPerformanceNowMs) {
+      unmatchedCameraAObservationCount += 1;
+      indexA += 1;
+    } else {
+      unmatchedCameraBObservationCount += 1;
+      indexB += 1;
     }
   }
-  return nearest;
+
+  unmatchedCameraAObservationCount += cameraA.length - indexA;
+  unmatchedCameraBObservationCount += cameraB.length - indexB;
+
+  return {
+    matches,
+    unmatchedCameraAObservationCount,
+    unmatchedCameraBObservationCount,
+  };
 }
 
 export function buildSynchronizationDiagnostics(
   recordingId: string,
   cameraA: CameraTimingSidecar,
   cameraB: CameraTimingSidecar,
+  pairingToleranceMs = DEFAULT_PAIRING_TOLERANCE_MS,
+  startupInstrumentation?: StereoRecorderInstrumentation,
 ): StereoSynchronizationDiagnostics {
-  const browserOffsets: number[] = [];
-  const mediaOffsets: number[] = [];
-
-  for (const observationA of cameraA.observations) {
-    const observationB = nearestObservation(observationA, cameraB.observations);
-    if (!observationB) continue;
-    browserOffsets.push(observationB.experimentTimeMs - observationA.experimentTimeMs);
-    mediaOffsets.push((observationB.mediaTimeSeconds - observationA.mediaTimeSeconds) * 1000);
-  }
+  const pairing = pairCameraObservationsOneToOne(
+    cameraA.observations,
+    cameraB.observations,
+    pairingToleranceMs,
+  );
+  const browserOffsets = pairing.matches.map(match => match.browserCallbackOffsetMs);
+  const absoluteBrowserOffsets = browserOffsets.map(Math.abs);
 
   const maxAbs = (values: number[]): number | undefined => (
     values.length > 0 ? Math.max(...values.map(Math.abs)) : undefined
@@ -326,33 +535,50 @@ export function buildSynchronizationDiagnostics(
     cameraA.metadataAvailability === 'frame_specific'
     && cameraB.metadataAvailability === 'frame_specific';
   const status: SynchronizationStatus =
-    cameraA.observations.length === 0 || cameraB.observations.length === 0
+    cameraA.observations.length === 0
+    || cameraB.observations.length === 0
+    || pairing.matches.length === 0
       ? 'unknown'
       : 'unverified';
 
   return {
     recordingId,
     status,
-    basis: 'nearest_browser_presentation_observation',
-    browserPresentationAlignmentOnly: true,
+    basis: 'one_to_one_browser_callback_receipt',
+    browserPresentationAlignmentOnly: false,
+    browserCallbackReceiptAlignmentOnly: true,
     hardwareExposureSynchronizationVerified: false,
+    pairingPolicy: 'monotonic_one_to_one_greedy',
+    pairingTimeBasis: 'browser_callback_receipt_performance_now',
+    pairingToleranceMs,
     pairedObservationCount: browserOffsets.length,
+    matchedObservationCount: browserOffsets.length,
+    unmatchedCameraAObservationCount: pairing.unmatchedCameraAObservationCount,
+    unmatchedCameraBObservationCount: pairing.unmatchedCameraBObservationCount,
+    matchedPairs: pairing.matches,
     meanBrowserObservationOffsetMs: calculateMean(browserOffsets),
+    meanAbsoluteBrowserObservationOffsetMs: calculateMean(absoluteBrowserOffsets),
+    medianAbsoluteBrowserObservationOffsetMs: median(absoluteBrowserOffsets),
+    p95AbsoluteBrowserObservationOffsetMs:
+      nearestRankPercentile(absoluteBrowserOffsets, 0.95),
     maxAbsoluteBrowserObservationOffsetMs: maxBrowserOffset,
-    meanMediaTimeOffsetMs: calculateMean(mediaOffsets),
-    maxAbsoluteMediaTimeOffsetMs: maxAbs(mediaOffsets),
-    timingUncertaintyMs: maxBrowserOffset,
+    cameraMediaTimeOriginsComparable: false,
     cameraPairMetadata: {
       status,
       cameraBMediaTimeBasis: cameraB.metadataAvailability === 'frame_specific'
         ? 'camera_b_frame_callback'
         : 'observed_current_time',
       cameraBFrameSynchronizationVerified: false,
-      estimatedOffsetMs: calculateMean(mediaOffsets),
-      uncertaintyMs: maxBrowserOffset,
-      notes: 'Browser presentation observations only; camera exposure synchronization is not verified.',
+      notes:
+        `One-to-one browser callback receipt pairing with a ${pairingToleranceMs} ms tolerance. `
+        + 'Raw camera media-time origins are not treated as synchronized. '
+        + 'Camera exposure synchronization is not verified.',
     },
+    startupInstrumentation,
     limitations: [
+      'Pairing uses browser callback receipt performance.now() timestamps, not camera exposure timestamps.',
+      'Browser callback timing can be delayed by main-thread work.',
+      'Raw camera media timestamps are retained per camera but their origins are not assumed comparable.',
       'Browser presentation timing does not prove simultaneous camera exposure.',
       ...(bothFrameSpecific
         ? []
@@ -409,18 +635,74 @@ interface CreateRecordingInput {
   clockMetadata: ExperimentClockMetadata;
   cameraATiming: CameraTimingSidecar;
   cameraBTiming: CameraTimingSidecar;
+  pairingToleranceMs?: number;
+  startupInstrumentation?: StereoRecorderInstrumentation;
+  cameraAEncodingStatus?: 'complete' | 'failed';
+  cameraBEncodingStatus?: 'complete' | 'failed';
+  errors?: string[];
+}
+
+export function classifyStereoRecordingStatus(
+  cameraAEncodingStatus: 'complete' | 'failed',
+  cameraBEncodingStatus: 'complete' | 'failed',
+): 'complete' | 'partial' | 'failed' {
+  if (cameraAEncodingStatus === 'complete' && cameraBEncodingStatus === 'complete') {
+    return 'complete';
+  }
+  if (cameraAEncodingStatus === 'failed' && cameraBEncodingStatus === 'failed') {
+    return 'failed';
+  }
+  return 'partial';
 }
 
 export function createStereoVideoRecording(
   input: CreateRecordingInput,
 ): StereoVideoRecording {
+  const cameraAGapThreshold =
+    input.cameraATiming.significantGapThresholdMs
+    ?? DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS;
+  const cameraBGapThreshold =
+    input.cameraBTiming.significantGapThresholdMs
+    ?? DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS;
   const cameraATiming: CameraTimingSidecar = {
     ...input.cameraATiming,
-    summary: summarizeCameraTiming(input.cameraATiming.observations),
+    limitation: input.cameraATiming.metadataAvailability === 'frame_specific'
+      ? undefined
+      : input.cameraATiming.limitation,
+    summary: summarizeCameraTiming(
+      input.cameraATiming.observations,
+      cameraAGapThreshold,
+    ),
+    significantGapThresholdMs: cameraAGapThreshold,
+    significantDiscontinuities: detectTimingDiscontinuities(
+      input.cameraATiming.observations,
+      cameraAGapThreshold,
+    ),
   };
   const cameraBTiming: CameraTimingSidecar = {
     ...input.cameraBTiming,
-    summary: summarizeCameraTiming(input.cameraBTiming.observations),
+    limitation: input.cameraBTiming.metadataAvailability === 'frame_specific'
+      ? undefined
+      : input.cameraBTiming.limitation,
+    summary: summarizeCameraTiming(
+      input.cameraBTiming.observations,
+      cameraBGapThreshold,
+    ),
+    significantGapThresholdMs: cameraBGapThreshold,
+    significantDiscontinuities: detectTimingDiscontinuities(
+      input.cameraBTiming.observations,
+      cameraBGapThreshold,
+    ),
+  };
+  const cameraAEncodingStatus = input.cameraAEncodingStatus ?? 'complete';
+  const cameraBEncodingStatus = input.cameraBEncodingStatus ?? 'complete';
+  const startupInstrumentation = input.startupInstrumentation ?? {
+    recordingId: input.recordingId,
+    experimentStartPerformanceNowMs:
+      input.clockMetadata.liveCaptureOrigin?.originPerformanceNowMs ?? 0,
+    cameraA: {},
+    cameraB: {},
+    notes: ['Startup instrumentation was not supplied by the recording runtime.'],
   };
   return {
     id: input.recordingId,
@@ -438,7 +720,17 @@ export function createStereoVideoRecording(
       input.recordingId,
       cameraATiming,
       cameraBTiming,
+      input.pairingToleranceMs,
+      startupInstrumentation,
     ),
+    startupInstrumentation,
+    status: classifyStereoRecordingStatus(
+      cameraAEncodingStatus,
+      cameraBEncodingStatus,
+    ),
+    cameraAEncodingStatus,
+    cameraBEncodingStatus,
+    errors: input.errors ?? [],
   };
 }
 
@@ -450,6 +742,30 @@ function pickMimeType(): string {
     'video/mp4',
   ];
   return candidates.find(mimeType => MediaRecorder.isTypeSupported(mimeType)) ?? '';
+}
+
+function requestedFrameRateFromTrack(track: MediaStreamTrack | undefined): number | undefined {
+  const constraint = track?.getConstraints().frameRate;
+  if (typeof constraint === 'number') return constraint;
+  if (constraint && typeof constraint === 'object') {
+    if (typeof constraint.exact === 'number') return constraint.exact;
+    if (typeof constraint.ideal === 'number') return constraint.ideal;
+    if (typeof constraint.max === 'number') return constraint.max;
+    if (typeof constraint.min === 'number') return constraint.min;
+  }
+  return undefined;
+}
+
+export function stopMediaRecorderSafely(
+  recorder: Pick<MediaRecorder, 'state' | 'stop'> | null,
+): boolean {
+  if (!recorder || recorder.state === 'inactive') return false;
+  try {
+    recorder.stop();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function downloadBlob(blob: Blob, fileName: string): void {
@@ -494,6 +810,9 @@ export function useStereoVideoRecorder(
   const cameraBSidecarRef = useRef<CameraTimingSidecar | null>(null);
   const cameraAObserverRef = useRef<TimingObserverHandle | null>(null);
   const cameraBObserverRef = useRef<TimingObserverHandle | null>(null);
+  const startupInstrumentationRef = useRef<StereoRecorderInstrumentation | null>(null);
+  const cameraEncodingFailureRef = useRef({ cameraA: false, cameraB: false });
+  const recordingErrorsRef = useRef<string[]>([]);
   const lastDiagnosticsUpdateRef = useRef(0);
 
   const updateLiveDiagnostics = useCallback((
@@ -511,12 +830,38 @@ export function useStereoVideoRecorder(
     lastDiagnosticsUpdateRef.current = now;
     const cameraA = cameraASidecarRef.current;
     const cameraB = cameraBSidecarRef.current;
+    const cameraASummary = cameraA
+      ? summarizeCameraTiming(
+          cameraA.observations,
+          cameraA.significantGapThresholdMs,
+        )
+      : null;
+    const cameraBSummary = cameraB
+      ? summarizeCameraTiming(
+          cameraB.observations,
+          cameraB.significantGapThresholdMs,
+        )
+      : null;
     setRecordingDiagnostics({
       recordingId: recordingIdRef.current,
       cameraAStatus,
       cameraBStatus,
       cameraAObservedFrameCount: cameraA?.observations.length ?? 0,
       cameraBObservedFrameCount: cameraB?.observations.length ?? 0,
+      cameraARequestedFps: cameraA?.requestedFrameRate,
+      cameraBRequestedFps: cameraB?.requestedFrameRate,
+      cameraABrowserObservedCallbackFps:
+        cameraASummary?.browserObservedCallbackFps,
+      cameraBBrowserObservedCallbackFps:
+        cameraBSummary?.browserObservedCallbackFps,
+      cameraASkippedPresentationFrames:
+        cameraASummary?.skippedFrameCount ?? 0,
+      cameraBSkippedPresentationFrames:
+        cameraBSummary?.skippedFrameCount ?? 0,
+      cameraAEncodedFpsAvailable:
+        cameraA?.encodedVideoMetrics.status === 'measured_externally',
+      cameraBEncodedFpsAvailable:
+        cameraB?.encodedVideoMetrics.status === 'measured_externally',
       durationMs: isRecordingRef.current
         ? Math.max(0, now - experimentStartRef.current)
         : 0,
@@ -531,10 +876,14 @@ export function useStereoVideoRecorder(
 
   const cancelObserver = useCallback((observer: TimingObserverHandle | null) => {
     if (!observer) return;
-    if (observer.kind === 'rvfc') {
-      observer.video.cancelVideoFrameCallback(observer.id);
-    } else {
-      cancelAnimationFrame(observer.id);
+    try {
+      if (observer.kind === 'rvfc') {
+        observer.video.cancelVideoFrameCallback(observer.id);
+      } else {
+        cancelAnimationFrame(observer.id);
+      }
+    } catch {
+      // Cleanup is best-effort; the active flag still prevents new observations.
     }
   }, []);
 
@@ -545,6 +894,13 @@ export function useStereoVideoRecorder(
     observerRef: MutableRefObject<TimingObserverHandle | null>,
   ) => {
     const sidecarRef = cameraRole === 'camera_a' ? cameraASidecarRef : cameraBSidecarRef;
+    const startupTiming = cameraRole === 'camera_a'
+      ? startupInstrumentationRef.current?.cameraA
+      : startupInstrumentationRef.current?.cameraB;
+    if (startupTiming) {
+      startupTiming.timingObserverRegisteredExperimentTimeMs =
+        performance.now() - sidecar.experimentStartPerformanceNowMs;
+    }
     sidecarRef.current = sidecar;
     if (!video) {
       sidecar.metadataAvailability = 'unavailable';
@@ -591,6 +947,13 @@ export function useStereoVideoRecorder(
           : metadata.processingDuration * 1000,
       });
       sidecarRef.current.observations.push(observation);
+      if (
+        startupTiming
+        && startupTiming.firstTimingObservationExperimentTimeMs === undefined
+      ) {
+        startupTiming.firstTimingObservationExperimentTimeMs =
+          observation.experimentTimeMs;
+      }
       previousPresentedFrames = metadata?.presentedFrames;
       previousMediaTimeSeconds = mediaTimeSeconds;
       updateLiveDiagnostics();
@@ -599,6 +962,7 @@ export function useStereoVideoRecorder(
     if (typeof video.requestVideoFrameCallback === 'function') {
       sidecar.metadataAvailability = 'frame_specific';
       sidecar.synchronizationStatus = 'unverified';
+      sidecar.limitation = undefined;
       const schedule = () => {
         const id = video.requestVideoFrameCallback((_now, rawMetadata) => {
           if (!isRecordingRef.current) return;
@@ -652,41 +1016,130 @@ export function useStereoVideoRecorder(
 
     const mimeType = pickMimeType();
     const mediaRecorderOptions = mimeType ? { mimeType } : {};
+    const wallClockStart = Date.now();
+    const experimentStartPerformanceNowMs = performance.now();
+    const recordingId = `stereo_video_${wallClockStart}`;
+    const cameraAId =
+      options.cameraA?.cameraId
+      || stream1.getVideoTracks()[0]?.getSettings().deviceId
+      || stream1.getVideoTracks()[0]?.label
+      || 'camera_a_unknown';
+    const cameraBId =
+      options.cameraB?.cameraId
+      || stream2.getVideoTracks()[0]?.getSettings().deviceId
+      || stream2.getVideoTracks()[0]?.label
+      || 'camera_b_unknown';
+    startWallClockRef.current = wallClockStart;
+    experimentStartRef.current = experimentStartPerformanceNowMs;
+    recordingIdRef.current = recordingId;
+    clockMetadataRef.current = createExperimentClockMetadata(
+      experimentStartPerformanceNowMs,
+    );
+    lastDiagnosticsUpdateRef.current = 0;
+    cameraEncodingFailureRef.current = { cameraA: false, cameraB: false };
+    recordingErrorsRef.current = [];
+    chunks1Ref.current = [];
+    chunks2Ref.current = [];
+    startupInstrumentationRef.current = {
+      recordingId,
+      experimentStartPerformanceNowMs,
+      cameraA: {},
+      cameraB: {},
+      notes: [
+        'Times are relative to the shared performance.now() origin.',
+        'MediaRecorder events and video-frame callbacks are browser/main-thread observations, not camera exposure timestamps.',
+      ],
+    };
+    cameraASidecarRef.current = createUnavailableCameraTimingSidecar(
+      recordingId,
+      'camera_a',
+      cameraAId,
+      experimentStartPerformanceNowMs,
+      'Timing observer has not started.',
+    );
+    cameraBSidecarRef.current = createUnavailableCameraTimingSidecar(
+      recordingId,
+      'camera_b',
+      cameraBId,
+      experimentStartPerformanceNowMs,
+      'Timing observer has not started.',
+    );
+    const cameraASettings = stream1.getVideoTracks()[0]?.getSettings();
+    const cameraBSettings = stream2.getVideoTracks()[0]?.getSettings();
+    cameraASidecarRef.current.resolution = cameraASettings?.width && cameraASettings?.height
+      ? { width: cameraASettings.width, height: cameraASettings.height }
+      : undefined;
+    cameraASidecarRef.current.nominalFrameRate = cameraASettings?.frameRate;
+    cameraASidecarRef.current.trackReportedFrameRate = cameraASettings?.frameRate;
+    cameraASidecarRef.current.requestedFrameRate =
+      requestedFrameRateFromTrack(stream1.getVideoTracks()[0]);
+    cameraBSidecarRef.current.resolution = cameraBSettings?.width && cameraBSettings?.height
+      ? { width: cameraBSettings.width, height: cameraBSettings.height }
+      : undefined;
+    cameraBSidecarRef.current.nominalFrameRate = cameraBSettings?.frameRate;
+    cameraBSidecarRef.current.trackReportedFrameRate = cameraBSettings?.frameRate;
+    cameraBSidecarRef.current.requestedFrameRate =
+      requestedFrameRateFromTrack(stream2.getVideoTracks()[0]);
+    const significantGapThresholdMs =
+      options.significantGapThresholdMs ?? DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS;
+    cameraASidecarRef.current.significantGapThresholdMs = significantGapThresholdMs;
+    cameraBSidecarRef.current.significantGapThresholdMs = significantGapThresholdMs;
+    let recorderA: MediaRecorder | null = null;
+    let recorderB: MediaRecorder | null = null;
 
     try {
-      const recorderA = new MediaRecorder(stream1, mediaRecorderOptions);
-      const recorderB = new MediaRecorder(stream2, mediaRecorderOptions);
-      const wallClockStart = Date.now();
-      const experimentStartPerformanceNowMs = performance.now();
-      const recordingId = `stereo_video_${wallClockStart}`;
-      const cameraAId =
-        options.cameraA?.cameraId
-        || stream1.getVideoTracks()[0]?.getSettings().deviceId
-        || stream1.getVideoTracks()[0]?.label
-        || 'camera_a_unknown';
-      const cameraBId =
-        options.cameraB?.cameraId
-        || stream2.getVideoTracks()[0]?.getSettings().deviceId
-        || stream2.getVideoTracks()[0]?.label
-        || 'camera_b_unknown';
+      recorderA = new MediaRecorder(stream1, mediaRecorderOptions);
+      recorderB = new MediaRecorder(stream2, mediaRecorderOptions);
 
-      chunks1Ref.current = [];
-      chunks2Ref.current = [];
       recorderA.ondataavailable = event => {
-        if (event.data.size > 0) chunks1Ref.current.push(event.data);
+        if (event.data.size > 0) {
+          chunks1Ref.current.push(event.data);
+          const timing = startupInstrumentationRef.current?.cameraA;
+          if (timing && timing.firstDataAvailableExperimentTimeMs === undefined) {
+            timing.firstDataAvailableExperimentTimeMs =
+              performance.now() - experimentStartPerformanceNowMs;
+          }
+        }
       };
       recorderB.ondataavailable = event => {
-        if (event.data.size > 0) chunks2Ref.current.push(event.data);
+        if (event.data.size > 0) {
+          chunks2Ref.current.push(event.data);
+          const timing = startupInstrumentationRef.current?.cameraB;
+          if (timing && timing.firstDataAvailableExperimentTimeMs === undefined) {
+            timing.firstDataAvailableExperimentTimeMs =
+              performance.now() - experimentStartPerformanceNowMs;
+          }
+        }
+      };
+      recorderA.onstart = () => {
+        const timing = startupInstrumentationRef.current?.cameraA;
+        if (timing) {
+          timing.startEventExperimentTimeMs =
+            performance.now() - experimentStartPerformanceNowMs;
+        }
+      };
+      recorderB.onstart = () => {
+        const timing = startupInstrumentationRef.current?.cameraB;
+        if (timing) {
+          timing.startEventExperimentTimeMs =
+            performance.now() - experimentStartPerformanceNowMs;
+        }
       };
       recorderA.onerror = () => {
-        setError('Camera A MediaRecorder reported an encoding error.');
+        const message = 'Camera A MediaRecorder reported an encoding error.';
+        cameraEncodingFailureRef.current.cameraA = true;
+        recordingErrorsRef.current.push(message);
+        setError(message);
         setRecordingDiagnostics(previous => ({
           ...previous,
           cameraAStatus: 'error',
         }));
       };
       recorderB.onerror = () => {
-        setError('Camera B MediaRecorder reported an encoding error.');
+        const message = 'Camera B MediaRecorder reported an encoding error.';
+        cameraEncodingFailureRef.current.cameraB = true;
+        recordingErrorsRef.current.push(message);
+        setError(message);
         setRecordingDiagnostics(previous => ({
           ...previous,
           cameraBStatus: 'error',
@@ -695,40 +1148,14 @@ export function useStereoVideoRecorder(
 
       rec1Ref.current = recorderA;
       rec2Ref.current = recorderB;
-      startWallClockRef.current = wallClockStart;
-      experimentStartRef.current = experimentStartPerformanceNowMs;
-      recordingIdRef.current = recordingId;
-      clockMetadataRef.current = createExperimentClockMetadata(
-        experimentStartPerformanceNowMs,
-      );
-      cameraASidecarRef.current = createUnavailableCameraTimingSidecar(
-        recordingId,
-        'camera_a',
-        cameraAId,
-        experimentStartPerformanceNowMs,
-        'Timing observer has not started.',
-      );
-      cameraBSidecarRef.current = createUnavailableCameraTimingSidecar(
-        recordingId,
-        'camera_b',
-        cameraBId,
-        experimentStartPerformanceNowMs,
-        'Timing observer has not started.',
-      );
-      const cameraASettings = stream1.getVideoTracks()[0]?.getSettings();
-      const cameraBSettings = stream2.getVideoTracks()[0]?.getSettings();
-      cameraASidecarRef.current.resolution = cameraASettings?.width && cameraASettings?.height
-        ? { width: cameraASettings.width, height: cameraASettings.height }
-        : undefined;
-      cameraASidecarRef.current.nominalFrameRate = cameraASettings?.frameRate;
-      cameraBSidecarRef.current.resolution = cameraBSettings?.width && cameraBSettings?.height
-        ? { width: cameraBSettings.width, height: cameraBSettings.height }
-        : undefined;
-      cameraBSidecarRef.current.nominalFrameRate = cameraBSettings?.frameRate;
       isRecordingRef.current = true;
 
       // Both encoders and both timing observers use the same monotonic origin.
+      startupInstrumentationRef.current.cameraA.startCallExperimentTimeMs =
+        performance.now() - experimentStartPerformanceNowMs;
       recorderA.start(100);
+      startupInstrumentationRef.current.cameraB.startCallExperimentTimeMs =
+        performance.now() - experimentStartPerformanceNowMs;
       recorderB.start(100);
       startTimingObserver(
         options.cameraA?.videoRef?.current ?? null,
@@ -748,14 +1175,46 @@ export function useStereoVideoRecorder(
       updateLiveDiagnostics('recording', 'recording');
     } catch (caughtError) {
       isRecordingRef.current = false;
-      setError(`Failed to start recording: ${(caughtError as Error).message}`);
-      setRecordingDiagnostics(previous => ({
-        ...previous,
+      cancelObserver(cameraAObserverRef.current);
+      cancelObserver(cameraBObserverRef.current);
+      cameraAObserverRef.current = null;
+      cameraBObserverRef.current = null;
+      stopMediaRecorderSafely(recorderA);
+      stopMediaRecorderSafely(recorderB);
+      rec1Ref.current = null;
+      rec2Ref.current = null;
+      const message = `Failed to start recording: ${(caughtError as Error).message}`;
+      recordingErrorsRef.current.push(message);
+      setError(message);
+      setIsRecording(false);
+      setRecordingDiagnostics({
+        recordingId: recordingIdRef.current,
         cameraAStatus: 'error',
         cameraBStatus: 'error',
-      }));
+        cameraAObservedFrameCount: cameraASidecarRef.current?.observations.length ?? 0,
+        cameraBObservedFrameCount: cameraBSidecarRef.current?.observations.length ?? 0,
+        cameraARequestedFps: cameraASidecarRef.current?.requestedFrameRate,
+        cameraBRequestedFps: cameraBSidecarRef.current?.requestedFrameRate,
+        cameraASkippedPresentationFrames: 0,
+        cameraBSkippedPresentationFrames: 0,
+        cameraAEncodedFpsAvailable: false,
+        cameraBEncodedFpsAvailable: false,
+        durationMs: Math.max(0, performance.now() - experimentStartRef.current),
+        cameraAMetadataAvailability:
+          cameraASidecarRef.current?.metadataAvailability ?? 'unavailable',
+        cameraBMetadataAvailability:
+          cameraBSidecarRef.current?.metadataAvailability ?? 'unavailable',
+        synchronizationStatus: 'unknown',
+      });
     }
-  }, [stream1, stream2, options, startTimingObserver, updateLiveDiagnostics]);
+  }, [
+    stream1,
+    stream2,
+    options,
+    cancelObserver,
+    startTimingObserver,
+    updateLiveDiagnostics,
+  ]);
 
   const stopRecording = useCallback((): Promise<StereoVideoRecording | null> => (
     new Promise(resolve => {
@@ -774,10 +1233,15 @@ export function useStereoVideoRecorder(
       cameraBObserverRef.current = null;
       updateLiveDiagnostics('stopping', 'stopping');
 
-      let stoppedCount = 0;
-      const tryFinalize = () => {
-        stoppedCount += 1;
-        if (stoppedCount < 2) return;
+      let finalized = false;
+      let cameraASettled = false;
+      let cameraBSettled = false;
+      let stopTimeout: ReturnType<typeof setTimeout> | null = null;
+
+      const finalize = () => {
+        if (finalized || !cameraASettled || !cameraBSettled) return;
+        finalized = true;
+        if (stopTimeout) clearTimeout(stopTimeout);
 
         const recordingId = recordingIdRef.current;
         const clockMetadata = clockMetadataRef.current;
@@ -786,11 +1250,19 @@ export function useStereoVideoRecorder(
         if (!recordingId || !clockMetadata || !cameraATiming || !cameraBTiming) {
           setError('Recording timing metadata was unavailable during finalization.');
           setIsRecording(false);
+          rec1Ref.current = null;
+          rec2Ref.current = null;
           resolve(null);
           return;
         }
 
         const resolvedMimeType = recorderA.mimeType || 'video/webm';
+        const cameraAEncodingStatus = cameraEncodingFailureRef.current.cameraA
+          ? 'failed'
+          : 'complete';
+        const cameraBEncodingStatus = cameraEncodingFailureRef.current.cameraB
+          ? 'failed'
+          : 'complete';
         const recording = createStereoVideoRecording({
           recordingId,
           name: `StereoCapture_${new Date(startWallClockRef.current).toLocaleString()}`,
@@ -803,16 +1275,38 @@ export function useStereoVideoRecorder(
           clockMetadata,
           cameraATiming,
           cameraBTiming,
+          pairingToleranceMs:
+            options.pairingToleranceMs ?? DEFAULT_PAIRING_TOLERANCE_MS,
+          startupInstrumentation: startupInstrumentationRef.current ?? undefined,
+          cameraAEncodingStatus,
+          cameraBEncodingStatus,
+          errors: [...recordingErrorsRef.current],
         });
 
         setRecordings(previous => [recording, ...previous]);
         setIsRecording(false);
         setRecordingDiagnostics({
           recordingId,
-          cameraAStatus: 'complete',
-          cameraBStatus: 'complete',
+          cameraAStatus:
+            cameraAEncodingStatus === 'complete' ? 'complete' : 'error',
+          cameraBStatus:
+            cameraBEncodingStatus === 'complete' ? 'complete' : 'error',
           cameraAObservedFrameCount: recording.cameraATiming.summary.observedFrameCount,
           cameraBObservedFrameCount: recording.cameraBTiming.summary.observedFrameCount,
+          cameraARequestedFps: recording.cameraATiming.requestedFrameRate,
+          cameraBRequestedFps: recording.cameraBTiming.requestedFrameRate,
+          cameraABrowserObservedCallbackFps:
+            recording.cameraATiming.summary.browserObservedCallbackFps,
+          cameraBBrowserObservedCallbackFps:
+            recording.cameraBTiming.summary.browserObservedCallbackFps,
+          cameraASkippedPresentationFrames:
+            recording.cameraATiming.summary.skippedFrameCount,
+          cameraBSkippedPresentationFrames:
+            recording.cameraBTiming.summary.skippedFrameCount,
+          cameraAEncodedFpsAvailable:
+            recording.cameraATiming.encodedVideoMetrics.status === 'measured_externally',
+          cameraBEncodedFpsAvailable:
+            recording.cameraBTiming.encodedVideoMetrics.status === 'measured_externally',
           durationMs: recording.duration,
           cameraAMetadataAvailability: recording.cameraATiming.metadataAvailability,
           cameraBMetadataAvailability: recording.cameraBTiming.metadataAvailability,
@@ -823,12 +1317,73 @@ export function useStereoVideoRecorder(
         resolve(recording);
       };
 
-      recorderA.onstop = tryFinalize;
-      recorderB.onstop = tryFinalize;
-      recorderA.stop();
-      recorderB.stop();
+      const settleCameraA = (failed: boolean, message?: string) => {
+        if (cameraASettled) return;
+        cameraASettled = true;
+        if (failed) cameraEncodingFailureRef.current.cameraA = true;
+        if (message) recordingErrorsRef.current.push(message);
+        finalize();
+      };
+      const settleCameraB = (failed: boolean, message?: string) => {
+        if (cameraBSettled) return;
+        cameraBSettled = true;
+        if (failed) cameraEncodingFailureRef.current.cameraB = true;
+        if (message) recordingErrorsRef.current.push(message);
+        finalize();
+      };
+
+      stopTimeout = setTimeout(() => {
+        if (!cameraASettled) {
+          settleCameraA(true, 'Camera A MediaRecorder stop timed out.');
+        }
+        if (!cameraBSettled) {
+          settleCameraB(true, 'Camera B MediaRecorder stop timed out.');
+        }
+      }, RECORDER_STOP_TIMEOUT_MS);
+
+      recorderA.onstop = () => settleCameraA(cameraEncodingFailureRef.current.cameraA);
+      recorderB.onstop = () => settleCameraB(cameraEncodingFailureRef.current.cameraB);
+      recorderA.onerror = () => settleCameraA(
+        true,
+        'Camera A MediaRecorder errored while stopping.',
+      );
+      recorderB.onerror = () => settleCameraB(
+        true,
+        'Camera B MediaRecorder errored while stopping.',
+      );
+
+      if (recorderA.state === 'inactive') {
+        settleCameraA(cameraEncodingFailureRef.current.cameraA);
+      } else {
+        try {
+          recorderA.stop();
+        } catch (caughtError) {
+          settleCameraA(
+            true,
+            `Camera A MediaRecorder stop failed: ${(caughtError as Error).message}`,
+          );
+        }
+      }
+      if (recorderB.state === 'inactive') {
+        settleCameraB(cameraEncodingFailureRef.current.cameraB);
+      } else {
+        try {
+          recorderB.stop();
+        } catch (caughtError) {
+          settleCameraB(
+            true,
+            `Camera B MediaRecorder stop failed: ${(caughtError as Error).message}`,
+          );
+        }
+      }
+
     })
-  ), [cancelObserver, options.experimentSessionId, updateLiveDiagnostics]);
+  ), [
+    cancelObserver,
+    options.experimentSessionId,
+    options.pairingToleranceMs,
+    updateLiveDiagnostics,
+  ]);
 
   const downloadRecording = useCallback((recording: StereoVideoRecording) => {
     const extension = recording.mimeType.includes('mp4') ? 'mp4' : 'webm';

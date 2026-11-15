@@ -393,6 +393,7 @@ export function ThreeDMotionCaptureView() {
                           <p className="font-medium text-sm text-white">{rec.name}</p>
                           <p className="text-xs text-gray-400 mt-0.5">
                             {dur}s &nbsp;·&nbsp; Cam1: {size1} MB &nbsp;·&nbsp; Cam2: {size2} MB
+                            &nbsp;·&nbsp; Status: {rec.status}
                           </p>
                         </div>
                         <div className="flex gap-2">

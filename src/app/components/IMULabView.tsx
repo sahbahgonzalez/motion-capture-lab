@@ -2629,7 +2629,7 @@ export function IMULabView() {
                       <div>
                         <p className="font-medium text-sm text-white">{rec.name}</p>
                         <p className="text-xs text-gray-400 mt-0.5">
-                          {Math.round(rec.duration/1000)}s · Cam1: {(rec.cam1Blob.size/1e6).toFixed(1)} MB · Cam2: {(rec.cam2Blob.size/1e6).toFixed(1)} MB
+                          {Math.round(rec.duration/1000)}s · Cam1: {(rec.cam1Blob.size/1e6).toFixed(1)} MB · Cam2: {(rec.cam2Blob.size/1e6).toFixed(1)} MB · Status: {rec.status}
                         </p>
                       </div>
                       <div className="flex gap-2">

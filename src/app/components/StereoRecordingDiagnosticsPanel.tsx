@@ -14,6 +14,10 @@ function statusColor(status: CameraRecordingStatus): string {
   return 'text-gray-500';
 }
 
+function formatFps(value: number | undefined): string {
+  return value === undefined ? 'Unavailable' : value.toFixed(2);
+}
+
 export function StereoRecordingDiagnosticsPanel({
   diagnostics,
 }: {
@@ -36,12 +40,20 @@ export function StereoRecordingDiagnosticsPanel({
           <div className="text-xs font-semibold text-gray-400">Camera A</div>
           {row('Recorder', diagnostics.cameraAStatus, statusColor(diagnostics.cameraAStatus))}
           {row('Observed frames', String(diagnostics.cameraAObservedFrameCount))}
+          {row('Requested FPS', formatFps(diagnostics.cameraARequestedFps))}
+          {row('Callback FPS', formatFps(diagnostics.cameraABrowserObservedCallbackFps))}
+          {row('Skipped observations', String(diagnostics.cameraASkippedPresentationFrames))}
+          {row('Encoded FPS', diagnostics.cameraAEncodedFpsAvailable ? 'Externally measured' : 'Unavailable')}
           {row('Timing', diagnostics.cameraAMetadataAvailability)}
         </div>
         <div className="rounded border border-gray-800 bg-gray-950/50 p-3 space-y-1.5">
           <div className="text-xs font-semibold text-gray-400">Camera B</div>
           {row('Recorder', diagnostics.cameraBStatus, statusColor(diagnostics.cameraBStatus))}
           {row('Observed frames', String(diagnostics.cameraBObservedFrameCount))}
+          {row('Requested FPS', formatFps(diagnostics.cameraBRequestedFps))}
+          {row('Callback FPS', formatFps(diagnostics.cameraBBrowserObservedCallbackFps))}
+          {row('Skipped observations', String(diagnostics.cameraBSkippedPresentationFrames))}
+          {row('Encoded FPS', diagnostics.cameraBEncodedFpsAvailable ? 'Externally measured' : 'Unavailable')}
           {row('Timing', diagnostics.cameraBMetadataAvailability)}
         </div>
         <div className="rounded border border-gray-800 bg-gray-950/50 p-3 space-y-1.5">
@@ -60,7 +72,8 @@ export function StereoRecordingDiagnosticsPanel({
         </div>
       </div>
       <p className="mt-3 text-[11px] leading-relaxed text-gray-600">
-        Synchronization describes browser presentation observations only. Hardware camera
+        Callback FPS measures browser timing observations, not encoded-video FPS. Encoded
+        frame rate and timestamp gaps require external container analysis. Hardware camera
         exposure synchronization is not verified.
       </p>
     </div>
