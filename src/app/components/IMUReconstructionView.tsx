@@ -13,6 +13,7 @@ import { Button } from './ui/button';
 import { Badge } from './ui/badge';
 import { Input } from './ui/input';
 import { useDualMediaPipePose } from '../hooks/useDualMediaPipePose';
+import type { ReconstructionRuntimeReport } from '../type/masterSession';
 import {
   triangulateAllLandmarks,
   LANDMARK_KEYS,
@@ -41,6 +42,7 @@ import {
 } from '../hooks/useIMUFusionController';
 
 interface IMUReconstructionViewProps {
+  onRuntimeConfiguration?: (report: ReconstructionRuntimeReport) => void;
   camera1Ref: RefObject<HTMLVideoElement | null>;
   camera2Ref: RefObject<HTMLVideoElement | null>;
   camera1Stream: MediaStream | null;
@@ -358,7 +360,7 @@ function SimulationPanel({
 
 export function IMUReconstructionView({
   camera1Ref, camera2Ref, camera1Stream, camera2Stream,
-  isBothCamerasActive, preloadedCalibration, onCorrectedPose,
+  isBothCamerasActive, preloadedCalibration, onCorrectedPose, onRuntimeConfiguration,
   imuReconstructionPose = null,
   fusedReconstructionPose = null,
   fusionDiagnostics = null,
@@ -445,8 +447,14 @@ export function IMUReconstructionView({
     }
   };
 
-  const { camera1Landmarks, camera2Landmarks, isLoaded: poseLoaded, error: poseError, debugInstanceId, debugStats } =
+  const { camera1Landmarks, camera2Landmarks, isLoaded: poseLoaded, isRunning: poseRunning, runtimeConfiguration, error: poseError, debugInstanceId, debugStats } =
     useDualMediaPipePose(camera1Ref.current, camera2Ref.current, isBothCamerasActive, onStereoFrameRef);
+
+  // Read-only metadata reporting: the processing loop and configuration values are unchanged.
+  useEffect(() => {
+    onRuntimeConfiguration?.({stereoCalibration: calibration,correction: config,correctionDefaults: DEFAULT_CONFIG,
+      mediaPipe:{loaded:poseLoaded,running:poseRunning,error:poseError,...runtimeConfiguration}});
+  }, [calibration,configOverrides,poseLoaded,poseRunning,poseError,onRuntimeConfiguration]);
 
   const cam1W = camera1Ref.current?.videoWidth  ?? 1280;
   const cam1H = camera1Ref.current?.videoHeight ?? 720;

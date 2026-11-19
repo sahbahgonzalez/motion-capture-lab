@@ -3,7 +3,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     environment: 'node',
-    include: ['src/**/__tests__/**/*.test.ts'],
+    include: ['src/**/_tests_/**/*.test.ts'],
   },
   server: {
     // Prevent tailwindcss/react plugin conflicts in test environment

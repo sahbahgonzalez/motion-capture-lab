@@ -1,8 +1,8 @@
 import {
   useCallback,
+  useEffect,
   useRef,
   useState,
-  type MutableRefObject,
   type RefObject,
 } from 'react';
 import type {
@@ -12,6 +12,7 @@ import type {
   ExperimentClockMetadata,
   SynchronizationStatus,
 } from '../type/experiment';
+import type { IMURecordingHandle, IMURecordingSidecars, IMURecordingSource } from '../type/imuRecording';
 
 export type CameraTimingMetadataAvailability =
   | 'frame_specific'
@@ -71,6 +72,7 @@ export interface CameraTimingSummary {
   observedFrameRate?: number;
   meanObservationIntervalMs?: number;
   observationIntervalStdDevMs?: number;
+  /** Legacy count of observations with skipped presentation frames; not significant time gaps. */
   frameGapCount: number;
   skippedFrameCount: number;
   largestObservationIntervalMs?: number;
@@ -108,6 +110,9 @@ export interface RecorderStartupTiming {
   firstDataAvailableExperimentTimeMs?: number;
   timingObserverRegisteredExperimentTimeMs?: number;
   firstTimingObservationExperimentTimeMs?: number;
+  stopCallExperimentTimeMs?: number;
+  stopEventExperimentTimeMs?: number;
+  lastDataAvailableExperimentTimeMs?: number;
 }
 
 export interface StereoRecorderInstrumentation {
@@ -188,18 +193,32 @@ export interface StereoVideoRecording {
   cam2Blob: Blob;
   mimeType: string;
   experimentSessionId?: string;
+  imuRecording?: IMURecordingSidecars;
   clockMetadata: ExperimentClockMetadata;
   cameraATiming: CameraTimingSidecar;
   cameraBTiming: CameraTimingSidecar;
   synchronizationDiagnostics: StereoSynchronizationDiagnostics;
   startupInstrumentation: StereoRecorderInstrumentation;
   status: 'complete' | 'partial' | 'failed';
+  limitations: string[];
   cameraAEncodingStatus: 'complete' | 'failed';
   cameraBEncodingStatus: 'complete' | 'failed';
   errors: string[];
 }
 
+export interface StereoRecordingIdentity { recordingId: string; experimentSessionId: string; }
+export interface StereoRecordingProgress {
+  recordingId: string;
+  originPerformanceNowMs: number;
+  phase: RecordingSession['phase'];
+  diagnostics: StereoRecordingDiagnostics;
+  instrumentation: StereoRecorderInstrumentation;
+  imu: import('../type/imuRecording').IMURecordingProgress | null;
+}
+
 export interface StereoVideoRecorderOptions {
+  onRecordingFinalized?: (recording: StereoVideoRecording) => void;
+  imuRecordingSource?: IMURecordingSource;
   cameraA?: {
     videoRef?: RefObject<HTMLVideoElement | null>;
     cameraId?: string;
@@ -377,8 +396,7 @@ export function summarizeCameraTiming(
       const browserGap =
         observation.experimentTimeMs - observations[index - 1].experimentTimeMs;
       return browserGap >= significantGapThresholdMs
-        || (observation.mediaTimeDeltaMs ?? 0) >= significantGapThresholdMs
-        || observation.skippedFramesSincePrevious > 0;
+        || (observation.mediaTimeDeltaMs ?? 0) >= significantGapThresholdMs;
     }).length,
   };
 }
@@ -397,7 +415,6 @@ export function detectTimingDiscontinuities(
     if (
       browserGap >= thresholdMs
       || (mediaGap ?? 0) >= thresholdMs
-      || current.skippedFramesSincePrevious > 0
     ) {
       discontinuities.push({
         afterSequence: previous.sequence,
@@ -632,6 +649,7 @@ interface CreateRecordingInput {
   cam2Blob: Blob;
   mimeType: string;
   experimentSessionId?: string;
+  imuRecording?: IMURecordingSidecars;
   clockMetadata: ExperimentClockMetadata;
   cameraATiming: CameraTimingSidecar;
   cameraBTiming: CameraTimingSidecar;
@@ -694,8 +712,13 @@ export function createStereoVideoRecording(
       cameraBGapThreshold,
     ),
   };
-  const cameraAEncodingStatus = input.cameraAEncodingStatus ?? 'complete';
-  const cameraBEncodingStatus = input.cameraBEncodingStatus ?? 'complete';
+  const errors = [...(input.errors ?? [])];
+  if (input.cam1Blob.size === 0) errors.push('Camera A produced an empty video blob.');
+  if (input.cam2Blob.size === 0) errors.push('Camera B produced an empty video blob.');
+  const cameraAEncodingStatus = input.cam1Blob.size === 0
+    ? 'failed' : (input.cameraAEncodingStatus ?? 'complete');
+  const cameraBEncodingStatus = input.cam2Blob.size === 0
+    ? 'failed' : (input.cameraBEncodingStatus ?? 'complete');
   const startupInstrumentation = input.startupInstrumentation ?? {
     recordingId: input.recordingId,
     experimentStartPerformanceNowMs:
@@ -714,6 +737,7 @@ export function createStereoVideoRecording(
     mimeType: input.mimeType,
     experimentSessionId: input.experimentSessionId,
     clockMetadata: input.clockMetadata,
+    ...(input.imuRecording ? {imuRecording: input.imuRecording} : {}),
     cameraATiming,
     cameraBTiming,
     synchronizationDiagnostics: buildSynchronizationDiagnostics(
@@ -730,7 +754,16 @@ export function createStereoVideoRecording(
     ),
     cameraAEncodingStatus,
     cameraBEncodingStatus,
-    errors: input.errors ?? [],
+    errors,
+    limitations: [
+      'Non-empty blobs and successful encoder completion do not verify video decodability or encoded frame coverage.',
+      'Camera exposure synchronization is not verified.',
+      ...[cameraATiming, cameraBTiming].flatMap(sidecar => [
+        ...(sidecar.limitation ? [sidecar.cameraRole + ': ' + sidecar.limitation] : []),
+        ...(sidecar.observations.length === 0
+          ? [sidecar.cameraRole + ': no browser timing observations were recorded.'] : []),
+      ]),
+    ],
   };
 }
 
@@ -786,6 +819,102 @@ function downloadJson(data: unknown, fileName: string): void {
   );
 }
 
+interface RecordingCameraSession {
+  recorder: MediaRecorder | null;
+  chunks: Blob[];
+  sidecar: CameraTimingSidecar;
+  timing: RecorderStartupTiming;
+  observer: TimingObserverHandle | null;
+  failed: boolean;
+  started: boolean;
+  settled: boolean;
+}
+
+interface RecordingSession {
+  id: string;
+  phase: 'starting' | 'recording' | 'stopping' | 'finalized';
+  origin: number;
+  wallStart: number;
+  duration: number;
+  experimentSessionId?: string;
+  pairingToleranceMs: number;
+  imuHandle?: IMURecordingHandle;
+  imuSidecars?: IMURecordingSidecars;
+  clock: ExperimentClockMetadata;
+  instrumentation: StereoRecorderInstrumentation;
+  cameras: [RecordingCameraSession, RecordingCameraSession];
+  errors: string[];
+  lastDiagnosticsUpdate: number;
+  stop: (reason?: string) => Promise<StereoVideoRecording | null>;
+}
+
+/** Additive metadata in the existing clock download keeps the six-file bundle compatible. */
+export function createRecordingClockExport(recording: StereoVideoRecording) {
+  return {
+    ...recording.clockMetadata,
+    recordingId: recording.id,
+    experimentSessionId: recording.experimentSessionId,
+    recordingSummary: {
+      status: recording.status,
+      cameraAEncodingStatus: recording.cameraAEncodingStatus,
+      cameraBEncodingStatus: recording.cameraBEncodingStatus,
+      errors: [...recording.errors],
+      limitations: [...recording.limitations, ...recording.synchronizationDiagnostics.limitations],
+      durationMs: recording.duration,
+      cameraAByteLength: recording.cam1Blob.size,
+      cameraBByteLength: recording.cam2Blob.size,
+      ...(recording.imuRecording ? {imuStreams: Object.fromEntries(
+        Object.entries(recording.imuRecording).map(([id, stream]) => [id, {
+          status: stream.status, packetCount: stream.diagnostics.packetCount,
+          invalidPacketCount: stream.diagnostics.invalidPacketCount,
+        }]),
+      )} : {}),
+      videoValidation: 'non_empty_blob_and_encoder_completion_only',
+    },
+  };
+}
+
+function cancelTimingObserver(camera: RecordingCameraSession) {
+  const observer = camera.observer;
+  camera.observer = null;
+  if (!observer) return;
+  try {
+    if (observer.kind === 'rvfc') observer.video.cancelVideoFrameCallback(observer.id);
+    else cancelAnimationFrame(observer.id);
+  } catch {
+    // The session phase also guards callbacks already queued by the browser.
+  }
+}
+
+function sessionDiagnostics(session: RecordingSession): StereoRecordingDiagnostics {
+  const [a, b] = session.cameras;
+  const summaryA = summarizeCameraTiming(a.sidecar.observations, a.sidecar.significantGapThresholdMs);
+  const summaryB = summarizeCameraTiming(b.sidecar.observations, b.sidecar.significantGapThresholdMs);
+  const status = (camera: RecordingCameraSession): CameraRecordingStatus => camera.failed
+    ? 'error' : session.phase === 'finalized' ? 'complete'
+    : session.phase === 'stopping' ? 'stopping' : 'recording';
+  return {
+    recordingId: session.id,
+    cameraAStatus: status(a), cameraBStatus: status(b),
+    cameraAObservedFrameCount: summaryA.observedFrameCount,
+    cameraBObservedFrameCount: summaryB.observedFrameCount,
+    cameraARequestedFps: a.sidecar.requestedFrameRate,
+    cameraBRequestedFps: b.sidecar.requestedFrameRate,
+    cameraABrowserObservedCallbackFps: summaryA.browserObservedCallbackFps,
+    cameraBBrowserObservedCallbackFps: summaryB.browserObservedCallbackFps,
+    cameraASkippedPresentationFrames: summaryA.skippedFrameCount,
+    cameraBSkippedPresentationFrames: summaryB.skippedFrameCount,
+    cameraAEncodedFpsAvailable: a.sidecar.encodedVideoMetrics.status === 'measured_externally',
+    cameraBEncodedFpsAvailable: b.sidecar.encodedVideoMetrics.status === 'measured_externally',
+    durationMs: session.phase === 'starting' || session.phase === 'recording'
+      ? Math.max(0, performance.now() - session.origin) : session.duration,
+    cameraAMetadataAvailability: a.sidecar.metadataAvailability,
+    cameraBMetadataAvailability: b.sidecar.metadataAvailability,
+    synchronizationStatus: a.sidecar.observations.length && b.sidecar.observations.length
+      ? 'unverified' : 'unknown',
+  };
+}
+
 export function useStereoVideoRecorder(
   stream1: MediaStream | null,
   stream2: MediaStream | null,
@@ -796,607 +925,316 @@ export function useStereoVideoRecorder(
   const [error, setError] = useState<string | null>(null);
   const [recordingDiagnostics, setRecordingDiagnostics] =
     useState<StereoRecordingDiagnostics>(EMPTY_DIAGNOSTICS);
+  const sessionRef = useRef<RecordingSession | null>(null);
+  const mountedRef = useRef(true);
+  const sequenceRef = useRef(0);
 
-  const isRecordingRef = useRef(false);
-  const rec1Ref = useRef<MediaRecorder | null>(null);
-  const rec2Ref = useRef<MediaRecorder | null>(null);
-  const chunks1Ref = useRef<Blob[]>([]);
-  const chunks2Ref = useRef<Blob[]>([]);
-  const startWallClockRef = useRef(0);
-  const experimentStartRef = useRef(0);
-  const recordingIdRef = useRef<string | null>(null);
-  const clockMetadataRef = useRef<ExperimentClockMetadata | null>(null);
-  const cameraASidecarRef = useRef<CameraTimingSidecar | null>(null);
-  const cameraBSidecarRef = useRef<CameraTimingSidecar | null>(null);
-  const cameraAObserverRef = useRef<TimingObserverHandle | null>(null);
-  const cameraBObserverRef = useRef<TimingObserverHandle | null>(null);
-  const startupInstrumentationRef = useRef<StereoRecorderInstrumentation | null>(null);
-  const cameraEncodingFailureRef = useRef({ cameraA: false, cameraB: false });
-  const recordingErrorsRef = useRef<string[]>([]);
-  const lastDiagnosticsUpdateRef = useRef(0);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      const session = sessionRef.current;
+      if (session) void session.stop('Recording interrupted by component unmount.');
+    };
+  }, []);
 
-  const updateLiveDiagnostics = useCallback((
-    cameraAStatus: CameraRecordingStatus = 'recording',
-    cameraBStatus: CameraRecordingStatus = 'recording',
-  ) => {
+  const updateDiagnostics = useCallback((session: RecordingSession, force = false) => {
+    if (!mountedRef.current || sessionRef.current !== session) return;
     const now = performance.now();
-    if (
-      cameraAStatus === 'recording'
-      && cameraBStatus === 'recording'
-      && now - lastDiagnosticsUpdateRef.current < 200
-    ) {
-      return;
-    }
-    lastDiagnosticsUpdateRef.current = now;
-    const cameraA = cameraASidecarRef.current;
-    const cameraB = cameraBSidecarRef.current;
-    const cameraASummary = cameraA
-      ? summarizeCameraTiming(
-          cameraA.observations,
-          cameraA.significantGapThresholdMs,
-        )
-      : null;
-    const cameraBSummary = cameraB
-      ? summarizeCameraTiming(
-          cameraB.observations,
-          cameraB.significantGapThresholdMs,
-        )
-      : null;
-    setRecordingDiagnostics({
-      recordingId: recordingIdRef.current,
-      cameraAStatus,
-      cameraBStatus,
-      cameraAObservedFrameCount: cameraA?.observations.length ?? 0,
-      cameraBObservedFrameCount: cameraB?.observations.length ?? 0,
-      cameraARequestedFps: cameraA?.requestedFrameRate,
-      cameraBRequestedFps: cameraB?.requestedFrameRate,
-      cameraABrowserObservedCallbackFps:
-        cameraASummary?.browserObservedCallbackFps,
-      cameraBBrowserObservedCallbackFps:
-        cameraBSummary?.browserObservedCallbackFps,
-      cameraASkippedPresentationFrames:
-        cameraASummary?.skippedFrameCount ?? 0,
-      cameraBSkippedPresentationFrames:
-        cameraBSummary?.skippedFrameCount ?? 0,
-      cameraAEncodedFpsAvailable:
-        cameraA?.encodedVideoMetrics.status === 'measured_externally',
-      cameraBEncodedFpsAvailable:
-        cameraB?.encodedVideoMetrics.status === 'measured_externally',
-      durationMs: isRecordingRef.current
-        ? Math.max(0, now - experimentStartRef.current)
-        : 0,
-      cameraAMetadataAvailability: cameraA?.metadataAvailability ?? 'unavailable',
-      cameraBMetadataAvailability: cameraB?.metadataAvailability ?? 'unavailable',
-      synchronizationStatus:
-        cameraA?.observations.length && cameraB?.observations.length
-          ? 'unverified'
-          : 'unknown',
-    });
+    if (!force && now - session.lastDiagnosticsUpdate < 200) return;
+    session.lastDiagnosticsUpdate = now;
+    setRecordingDiagnostics(sessionDiagnostics(session));
   }, []);
 
-  const cancelObserver = useCallback((observer: TimingObserverHandle | null) => {
-    if (!observer) return;
-    try {
-      if (observer.kind === 'rvfc') {
-        observer.video.cancelVideoFrameCallback(observer.id);
-      } else {
-        cancelAnimationFrame(observer.id);
-      }
-    } catch {
-      // Cleanup is best-effort; the active flag still prevents new observations.
-    }
-  }, []);
-
-  const startTimingObserver = useCallback((
-    video: HTMLVideoElement | null,
-    cameraRole: 'camera_a' | 'camera_b',
-    sidecar: CameraTimingSidecar,
-    observerRef: MutableRefObject<TimingObserverHandle | null>,
-  ) => {
-    const sidecarRef = cameraRole === 'camera_a' ? cameraASidecarRef : cameraBSidecarRef;
-    const startupTiming = cameraRole === 'camera_a'
-      ? startupInstrumentationRef.current?.cameraA
-      : startupInstrumentationRef.current?.cameraB;
-    if (startupTiming) {
-      startupTiming.timingObserverRegisteredExperimentTimeMs =
-        performance.now() - sidecar.experimentStartPerformanceNowMs;
-    }
-    sidecarRef.current = sidecar;
-    if (!video) {
-      sidecar.metadataAvailability = 'unavailable';
-      sidecar.synchronizationStatus = 'unknown';
-      sidecar.limitation = 'No video element was available when recording started.';
-      updateLiveDiagnostics();
-      return;
-    }
-    if (!sidecar.resolution && video.videoWidth > 0 && video.videoHeight > 0) {
-      sidecar.resolution = {
-        width: video.videoWidth,
-        height: video.videoHeight,
-      };
-    }
-
-    let previousPresentedFrames: number | undefined;
-    let previousMediaTimeSeconds: number | undefined;
-
-    const pushObservation = (
-      observedPerformanceNowMs: number,
-      mediaTimeSeconds: number,
-      method: RecordedCameraTimingObservation['observationMethod'],
-      mediaTimestampSource: RecordedCameraTimingObservation['mediaTimestampSource'],
-      metadata?: VideoFrameCallbackMetadataLike,
-    ) => {
-      if (!isRecordingRef.current || !sidecarRef.current) return;
-      const observation = createCameraTimingObservation({
-        recordingId: sidecar.recordingId,
-        cameraRole,
-        sequence: sidecarRef.current.observations.length,
-        experimentStartPerformanceNowMs: sidecar.experimentStartPerformanceNowMs,
-        browserObservedPerformanceNowMs: observedPerformanceNowMs,
-        browserObservedWallClockMs: Date.now(),
-        mediaTimeSeconds,
-        observationMethod: method,
-        mediaTimestampSource,
-        presentedFrames: metadata?.presentedFrames,
-        previousPresentedFrames,
-        previousMediaTimeSeconds,
-        presentationTimePerformanceNowMs: metadata?.presentationTime,
-        expectedDisplayTimePerformanceNowMs: metadata?.expectedDisplayTime,
-        processingDurationMs: metadata?.processingDuration === undefined
-          ? undefined
-          : metadata.processingDuration * 1000,
-      });
-      sidecarRef.current.observations.push(observation);
-      if (
-        startupTiming
-        && startupTiming.firstTimingObservationExperimentTimeMs === undefined
-      ) {
-        startupTiming.firstTimingObservationExperimentTimeMs =
-          observation.experimentTimeMs;
-      }
-      previousPresentedFrames = metadata?.presentedFrames;
-      previousMediaTimeSeconds = mediaTimeSeconds;
-      updateLiveDiagnostics();
-    };
-
-    if (typeof video.requestVideoFrameCallback === 'function') {
-      sidecar.metadataAvailability = 'frame_specific';
-      sidecar.synchronizationStatus = 'unverified';
-      sidecar.limitation = undefined;
-      const schedule = () => {
-        const id = video.requestVideoFrameCallback((_now, rawMetadata) => {
-          if (!isRecordingRef.current) return;
-          const metadata = (rawMetadata ?? {}) as VideoFrameCallbackMetadataLike;
-          const hasMediaTime = Number.isFinite(metadata.mediaTime);
-          pushObservation(
-            performance.now(),
-            hasMediaTime ? metadata.mediaTime! : video.currentTime,
-            'request_video_frame_callback',
-            hasMediaTime ? 'rvfc_media_time' : 'video_current_time',
-            metadata,
-          );
-          schedule();
-        });
-        observerRef.current = { kind: 'rvfc', id, video };
-      };
-      schedule();
-      return;
-    }
-
-    sidecar.metadataAvailability = 'fallback_current_time';
-    sidecar.synchronizationStatus = 'unverified';
-    sidecar.limitation =
-      'requestVideoFrameCallback is unavailable; observations use requestAnimationFrame and video.currentTime and are not frame-specific.';
-    let lastMediaTime = -1;
-    const scheduleFallback = () => {
-      const id = requestAnimationFrame(() => {
-        if (!isRecordingRef.current) return;
-        if (video.currentTime !== lastMediaTime) {
-          lastMediaTime = video.currentTime;
-          pushObservation(
-            performance.now(),
-            video.currentTime,
-            'request_animation_frame_current_time',
-            'video_current_time',
-          );
-        }
-        scheduleFallback();
-      });
-      observerRef.current = { kind: 'raf', id, video };
-    };
-    scheduleFallback();
-  }, [updateLiveDiagnostics]);
-
-  const startRecording = useCallback(() => {
+  const startRecordingWithIdentity = useCallback((identity?: StereoRecordingIdentity) => {
+    // Keep ownership until both encoders settle and the immutable output is built.
+    if (!mountedRef.current || sessionRef.current) return null;
     if (!stream1 || !stream2) {
       setError('Both camera streams must be active before recording.');
-      return;
+      return null;
     }
-    if (isRecordingRef.current) return;
-
-    const mimeType = pickMimeType();
-    const mediaRecorderOptions = mimeType ? { mimeType } : {};
-    const wallClockStart = Date.now();
-    const experimentStartPerformanceNowMs = performance.now();
-    const recordingId = `stereo_video_${wallClockStart}`;
-    const cameraAId =
-      options.cameraA?.cameraId
-      || stream1.getVideoTracks()[0]?.getSettings().deviceId
-      || stream1.getVideoTracks()[0]?.label
-      || 'camera_a_unknown';
-    const cameraBId =
-      options.cameraB?.cameraId
-      || stream2.getVideoTracks()[0]?.getSettings().deviceId
-      || stream2.getVideoTracks()[0]?.label
-      || 'camera_b_unknown';
-    startWallClockRef.current = wallClockStart;
-    experimentStartRef.current = experimentStartPerformanceNowMs;
-    recordingIdRef.current = recordingId;
-    clockMetadataRef.current = createExperimentClockMetadata(
-      experimentStartPerformanceNowMs,
-    );
-    lastDiagnosticsUpdateRef.current = 0;
-    cameraEncodingFailureRef.current = { cameraA: false, cameraB: false };
-    recordingErrorsRef.current = [];
-    chunks1Ref.current = [];
-    chunks2Ref.current = [];
-    startupInstrumentationRef.current = {
-      recordingId,
-      experimentStartPerformanceNowMs,
-      cameraA: {},
-      cameraB: {},
+    const wallStart = Date.now();
+    const origin = performance.now();
+    const id = identity?.recordingId ?? ('stereo_video_' + wallStart + '_' + sequenceRef.current++);
+    const instrumentation: StereoRecorderInstrumentation = {
+      recordingId: id, experimentStartPerformanceNowMs: origin,
+      cameraA: {}, cameraB: {},
       notes: [
         'Times are relative to the shared performance.now() origin.',
-        'MediaRecorder events and video-frame callbacks are browser/main-thread observations, not camera exposure timestamps.',
+        'MediaRecorder events and video callbacks are browser observations, not camera exposure timestamps.',
       ],
     };
-    cameraASidecarRef.current = createUnavailableCameraTimingSidecar(
-      recordingId,
-      'camera_a',
-      cameraAId,
-      experimentStartPerformanceNowMs,
-      'Timing observer has not started.',
-    );
-    cameraBSidecarRef.current = createUnavailableCameraTimingSidecar(
-      recordingId,
-      'camera_b',
-      cameraBId,
-      experimentStartPerformanceNowMs,
-      'Timing observer has not started.',
-    );
-    const cameraASettings = stream1.getVideoTracks()[0]?.getSettings();
-    const cameraBSettings = stream2.getVideoTracks()[0]?.getSettings();
-    cameraASidecarRef.current.resolution = cameraASettings?.width && cameraASettings?.height
-      ? { width: cameraASettings.width, height: cameraASettings.height }
-      : undefined;
-    cameraASidecarRef.current.nominalFrameRate = cameraASettings?.frameRate;
-    cameraASidecarRef.current.trackReportedFrameRate = cameraASettings?.frameRate;
-    cameraASidecarRef.current.requestedFrameRate =
-      requestedFrameRateFromTrack(stream1.getVideoTracks()[0]);
-    cameraBSidecarRef.current.resolution = cameraBSettings?.width && cameraBSettings?.height
-      ? { width: cameraBSettings.width, height: cameraBSettings.height }
-      : undefined;
-    cameraBSidecarRef.current.nominalFrameRate = cameraBSettings?.frameRate;
-    cameraBSidecarRef.current.trackReportedFrameRate = cameraBSettings?.frameRate;
-    cameraBSidecarRef.current.requestedFrameRate =
-      requestedFrameRateFromTrack(stream2.getVideoTracks()[0]);
-    const significantGapThresholdMs =
-      options.significantGapThresholdMs ?? DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS;
-    cameraASidecarRef.current.significantGapThresholdMs = significantGapThresholdMs;
-    cameraBSidecarRef.current.significantGapThresholdMs = significantGapThresholdMs;
-    let recorderA: MediaRecorder | null = null;
-    let recorderB: MediaRecorder | null = null;
-
-    try {
-      recorderA = new MediaRecorder(stream1, mediaRecorderOptions);
-      recorderB = new MediaRecorder(stream2, mediaRecorderOptions);
-
-      recorderA.ondataavailable = event => {
-        if (event.data.size > 0) {
-          chunks1Ref.current.push(event.data);
-          const timing = startupInstrumentationRef.current?.cameraA;
-          if (timing && timing.firstDataAvailableExperimentTimeMs === undefined) {
-            timing.firstDataAvailableExperimentTimeMs =
-              performance.now() - experimentStartPerformanceNowMs;
-          }
-        }
+    const cameras = [stream1, stream2].map((stream, index): RecordingCameraSession => {
+      const track = stream.getVideoTracks()[0];
+      const settings = track?.getSettings();
+      const config = index === 0 ? options.cameraA : options.cameraB;
+      const role = index === 0 ? 'camera_a' : 'camera_b';
+      const sidecar = createUnavailableCameraTimingSidecar(id, role,
+        config?.cameraId || settings?.deviceId || track?.label || role + '_unknown',
+        origin, 'Timing observer has not started.');
+      sidecar.resolution = settings?.width && settings?.height
+        ? { width: settings.width, height: settings.height } : undefined;
+      sidecar.nominalFrameRate = settings?.frameRate;
+      sidecar.trackReportedFrameRate = settings?.frameRate;
+      sidecar.requestedFrameRate = requestedFrameRateFromTrack(track);
+      sidecar.significantGapThresholdMs = options.significantGapThresholdMs
+        ?? DEFAULT_SIGNIFICANT_GAP_THRESHOLD_MS;
+      return {
+        recorder: null, chunks: [], sidecar,
+        timing: index === 0 ? instrumentation.cameraA : instrumentation.cameraB,
+        observer: null, failed: false, started: false, settled: false,
       };
-      recorderB.ondataavailable = event => {
-        if (event.data.size > 0) {
-          chunks2Ref.current.push(event.data);
-          const timing = startupInstrumentationRef.current?.cameraB;
-          if (timing && timing.firstDataAvailableExperimentTimeMs === undefined) {
-            timing.firstDataAvailableExperimentTimeMs =
-              performance.now() - experimentStartPerformanceNowMs;
-          }
-        }
-      };
-      recorderA.onstart = () => {
-        const timing = startupInstrumentationRef.current?.cameraA;
-        if (timing) {
-          timing.startEventExperimentTimeMs =
-            performance.now() - experimentStartPerformanceNowMs;
-        }
-      };
-      recorderB.onstart = () => {
-        const timing = startupInstrumentationRef.current?.cameraB;
-        if (timing) {
-          timing.startEventExperimentTimeMs =
-            performance.now() - experimentStartPerformanceNowMs;
-        }
-      };
-      recorderA.onerror = () => {
-        const message = 'Camera A MediaRecorder reported an encoding error.';
-        cameraEncodingFailureRef.current.cameraA = true;
-        recordingErrorsRef.current.push(message);
-        setError(message);
-        setRecordingDiagnostics(previous => ({
-          ...previous,
-          cameraAStatus: 'error',
-        }));
-      };
-      recorderB.onerror = () => {
-        const message = 'Camera B MediaRecorder reported an encoding error.';
-        cameraEncodingFailureRef.current.cameraB = true;
-        recordingErrorsRef.current.push(message);
-        setError(message);
-        setRecordingDiagnostics(previous => ({
-          ...previous,
-          cameraBStatus: 'error',
-        }));
-      };
-
-      rec1Ref.current = recorderA;
-      rec2Ref.current = recorderB;
-      isRecordingRef.current = true;
-
-      // Both encoders and both timing observers use the same monotonic origin.
-      startupInstrumentationRef.current.cameraA.startCallExperimentTimeMs =
-        performance.now() - experimentStartPerformanceNowMs;
-      recorderA.start(100);
-      startupInstrumentationRef.current.cameraB.startCallExperimentTimeMs =
-        performance.now() - experimentStartPerformanceNowMs;
-      recorderB.start(100);
-      startTimingObserver(
-        options.cameraA?.videoRef?.current ?? null,
-        'camera_a',
-        cameraASidecarRef.current,
-        cameraAObserverRef,
-      );
-      startTimingObserver(
-        options.cameraB?.videoRef?.current ?? null,
-        'camera_b',
-        cameraBSidecarRef.current,
-        cameraBObserverRef,
-      );
-
-      setIsRecording(true);
-      setError(null);
-      updateLiveDiagnostics('recording', 'recording');
-    } catch (caughtError) {
-      isRecordingRef.current = false;
-      cancelObserver(cameraAObserverRef.current);
-      cancelObserver(cameraBObserverRef.current);
-      cameraAObserverRef.current = null;
-      cameraBObserverRef.current = null;
-      stopMediaRecorderSafely(recorderA);
-      stopMediaRecorderSafely(recorderB);
-      rec1Ref.current = null;
-      rec2Ref.current = null;
-      const message = `Failed to start recording: ${(caughtError as Error).message}`;
-      recordingErrorsRef.current.push(message);
-      setError(message);
-      setIsRecording(false);
-      setRecordingDiagnostics({
-        recordingId: recordingIdRef.current,
-        cameraAStatus: 'error',
-        cameraBStatus: 'error',
-        cameraAObservedFrameCount: cameraASidecarRef.current?.observations.length ?? 0,
-        cameraBObservedFrameCount: cameraBSidecarRef.current?.observations.length ?? 0,
-        cameraARequestedFps: cameraASidecarRef.current?.requestedFrameRate,
-        cameraBRequestedFps: cameraBSidecarRef.current?.requestedFrameRate,
-        cameraASkippedPresentationFrames: 0,
-        cameraBSkippedPresentationFrames: 0,
-        cameraAEncodedFpsAvailable: false,
-        cameraBEncodedFpsAvailable: false,
-        durationMs: Math.max(0, performance.now() - experimentStartRef.current),
-        cameraAMetadataAvailability:
-          cameraASidecarRef.current?.metadataAvailability ?? 'unavailable',
-        cameraBMetadataAvailability:
-          cameraBSidecarRef.current?.metadataAvailability ?? 'unavailable',
-        synchronizationStatus: 'unknown',
+    }) as [RecordingCameraSession, RecordingCameraSession];
+    const session: RecordingSession = {
+      id, phase: 'starting', origin, wallStart, duration: 0,
+      experimentSessionId: identity?.experimentSessionId ?? options.experimentSessionId,
+      pairingToleranceMs: options.pairingToleranceMs ?? DEFAULT_PAIRING_TOLERANCE_MS,
+      clock: createExperimentClockMetadata(origin), instrumentation, cameras,
+      errors: [], lastDiagnosticsUpdate: 0,
+      stop: () => Promise.resolve(null),
+    };
+    sessionRef.current = session;
+    const onFinalized = options.onRecordingFinalized;
+    let completion: Promise<StereoVideoRecording | null> | null = null;
+    let resolveCompletion: (recording: StereoVideoRecording | null) => void = () => {};
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const fail = (camera: RecordingCameraSession, message: string) => {
+      if (session.phase === 'finalized') return;
+      camera.failed = true;
+      if (!session.errors.includes(message)) session.errors.push(message);
+      if (mountedRef.current && sessionRef.current === session) setError(message);
+    };
+    const finalize = () => {
+      if (session.phase !== 'stopping' || cameras.some(camera => !camera.settled)) return;
+      session.phase = 'finalized';
+      clearTimeout(timeout);
+      const blobs = cameras.map(camera => new Blob(camera.chunks,
+        { type: camera.recorder?.mimeType || 'video/webm' }));
+      const recording = createStereoVideoRecording({
+        recordingId: id, name: 'StereoCapture_' + new Date(wallStart).toLocaleString(),
+        startTime: wallStart, duration: session.duration,
+        cam1Blob: blobs[0], cam2Blob: blobs[1], mimeType: blobs[0].type,
+        experimentSessionId: session.experimentSessionId, clockMetadata: session.clock,
+        cameraATiming: cameras[0].sidecar, cameraBTiming: cameras[1].sidecar,
+        pairingToleranceMs: session.pairingToleranceMs, startupInstrumentation: instrumentation,
+        cameraAEncodingStatus: cameras[0].failed ? 'failed' : 'complete',
+        cameraBEncodingStatus: cameras[1].failed ? 'failed' : 'complete',
+        errors: session.errors, imuRecording: session.imuSidecars,
       });
-    }
-  }, [
-    stream1,
-    stream2,
-    options,
-    cancelObserver,
-    startTimingObserver,
-    updateLiveDiagnostics,
-  ]);
-
-  const stopRecording = useCallback((): Promise<StereoVideoRecording | null> => (
-    new Promise(resolve => {
-      const recorderA = rec1Ref.current;
-      const recorderB = rec2Ref.current;
-      if (!recorderA || !recorderB || !isRecordingRef.current) {
-        resolve(null);
-        return;
-      }
-
-      isRecordingRef.current = false;
-      const duration = Math.max(0, performance.now() - experimentStartRef.current);
-      cancelObserver(cameraAObserverRef.current);
-      cancelObserver(cameraBObserverRef.current);
-      cameraAObserverRef.current = null;
-      cameraBObserverRef.current = null;
-      updateLiveDiagnostics('stopping', 'stopping');
-
-      let finalized = false;
-      let cameraASettled = false;
-      let cameraBSettled = false;
-      let stopTimeout: ReturnType<typeof setTimeout> | null = null;
-
-      const finalize = () => {
-        if (finalized || !cameraASettled || !cameraBSettled) return;
-        finalized = true;
-        if (stopTimeout) clearTimeout(stopTimeout);
-
-        const recordingId = recordingIdRef.current;
-        const clockMetadata = clockMetadataRef.current;
-        const cameraATiming = cameraASidecarRef.current;
-        const cameraBTiming = cameraBSidecarRef.current;
-        if (!recordingId || !clockMetadata || !cameraATiming || !cameraBTiming) {
-          setError('Recording timing metadata was unavailable during finalization.');
-          setIsRecording(false);
-          rec1Ref.current = null;
-          rec2Ref.current = null;
-          resolve(null);
-          return;
+      cameras[0].failed = recording.cameraAEncodingStatus === 'failed';
+      cameras[1].failed = recording.cameraBEncodingStatus === 'failed';
+      for (const camera of cameras) {
+        cancelTimingObserver(camera);
+        if (camera.recorder) {
+          camera.recorder.ondataavailable = null;
+          camera.recorder.onstart = null;
+          camera.recorder.onstop = null;
+          camera.recorder.onerror = null;
         }
-
-        const resolvedMimeType = recorderA.mimeType || 'video/webm';
-        const cameraAEncodingStatus = cameraEncodingFailureRef.current.cameraA
-          ? 'failed'
-          : 'complete';
-        const cameraBEncodingStatus = cameraEncodingFailureRef.current.cameraB
-          ? 'failed'
-          : 'complete';
-        const recording = createStereoVideoRecording({
-          recordingId,
-          name: `StereoCapture_${new Date(startWallClockRef.current).toLocaleString()}`,
-          startTime: startWallClockRef.current,
-          duration,
-          cam1Blob: new Blob(chunks1Ref.current, { type: resolvedMimeType }),
-          cam2Blob: new Blob(chunks2Ref.current, { type: resolvedMimeType }),
-          mimeType: resolvedMimeType,
-          experimentSessionId: options.experimentSessionId,
-          clockMetadata,
-          cameraATiming,
-          cameraBTiming,
-          pairingToleranceMs:
-            options.pairingToleranceMs ?? DEFAULT_PAIRING_TOLERANCE_MS,
-          startupInstrumentation: startupInstrumentationRef.current ?? undefined,
-          cameraAEncodingStatus,
-          cameraBEncodingStatus,
-          errors: [...recordingErrorsRef.current],
-        });
-
+        camera.chunks = [];
+      }
+      if (mountedRef.current && sessionRef.current === session) {
         setRecordings(previous => [recording, ...previous]);
         setIsRecording(false);
         setRecordingDiagnostics({
-          recordingId,
-          cameraAStatus:
-            cameraAEncodingStatus === 'complete' ? 'complete' : 'error',
-          cameraBStatus:
-            cameraBEncodingStatus === 'complete' ? 'complete' : 'error',
-          cameraAObservedFrameCount: recording.cameraATiming.summary.observedFrameCount,
-          cameraBObservedFrameCount: recording.cameraBTiming.summary.observedFrameCount,
-          cameraARequestedFps: recording.cameraATiming.requestedFrameRate,
-          cameraBRequestedFps: recording.cameraBTiming.requestedFrameRate,
-          cameraABrowserObservedCallbackFps:
-            recording.cameraATiming.summary.browserObservedCallbackFps,
-          cameraBBrowserObservedCallbackFps:
-            recording.cameraBTiming.summary.browserObservedCallbackFps,
-          cameraASkippedPresentationFrames:
-            recording.cameraATiming.summary.skippedFrameCount,
-          cameraBSkippedPresentationFrames:
-            recording.cameraBTiming.summary.skippedFrameCount,
-          cameraAEncodedFpsAvailable:
-            recording.cameraATiming.encodedVideoMetrics.status === 'measured_externally',
-          cameraBEncodedFpsAvailable:
-            recording.cameraBTiming.encodedVideoMetrics.status === 'measured_externally',
-          durationMs: recording.duration,
-          cameraAMetadataAvailability: recording.cameraATiming.metadataAvailability,
-          cameraBMetadataAvailability: recording.cameraBTiming.metadataAvailability,
+          ...sessionDiagnostics(session),
           synchronizationStatus: recording.synchronizationDiagnostics.status,
         });
-        rec1Ref.current = null;
-        rec2Ref.current = null;
-        resolve(recording);
-      };
-
-      const settleCameraA = (failed: boolean, message?: string) => {
-        if (cameraASettled) return;
-        cameraASettled = true;
-        if (failed) cameraEncodingFailureRef.current.cameraA = true;
-        if (message) recordingErrorsRef.current.push(message);
+        if (recording.errors.length) setError(recording.errors.join(' '));
+      }
+      if (sessionRef.current === session) sessionRef.current = null;
+      resolveCompletion(recording);
+      try { onFinalized?.(recording); }
+      catch (cause) {
+        if (mountedRef.current) setError('Session metadata finalization failed: ' + (cause as Error).message);
+      }
+    };
+    session.stop = (reason?: string) => {
+      if (completion) return completion;
+      completion = new Promise(resolve => { resolveCompletion = resolve; });
+      session.phase = 'stopping';
+      const stopPerformanceNowMs = performance.now();
+      session.duration = Math.max(0, stopPerformanceNowMs - origin);
+      session.imuSidecars = session.imuHandle?.stop({
+        endPerformanceNowMs: stopPerformanceNowMs,
+        reason: reason ?? (session.errors.length ? 'camera_error' : 'user_stop'),
+      });
+      for (const camera of cameras) {
+        cancelTimingObserver(camera);
+        if (reason) fail(camera, reason);
+      }
+      updateDiagnostics(session, true);
+      timeout = setTimeout(() => {
+        cameras.forEach((camera, index) => {
+          if (camera.settled) return;
+          fail(camera, 'Camera ' + (index === 0 ? 'A' : 'B') + ' MediaRecorder stop timed out.');
+          stopMediaRecorderSafely(camera.recorder);
+          camera.settled = true;
+        });
         finalize();
-      };
-      const settleCameraB = (failed: boolean, message?: string) => {
-        if (cameraBSettled) return;
-        cameraBSettled = true;
-        if (failed) cameraEncodingFailureRef.current.cameraB = true;
-        if (message) recordingErrorsRef.current.push(message);
-        finalize();
-      };
-
-      stopTimeout = setTimeout(() => {
-        if (!cameraASettled) {
-          settleCameraA(true, 'Camera A MediaRecorder stop timed out.');
-        }
-        if (!cameraBSettled) {
-          settleCameraB(true, 'Camera B MediaRecorder stop timed out.');
-        }
       }, RECORDER_STOP_TIMEOUT_MS);
-
-      recorderA.onstop = () => settleCameraA(cameraEncodingFailureRef.current.cameraA);
-      recorderB.onstop = () => settleCameraB(cameraEncodingFailureRef.current.cameraB);
-      recorderA.onerror = () => settleCameraA(
-        true,
-        'Camera A MediaRecorder errored while stopping.',
-      );
-      recorderB.onerror = () => settleCameraB(
-        true,
-        'Camera B MediaRecorder errored while stopping.',
-      );
-
-      if (recorderA.state === 'inactive') {
-        settleCameraA(cameraEncodingFailureRef.current.cameraA);
-      } else {
-        try {
-          recorderA.stop();
-        } catch (caughtError) {
-          settleCameraA(
-            true,
-            `Camera A MediaRecorder stop failed: ${(caughtError as Error).message}`,
-          );
+      cameras.forEach((camera, index) => {
+        if (!camera.recorder || !camera.started) {
+          camera.settled = true;
+        } else if (!camera.settled && camera.recorder.state !== 'inactive') {
+          camera.timing.stopCallExperimentTimeMs = performance.now() - origin;
+          try { camera.recorder.stop(); }
+          catch (caughtError) {
+            fail(camera, 'Camera ' + (index === 0 ? 'A' : 'B')
+              + ' MediaRecorder stop failed: ' + (caughtError as Error).message);
+            // Retry best-effort cleanup; the timeout bounds missing stop events.
+            stopMediaRecorderSafely(camera.recorder);
+          }
         }
-      }
-      if (recorderB.state === 'inactive') {
-        settleCameraB(cameraEncodingFailureRef.current.cameraB);
-      } else {
-        try {
-          recorderB.stop();
-        } catch (caughtError) {
-          settleCameraB(
-            true,
-            `Camera B MediaRecorder stop failed: ${(caughtError as Error).message}`,
-          );
-        }
-      }
+        // Inactive encoders may still have final data/stop events queued. Wait for onstop.
+      });
+      finalize();
+      return completion;
+    };
 
-    })
-  ), [
-    cancelObserver,
-    options.experimentSessionId,
-    options.pairingToleranceMs,
-    updateLiveDiagnostics,
-  ]);
+    const startObserver = (camera: RecordingCameraSession, video: HTMLVideoElement | null) => {
+      const sidecar = camera.sidecar;
+      camera.timing.timingObserverRegisteredExperimentTimeMs = performance.now() - origin;
+      if (!video) {
+        sidecar.limitation = 'No video element was available when recording started.';
+        return;
+      }
+      if (!sidecar.resolution && video.videoWidth > 0 && video.videoHeight > 0) {
+        sidecar.resolution = { width: video.videoWidth, height: video.videoHeight };
+      }
+      let previousPresentedFrames: number | undefined;
+      let previousMediaTimeSeconds: number | undefined;
+      let lastMediaTime = -1;
+      const rvfc = typeof video.requestVideoFrameCallback === 'function';
+      sidecar.metadataAvailability = rvfc ? 'frame_specific' : 'fallback_current_time';
+      sidecar.synchronizationStatus = 'unverified';
+      sidecar.limitation = rvfc ? undefined
+        : 'requestVideoFrameCallback unavailable; video.currentTime observations are not frame-specific.';
+      const active = () => session.phase === 'recording' && sessionRef.current === session;
+      const schedule = () => {
+        if (!active()) return;
+        const callback = (_now: number, rawMetadata?: unknown) => {
+          if (!active()) return;
+          const metadata = (rawMetadata ?? {}) as VideoFrameCallbackMetadataLike;
+          if (rvfc || video.currentTime !== lastMediaTime) {
+            lastMediaTime = video.currentTime;
+            const hasMediaTime = Number.isFinite(metadata.mediaTime);
+            const mediaTimeSeconds = hasMediaTime ? metadata.mediaTime! : video.currentTime;
+            const observation = createCameraTimingObservation({
+              recordingId: id, cameraRole: sidecar.cameraRole,
+              sequence: sidecar.observations.length,
+              experimentStartPerformanceNowMs: origin,
+              browserObservedPerformanceNowMs: performance.now(), browserObservedWallClockMs: Date.now(),
+              mediaTimeSeconds, previousMediaTimeSeconds, previousPresentedFrames,
+              observationMethod: rvfc ? 'request_video_frame_callback' : 'request_animation_frame_current_time',
+              mediaTimestampSource: hasMediaTime ? 'rvfc_media_time' : 'video_current_time',
+              presentedFrames: metadata.presentedFrames,
+              presentationTimePerformanceNowMs: metadata.presentationTime,
+              expectedDisplayTimePerformanceNowMs: metadata.expectedDisplayTime,
+              processingDurationMs: metadata.processingDuration === undefined
+                ? undefined : metadata.processingDuration * 1000,
+            });
+            sidecar.observations.push(observation);
+            camera.timing.firstTimingObservationExperimentTimeMs ??= observation.experimentTimeMs;
+            previousPresentedFrames = metadata.presentedFrames;
+            previousMediaTimeSeconds = mediaTimeSeconds;
+            updateDiagnostics(session);
+          }
+          schedule();
+        };
+        camera.observer = rvfc
+          ? { kind: 'rvfc', video, id: video.requestVideoFrameCallback(callback) }
+          : { kind: 'raf', video, id: requestAnimationFrame(callback) };
+      };
+      schedule();
+    };
+
+    setError(null);
+    setIsRecording(true);
+    try {
+      session.imuHandle = options.imuRecordingSource?.start({
+        recordingId: id, experimentSessionId: session.experimentSessionId,
+        experimentStartPerformanceNowMs: origin, startTime: wallStart, clockMetadata: session.clock,
+      });
+      const mimeType = pickMimeType();
+      const recorderOptions = mimeType ? { mimeType } : {};
+      cameras.forEach((camera, index) => {
+        const label = index === 0 ? 'A' : 'B';
+        const recorder = new MediaRecorder(index === 0 ? stream1 : stream2, recorderOptions);
+        camera.recorder = recorder;
+        recorder.ondataavailable = event => {
+          if (session.phase === 'finalized' || camera.settled || event.data.size === 0) return;
+          camera.chunks.push(event.data);
+          camera.timing.lastDataAvailableExperimentTimeMs = performance.now() - origin;
+          camera.timing.firstDataAvailableExperimentTimeMs ??= performance.now() - origin;
+        };
+        recorder.onstart = () => {
+          if (session.phase !== 'finalized') camera.timing.startEventExperimentTimeMs = performance.now() - origin;
+        };
+        recorder.onerror = () => {
+          if (session.phase === 'finalized') return;
+          fail(camera, 'Camera ' + label + ' MediaRecorder reported an encoding error.');
+          void session.stop();
+          updateDiagnostics(session, true);
+        };
+        recorder.onstop = () => {
+          if (session.phase === 'finalized') return;
+          camera.timing.stopEventExperimentTimeMs = performance.now() - origin;
+          camera.settled = true;
+          if (session.phase !== 'stopping') {
+            fail(camera, 'Camera ' + label + ' MediaRecorder stopped unexpectedly.');
+            void session.stop();
+          }
+          finalize();
+        };
+      });
+      cameras.forEach(camera => {
+        if (session.phase !== 'starting') return;
+        camera.timing.startCallExperimentTimeMs = performance.now() - origin;
+        camera.recorder!.start(100);
+        camera.started = true;
+      });
+      if (session.phase === 'starting') {
+        session.phase = 'recording';
+        startObserver(cameras[0], options.cameraA?.videoRef?.current ?? null);
+        startObserver(cameras[1], options.cameraB?.videoRef?.current ?? null);
+        updateDiagnostics(session, true);
+      }
+    } catch (caughtError) {
+      for (const camera of cameras) fail(camera, 'Failed to start recording: ' + (caughtError as Error).message);
+      void session.stop();
+    }
+    return {recordingId: id, originPerformanceNowMs: origin, clockMetadata: session.clock};
+  }, [stream1, stream2, options, updateDiagnostics]);
+
+  const startRecording = useCallback(() => startRecordingWithIdentity(), [startRecordingWithIdentity]);
+  const getRecordingProgress = useCallback((): StereoRecordingProgress | null => {
+    const session = sessionRef.current;
+    if (!session) return null;
+    return {
+      recordingId: session.id, originPerformanceNowMs: session.origin, phase: session.phase,
+      diagnostics: sessionDiagnostics(session), instrumentation: structuredClone(session.instrumentation),
+      imu: session.imuHandle?.getProgress?.() ?? null,
+    };
+  }, []);
+
+  const stopRecording = useCallback((): Promise<StereoVideoRecording | null> => (
+    sessionRef.current?.stop() ?? Promise.resolve(null)
+  ), []);
 
   const downloadRecording = useCallback((recording: StereoVideoRecording) => {
     const extension = recording.mimeType.includes('mp4') ? 'mp4' : 'webm';
     const safeName = recording.name.replace(/[^a-z0-9]/gi, '_');
-    downloadBlob(recording.cam1Blob, `${safeName}_cam1.${extension}`);
-    downloadBlob(recording.cam2Blob, `${safeName}_cam2.${extension}`);
-    downloadJson(recording.cameraATiming, `${safeName}_camera_a_timing.json`);
-    downloadJson(recording.cameraBTiming, `${safeName}_camera_b_timing.json`);
-    downloadJson(recording.clockMetadata, `${safeName}_recording_clock.json`);
-    downloadJson(
-      recording.synchronizationDiagnostics,
-      `${safeName}_camera_sync_diagnostics.json`,
-    );
+    downloadBlob(recording.cam1Blob, safeName + '_cam1.' + extension);
+    downloadBlob(recording.cam2Blob, safeName + '_cam2.' + extension);
+    downloadJson(recording.cameraATiming, safeName + '_camera_a_timing.json');
+    downloadJson(recording.cameraBTiming, safeName + '_camera_b_timing.json');
+    downloadJson(createRecordingClockExport(recording), safeName + '_recording_clock.json');
+    downloadJson(recording.synchronizationDiagnostics, safeName + '_camera_sync_diagnostics.json');
+    if (recording.imuRecording) {
+      downloadJson(recording.imuRecording.imu_01, safeName + '_imu_01.json');
+      downloadJson(recording.imuRecording.imu_02, safeName + '_imu_02.json');
+    }
   }, []);
 
   const deleteRecording = useCallback((id: string) => {
@@ -1404,13 +1242,7 @@ export function useStereoVideoRecorder(
   }, []);
 
   return {
-    isRecording,
-    recordings,
-    error,
-    recordingDiagnostics,
-    startRecording,
-    stopRecording,
-    downloadRecording,
-    deleteRecording,
+    isRecording, recordings, error, recordingDiagnostics,
+    startRecording, startRecordingWithIdentity, getRecordingProgress, stopRecording, downloadRecording, deleteRecording,
   };
 }

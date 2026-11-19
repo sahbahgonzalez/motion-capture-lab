@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "tsx src/app/hooks/__tests__/runTests.ts"
+    "test": "tsx src/app/hooks/_tests_/runTests.ts && vitest run"
   },
   "dependencies": {
     "@emotion/react": "11.14.0",
@@ -49,6 +49,7 @@
     "cmdk": "1.1.1",
     "date-fns": "3.6.0",
     "embla-carousel-react": "8.6.0",
+    "fflate": "^0.8.2",
     "framer-motion": "^12.38.0",
     "input-otp": "1.4.2",
     "lucide-react": "0.487.0",
@@ -73,10 +74,11 @@
   "devDependencies": {
     "@tailwindcss/vite": "4.1.12",
     "@vitejs/plugin-react": "4.7.0",
+    "react-test-renderer": "^18.3.1",
     "tailwindcss": "4.1.12",
     "tsx": "^4.23.15",
     "vite": "6.3.5",
-    "vitest": "^5.0.5"
+    "vitest": "^3.2.4"
   },
   "peerDependencies": {
     "react": "18.3.1",

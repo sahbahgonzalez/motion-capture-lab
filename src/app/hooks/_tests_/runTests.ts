@@ -1,6 +1,6 @@
 /**
  * Lightweight test runner for the fusion controller.
- * Uses no test framework — runs with: pnpm exec tsx src/app/hooks/__tests__/runTests.ts
+ * Uses no test framework — runs with: pnpm exec tsx src/app/hooks/_tests_/runTests.ts
  *
  * Each test function throws on failure; all tests run before exit.
  * Output: PASS / FAIL per test, summary at end.
@@ -37,8 +37,8 @@ import {
   type ExperimentCalibrationMetadata,
   type ExperimentCycle,
   type IMUAlsCalibrationSnapshot,
-} from '../../types/experiment';
-import type { StereoCalibration } from '../../types/calibration';
+} from '../../type/experiment';
+import type { StereoCalibration } from '../../type/calibration';
 import { calculateJitterMetrics } from '../../utils/motionQualityMetrics';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';

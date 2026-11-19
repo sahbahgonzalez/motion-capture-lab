@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import type React from 'react';
 import { PoseLandmarker, FilesetResolver, PoseLandmarkerResult } from '@mediapipe/tasks-vision';
 import { PoseLandmarks } from './useMediaPipePose';
+import { DUAL_MEDIAPIPE_OPTIONS, DUAL_MEDIAPIPE_WASM_URL } from '../utils/poseRuntimeConfiguration';
 
 // requestVideoFrameCallback is not yet in the standard TypeScript DOM lib.
 declare global {
@@ -28,6 +29,7 @@ export function useDualMediaPipePose(
     ((lm1: PoseLandmarks | null, lm2: PoseLandmarks | null) => void) | null
   >,
 ) {
+  const runtimeOptionsRef = useRef<typeof DUAL_MEDIAPIPE_OPTIONS | null>(null);
   const [isLoaded, setIsLoaded] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   const [camera1Landmarks, setCamera1Landmarks] = useState<PoseLandmarks | null>(null);
@@ -73,20 +75,10 @@ export function useDualMediaPipePose(
     const init = async () => {
       try {
         const vision = await FilesetResolver.forVisionTasks(
-          'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm',
+          DUAL_MEDIAPIPE_WASM_URL,
         );
-        const opts = {
-          baseOptions: {
-            modelAssetPath:
-              'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task',
-            delegate: 'GPU' as const,
-          },
-          runningMode: 'VIDEO' as const,
-          numPoses: 1,
-          minPoseDetectionConfidence: 0.5,
-          minPosePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5,
-        };
+        const opts = structuredClone(DUAL_MEDIAPIPE_OPTIONS);
+        runtimeOptionsRef.current = opts;
         const [lm1, lm2] = await Promise.all([
           PoseLandmarker.createFromOptions(vision, opts),
           PoseLandmarker.createFromOptions(vision, opts),
@@ -310,6 +302,7 @@ export function useDualMediaPipePose(
     camera1Landmarks,
     camera2Landmarks,
     error,
+    runtimeConfiguration: {wasmUrl: DUAL_MEDIAPIPE_WASM_URL, options: runtimeOptionsRef.current},
     debugInstanceId: debugInstanceId.current,
     debugStats: debugStatsRef,
   };

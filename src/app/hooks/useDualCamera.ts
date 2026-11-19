@@ -27,6 +27,10 @@ export function useDualCamera() {
   const camera1Ref = useRef<HTMLVideoElement | null>(null);
   const camera2Ref = useRef<HTMLVideoElement | null>(null);
 
+  const mountedRef = useRef(true);
+  const liveStreamsRef = useRef({camera1: camera1Stream, camera2: camera2Stream});
+  liveStreamsRef.current = {camera1: camera1Stream, camera2: camera2Stream};
+
   // Enumerate available cameras
   const enumerateCameras = useCallback(async () => {
     try {
@@ -190,6 +194,7 @@ export function useDualCamera() {
 
   // Start camera 1
   const startCamera1 = useCallback(async (deviceId: string) => {
+    if (!mountedRef.current) return;
     try {
       console.log('🎬 Starting Camera 1 with deviceId:', deviceId);
 
@@ -212,6 +217,7 @@ export function useDualCamera() {
 
       console.log('📹 Requesting Camera 1 stream with constraints:', constraints);
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      if (!mountedRef.current) { stream.getTracks().forEach(track => track.stop()); return; }
 
       const videoTrack = stream.getVideoTracks()[0];
       console.log('✅ Camera 1 started:', videoTrack.label);
@@ -247,6 +253,7 @@ export function useDualCamera() {
 
   // Start camera 2
   const startCamera2 = useCallback(async (deviceId: string) => {
+    if (!mountedRef.current) return;
     try {
       console.log('🎬 Starting Camera 2 with deviceId:', deviceId);
 
@@ -269,6 +276,7 @@ export function useDualCamera() {
 
       console.log('📹 Requesting Camera 2 stream with constraints:', constraints);
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      if (!mountedRef.current) { stream.getTracks().forEach(track => track.stop()); return; }
 
       const videoTrack = stream.getVideoTracks()[0];
       console.log('✅ Camera 2 started:', videoTrack.label);
@@ -344,20 +352,14 @@ export function useDualCamera() {
     });
   }, [isCamera1Active, isCamera2Active, camera1Stream, camera2Stream]);
 
-  // Cleanup on unmount only
+  // Read current streams instead of the initial null values captured by a mount-only effect.
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
-      // Clean up streams on unmount
-      console.log('🧹 Cleaning up camera streams on unmount');
-      if (camera1Stream) {
-        camera1Stream.getTracks().forEach((track) => track.stop());
-      }
-      if (camera2Stream) {
-        camera2Stream.getTracks().forEach((track) => track.stop());
-      }
+      mountedRef.current = false;
+      for (const stream of Object.values(liveStreamsRef.current)) stream?.getTracks().forEach(track => track.stop());
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // Empty deps - only run on mount/unmount
+  }, []);
 
   return {
     camera1Stream,

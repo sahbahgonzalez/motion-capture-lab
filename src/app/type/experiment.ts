@@ -154,7 +154,8 @@ export interface NormalizedQuaternion {
 export interface BrowserReceiverTimestamp {
   performanceNowMs: number;
   wallClockMs?: number;
-  receiverTimeNs?: number;
+  /** New IMU archives use exact decimal strings; numbers remain accepted for legacy exports. */
+  receiverTimeNs?: number | string;
   receiverTimeUtc?: string;
 }
 
@@ -174,12 +175,13 @@ export interface IMUPacketSynchronization {
 export interface ExperimentIMUPacket {
   packetId: string;
   sensorId: 'imu_01' | 'imu_02';
-  sensorTimestampUs: number;
-  sequence: number;
+  /** Null when absent or invalid; original transport values belong in the raw packet archive. */
+  sensorTimestampUs: number | null;
+  sequence: number | null;
   browserReceiverTimestamp: BrowserReceiverTimestamp;
   experimentReceiveTimeMs: number;
   normalizedQuaternion: NormalizedQuaternion | null;
-  accuracy?: number;
+  accuracy?: number | null;
   validity: IMUPacketValidity;
   synchronization: IMUPacketSynchronization;
 }

@@ -1,6 +1,6 @@
 # Motion Capture Lab
 
-A web-based 2D and 3D motion capture application powered by MediaPipe Pose Landmarker and stereo computer vision. Capture real-world millimeter-accurate 3D joint positions in real time using two ordinary webcams — no specialized hardware required.
+A web-based 2D and 3D motion capture application powered by MediaPipe Pose Landmarker and stereo computer vision. Stereo estimates use calibration units (millimeters), which does not establish millimeter-level human pose accuracy. Thesis evaluation targets relative availability, continuity, stability, angle consistency and recovery.
 
 ---
 
@@ -47,6 +47,8 @@ A web-based 2D and 3D motion capture application powered by MediaPipe Pose Landm
    - [Physical Camera Timing Findings](#physical-camera-timing-findings)
    - [Stage 1 — Experiment Infrastructure](#stage-1--standardized-thesis-experiment-infrastructure)
    - [Stage 2A — Dual-Camera Timing](#stage-2a--standardized-dual-camera-recording-and-timing)
+   - [Stage 2B - Independent IMU Recording](#stage-2b---independent-timestamped-imu-recording)
+   - [Stage 2C - Unified Master Sessions](#stage-2c---unified-master-experimental-session)
    - [Uniform Physical Camera Retest Procedure](#uniform-physical-camera-retest-procedure)
 9. [Technology Stack](#technology-stack)
 10. [Data Format](#data-format)
@@ -67,7 +69,7 @@ A web-based 2D and 3D motion capture application powered by MediaPipe Pose Landm
 - Real-world X/Y/Z coordinates in millimeters from two ordinary webcams
 - Full stereo calibration pipeline: checkerboard → OpenCV → projection matrices
 - DLT triangulation implemented from scratch in TypeScript — no server required
-- Live wrist tracking with sub-centimeter accuracy when well calibrated
+- Live wrist tracking with stereo-derived coordinates; absolute human pose accuracy is not established.
 
 ---
 
@@ -761,7 +763,7 @@ Each WebSocket message is a JSON object:
 - 2 = Medium
 - 3 = High (full sensor fusion active)
 
-IMU packets are written directly to a ref at the full hardware rate (typically 50–100 Hz). React state is synchronized at **10 Hz** only for the UI display. All reconstruction math reads from the ref so it never misses a high-frequency update.
+Live IMU processing stores only the latest packet per sensor in refs; React state refreshes at 10 Hz for display. Reconstruction reads that latest value and does not process every hardware sample. Stage 2B independently archives every sensor-attributable message delivered to the active browser socket during the camera recording window, before live validation and normalization.
 
 ---
 
@@ -2215,19 +2217,19 @@ See [Automated Test Suite](#automated-test-suite) below.
 
 ### Automated Test Suite
 
-The fusion controller is tested by a framework-free TypeScript runner that imports the `createFusionController()` factory directly. No React dependency, no Vite plugin — runs in a plain Node.js environment via `tsx`.
+The normal test command runs the standalone TypeScript runner (38 cases) and five Vitest suites: 20 existing fusion cases, 26 Stage 2A recording cases, 38 Stage 2B archive cases, 14 Stage 2B integration cases, and 31 Stage 2C master-session cases. This is **167 test executions in total**, including mirrored fusion coverage.
 
 #### Run the tests
 
 ```bash
-pnpm test
-# or explicitly:
-pnpm exec tsx src/app/hooks/__tests__/runTests.ts
+npm test
+# Standalone runner only:
+npx tsx src/app/hooks/_tests_/runTests.ts
+# Vitest suites only:
+npx vitest run
 ```
 
-#### Why a custom runner (not vitest)
-
-Vitest 5.x auto-merges with `vite.config.ts`. The `@tailwindcss/vite` plugin exposes a function in its `assetsInclude` option, which Vitest passes to `path.resolve()` internally — causing a crash (`The "path" argument must be of type string. Received function`). Extracting `createFusionController()` as a pure TypeScript factory (no React import) and running tests with `tsx` avoids the plugin entirely.
+Vitest 3.2.x is compatible with the project's Vite 6.3.5. Its dedicated configuration discovers `_tests_` files without loading the application's React/Tailwind plugins. React test renderer exercises recording hook updates and unmount effects without opening physical cameras. The existing fusion test expectations count the RECOVERY entry frame separately from subsequent confirmation frames; fusion implementation is unchanged.
 
 #### Pipeline 4 regression cases (20)
 
@@ -2279,15 +2281,15 @@ This design prevents differences in subject motion, camera timing, warm-up, occl
 | One reusable Camera A + B video bundle | **Implemented** | Stage 2A |
 | Independent Camera A/B timing sidecars | **Implemented** | rVFC preferred, explicitly marked fallback otherwise |
 | Camera timing gap/startup instrumentation | **Implemented** | Stage 2A hardening |
-| Recorded `imu_01` and `imu_02` streams | **Pending Stage 2B** | Do not infer IMU replay from current live WebSocket state |
-| One capture controller for camera + IMU | **Pending** | Will use the existing video recorder rather than replace it |
+| Recorded `imu_01` and `imu_02` streams | **Implemented - Stage 2B** | Independent ingress buffers, exact camera recording ID/origin and stop boundary, raw packet JSON sidecars; replay remains pending |
+| Master four-stream session and ZIP | **Implemented - Stage 2C** | Existing camera/IMU recorders share a UUID and origin; versioned raw-session manifest, runtime configuration journal and one ZIP |
 | Shared deterministic playback clock | **Pending** | Camera A media time is the planned playback authority |
-| Central warm-up and measurement enforcement | **Schema defined; runtime pending** | Metrics are not yet automatically gated by the protocol |
+| Stabilization and evaluation-window marker | **Implemented - Stage 2C** | Retained warmup, browser readiness checks and explicit evaluation timestamp; metric gating belongs to Stage 3/4 |
 | Timestamp-driven occlusion schedules | **Schema defined; runtime pending** | No scheduled injection is active yet |
 | P4 fused-pose time-series recording/replay | **Pending** | Current P4 fusion remains live |
 | Identical metric window across P1–P4 | **Target protocol; runtime pending** | Existing metric formulas will be reused unchanged |
 
-The current app therefore has a standardized camera master and experiment contracts, but it does **not yet** provide a fully synchronized camera+IMU replay session. Thesis data collection should wait until the pending capture and playback stages are complete.
+The IMU lab can now record cameras and both raw IMU streams against one browser experiment origin. This does **not** establish hardware synchronization or provide deterministic replay. Stage 2C now packages these inputs and runtime snapshots in one ZIP. Deterministic playback remains pending; validate raw captures physically before accepting experimental inputs.
 
 ### Uniform cross-pipeline rules
 
@@ -2328,7 +2330,7 @@ The complete intended lifecycle is:
    ├─ Camera B WebM + independent timing sidecar
    ├─ shared recording-clock metadata
    ├─ camera synchronization diagnostics
-   └─ imu_01 / imu_02 packet streams (Stage 2B, pending)
+   └─ imu_01 / imu_02 packet streams (Stage 2B implemented in the IMU lab)
 
 4. FINALIZE AND VALIDATE
    ├─ stop all producers transactionally
@@ -2466,7 +2468,7 @@ Stage 1 defines the versioned experiment contract and adds explicit experiment t
 
 ### Experiment schema
 
-**Source:** `src/app/types/experiment.ts`
+**Source:** `src/app/type/experiment.ts`
 
 `ExperimentSession` is the top-level V1 session structure (`schemaVersion: "1.0.0"`). It contains:
 
@@ -2669,29 +2671,32 @@ The recording metadata now captures lightweight timing markers for each encoder:
 - Timing-observer registration time
 - First timing observation time
 
-Each camera sidecar also records significant browser-observation or camera-media-time discontinuities above a configurable threshold (100 ms by default), plus any `presentedFrames` gaps. These measurements can distinguish browser callback stalls from media-timeline discontinuities, but they do not identify encoded frame timestamps. Encoded startup gaps still require external inspection of the WebM frame timestamps.
+Each camera sidecar records significant browser-observation or camera-media-time gaps greater than or equal to a configurable threshold (100 ms by default). These alone contribute to `significantGapCount` and `significantDiscontinuities`. Separately, `skippedFramesSincePrevious`, `skippedFrameCount`, and the legacy `frameGapCount` retain skipped browser presentation observations; a skipped observation below the time threshold is not a significant time gap. These measurements can distinguish browser callback stalls from media-timeline discontinuities, but they do not identify encoded frame timestamps. Encoded startup gaps still require external inspection of the WebM frame timestamps.
 
 ### Recorder failure behavior
 
-- If either encoder fails during startup, any encoder that already started is stopped and timing observers are cancelled.
-- Stop and error events settle independently for Camera A and Camera B.
-- A five-second stop timeout prevents unresolved stop promises.
-- Final recordings are labelled `complete`, `partial`, or `failed`, with per-camera encoding status and errors.
-- Every start resets chunks, timing observations, counters, errors, and startup instrumentation.
-- A frame-specific timing observer clears the temporary `"Timing observer has not started."` limitation before export.
+- Each recording owns its chunks, sidecars, encoder handlers, clock, start options, and completion promise. Start requests are ignored until the prior session has fully finalized; repeated stop requests share the same promise.
+- If either encoder fails during startup, already-started encoders are stopped and the session is retained as failed. Restart remains blocked until rollback settles.
+- Mid-recording encoding errors or unexpected encoder stops trigger coordinated finalization of both cameras. Timing callbacks cannot restore an error status to `recording`.
+- Final data chunks are accepted until each encoder's stop event. An inactive encoder may still have queued data/stop events, so it is not finalized prematurely. A five-second timeout bounds missing stop events; affected cameras are marked failed.
+- A camera is complete only if its encoder completes without errors and its resulting blob is non-empty. Two complete cameras produce `complete`, one produces `partial`, and none produces `failed`. Empty-output errors are explicit.
+- On unmount, timing observers are cancelled immediately and active encoders are stopped. Pending stop events can drain until the timeout, then handlers are detached. No unmounted React state is updated and finalized recordings cannot be changed by late events. An active capture interrupted by unmount is marked failed; in-memory results are not persisted across navigation.
+- Successful frame-specific observers clear the temporary `"Timing observer has not started."` limitation.
+
+Validation checks non-empty blobs and encoder completion. It does **not** prove video decodability, encoded frame coverage, encoded FPS, exposure synchronization, or pose accuracy. Missing browser timing is exported as a limitation and does not by itself mean encoding failed.
 
 ### Download bundle
 
-The existing Video Recording tabs now download six associated files:
+The camera-only Video Recording tabs download six associated files (the IMU lab appends two Stage 2B sidecars):
 
 1. Camera A video (`*_cam1.webm` or MP4)
 2. Camera B video (`*_cam2.webm` or MP4)
 3. Camera A timing sidecar
 4. Camera B timing sidecar
-5. Shared recording clock metadata
+5. Shared recording clock metadata with additive `recordingId`, optional `experimentSessionId`, and `recordingSummary`
 6. Camera synchronization diagnostics
 
-All metadata files contain or inherit the stereo recording ID needed for future `ExperimentSession` association.
+The existing six camera files are preserved. The clock JSON keeps its original clock fields and adds a `recordingSummary` with overall status, per-camera encoding status, errors, limitations, byte sizes, monotonic duration, and the validation scope. Other metadata retains recording IDs, camera identities, and startup instrumentation for future `ExperimentSession` association.
 
 ### Recording diagnostics UI
 
@@ -2710,23 +2715,20 @@ The Video Recording tabs for the stereo, correction, and IMU labs display:
 
 ### Stage 2A tests
 
-The framework-free runner now executes **44 tests**. Tests 32–44 verify:
+`npm test` runs **167 test executions**: 38 standalone cases, 20 existing Vitest fusion cases, 52 Stage 2B cases, 31 Stage 2C cases, and **26 Stage 2A regression cases** in `src/app/hooks/_tests_/stereoVideoRecorder.test.ts`. The standalone runner's camera tests are cases 32-38; it does not contain cases 39-44.
 
-| # | Test | What it verifies |
-|---|---|---|
-| 32 | Shared camera clock | Both sidecars derive experiment time from one monotonic origin |
-| 33 | Media timestamp preservation | Camera media and presentation timestamps are retained exactly |
-| 34 | Independent Camera B observations | Camera B has its own frame reference, media time, and observation time |
-| 35 | Frame-gap detection | `presentedFrames` gaps produce skipped-frame diagnostics |
-| 36 | Missing timing metadata | Unavailable metadata produces an explicit empty sidecar without invented frames |
-| 37 | Existing recording behavior | Both video blobs, MIME type, and duration remain intact |
-| 38 | Export association | Camera sidecars and synchronization diagnostics retain the correct recording ID |
-| 39 | Pairing tolerance and uniqueness | Matching is one-to-one, tolerance-bounded, and reports both unmatched counts |
-| 40 | Offset statistics | Mean, median, nearest-rank p95, and maximum absolute callback offsets are correct |
-| 41 | Empty and irregular streams | Missing observations and callback interval variation are handled explicitly |
-| 42 | Large discontinuities | Browser and camera-media timeline gaps are instrumented without interpolation |
-| 43 | Recorder failures | Safe cleanup and partial/failed status classification remain deterministic |
-| 44 | Final metadata consistency | Stale startup text is cleared and encoded metrics remain honestly unavailable |
+The recording regressions exercise the real hook with mocked MediaRecorder/video callbacks, React lifecycle effects, and fake monotonic time:
+
+| Coverage | Verification |
+|---|---|
+| Session ownership | Restart blocking during finalization/rollback, repeated-stop promise identity, isolated buffers/IDs, late encoder and timing events, immutable start options |
+| Output classification | Both non-empty, each single-camera empty case, both empty, retained final chunks, correct complete/partial/failed statuses |
+| Encoder failures | Mid-recording errors, inactive encoders with queued final data, unexpected stops, startup/constructor failures, stop exceptions, five-second timeouts |
+| Cleanup | rVFC and rAF cancellation, deduplicated fallback times, unmount during capture/finalization, missing stop events, handler/timer disposal, unchanged finalized recordings |
+| Exports and clocks | Actual six-download path, durable status/errors/limitations, shared monotonic origin, independent media times, startup instrumentation |
+| Timing semantics | Subthreshold skipped observations kept separate, exact 100 ms boundary, media-only gaps, tolerance/uniqueness, signed/absolute statistics, no invented exposure uncertainty |
+
+These are automated software checks. **No physical camera testing is established by these tests.** Retest real cameras and inspect encoded videos independently before accepting experimental input sessions. Stage 2B packet recording is implemented below; deterministic replay remains pending.
 
 ### Uniform physical camera retest procedure
 
@@ -2753,6 +2755,167 @@ ffprobe -v error \
 10. Calculate encoded frame count, encoded FPS, and consecutive encoded timestamp gaps from that output. Do not substitute sidecar callback FPS.
 11. Retain the raw bundle and derived external timing report under the same recording/session ID.
 12. Once common replay is implemented, run P1–P4 from this one accepted master bundle rather than recapturing the movement in each lab.
+
+---
+
+## Stage 2B - Independent Timestamped IMU Recording
+
+### Scope and controls
+
+In **3D + Failure Correction + IMU**, starting Video Recording opens independent archives for `imu_01` (right upper arm) and `imu_02` (right forearm). The existing camera recorder supplies its exact recording ID, `performance.now()` origin, and stop boundary. Both IMU archives close synchronously when stop is requested, including camera error, startup rollback, and unmount; they do not continue until encoder finalization finishes. The Stage 2A guard still blocks another camera session while finalization is pending.
+
+Every attributable WebSocket message delivered during that window is appended before live validation or normalization, independently of React's display interval, visual reliability, calibration, or fusion activation. Invalid sensor packets remain in their sensor archive. Unparseable messages and messages without a supported sensor identity are retained in a separate shared `unassignedMessages` log included in both files; they are not counted as packets for either sensor. Live latest-packet processing continues before, during, and after recording, with its existing normalized quaternion and fallback behavior. Experimental archives never use those fallback zeros.
+
+Camera-only labs keep their existing six-file downloads. The IMU lab's same download button produces **eight files**, appending `*_imu_01.json` and `*_imu_02.json`. Rows show each stream's packet count. An empty IMU stream does not change the camera encoding status; inspect the IMU sidecars separately.
+
+### Recording schema and clocks
+
+Sources:
+
+- `src/app/type/imuRecording.ts`: versioned sidecars, diagnostics and lifecycle interfaces
+- `src/app/utils/imuRecording.ts`: raw ingress archive and conservative diagnostics
+- `src/app/hooks/useIMUWebSocket.ts`: receipt timestamping, socket identity and connection events
+- `src/app/hooks/useStereoVideoRecorder.ts`: camera-owned recording boundary and downloads
+
+Each sidecar has `schemaVersion: "1.0.0-imu-recording"` and contains:
+
+| Field | Meaning |
+|---|---|
+| `recordingId`, optional `experimentSessionId`, `startTime` | Same association and human-readable correlation as the camera recording |
+| `experimentStartPerformanceNowMs`, `clockMetadata` | Exact camera experiment origin and clock declaration |
+| `endPerformanceNowMs`, `durationMs`, `stopReason` | Frozen camera stop boundary, independent of finalization latency |
+| `sensorId`, `segment`, `quaternionOrdering` | Sensor assignment and scalar-first `wxyz` ordering |
+| `clockDefinitions` | Browser receipt source, microsecond ESP32 timestamp field, unknown sensor clock origin, unverified upstream receiver clock, hardware synchronization false |
+| `packets` | All messages attributed to this sensor, in browser arrival order |
+| `connectionAtStart`, `connectionEvents` | Socket state/URL/connection identity and timestamped connection changes |
+| `unassignedMessages` | Shared malformed/unattributable message log; do not double-count across the two files |
+| `status`, `diagnostics`, `limitations` | `recorded` or `empty` describes presence, not synchronization or complete sensor delivery |
+
+Every packet preserves the original `rawMessage` and parsed `rawFields`, including `sensor_id`, `timestamp_us`, `sequence`, `qw/qx/qy/qz`, `accuracy` and extra upstream fields. Binary UTF-8 JSON messages also retain exact bytes as `rawBinaryHex`. A separate normalized quaternion is a convenience; raw quaternions are never replaced. Missing/invalid interpreted timestamps and sequences are `null`, with explicit per-field missing/invalid flags and validation issues. Optional upstream receiver metadata is also flagged explicitly. Raw text preserves numeric lexemes that JavaScript numbers cannot represent exactly.
+
+`ExperimentIMUPacket` now permits nullable sensor timestamps, sequence numbers and accuracy, preserving existing valid packet shapes. The richer Stage 2B packet type extends this contract; Stage 2C below adds master packaging without changing those packet measurements.
+
+`browserReceiverTimestamp.performanceNowMs` is sampled as the first operation in the current socket's message handler, before JSON parsing. Its experiment timestamp is:
+
+```text
+experimentReceiveTimeMs = browserReceiptPerformanceNowMs - cameraExperimentStartPerformanceNowMs
+```
+
+Upstream `receiver_time_ns` is optional metadata. A nonnegative decimal integer token or decimal string is extracted from the original top-level JSON field without using a rounded JavaScript number for validation. New exports store its exact digits as a JSON string in `rawFields.receiver_time_ns` and `browserReceiverTimestamp.receiverTimeNs`; the original `rawMessage` is unchanged. The timestamp type still accepts numbers when reading legacy exports. Missing/malformed receiver nanoseconds or UTC fields retain separate `metadataValidity` flags and `validationIssues`, but do not affect core packet validity, rejection reasons, or invalid-packet counts. Sensor timestamps, sequence numbers, accuracy, quaternion processing and browser experiment clocks are unchanged. Old recordings can be revalidated from retained `rawMessage` values and original browser receipt timestamps; low-order nanosecond digits cannot be reconstructed from an already rounded numeric field alone.
+
+ESP32 `timestamp_us` remains a separate sensor clock. No offset, drift correction, hardware sampling alignment, or exposure synchronization is inferred. `Date.now()` is optional correlation only. Packets are timestamped when their browser handler runs, so main-thread stalls and bridge/network buffering can affect receipt timing.
+
+### Diagnostics and failure behavior
+
+- Packet count includes all sensor-attributable messages; valid/invalid counts describe metadata/quaternion validation. Receipt rate is `(N-1)/(last-first)`, or `null` when unmeasurable. Per-sensor receipt gaps of at least 100 ms and leading/trailing silence are retained.
+- Duplicate sequences, backwards sequences, sensor-clock rollback/reset candidates, and forward counter gaps are counted. Missing-sequence estimates apply only between valid observed counters within a connection epoch. Reordering, rollback or invalid sequence metadata makes the reliable missing count `null`; the forward-gap count remains explicitly an inference. Reconnects reset counter comparisons and do not fabricate loss between epochs. No estimate covers data before the first packet, after the last packet, or during an unknown outage.
+- Socket open/close/error/reconnect/construction-failure/unmount events retain browser timestamps and details. An established connection transitioning away from open counts once as an interruption; error followed by close is not two outages. Sensor silence without a socket change is visible through packet gaps or an empty stream, not a fabricated disconnect event.
+- Old sockets have handlers detached, and saved/queued callbacks from replaced or unmounted sockets are ignored. Explicit reconnect remains available; automatic reconnection is not added.
+- Both buffers are isolated per recording, and repeated stop calls return the same completed sidecars. Camera error or unmount closes ingestion immediately. Completed exports cannot receive later packets.
+- Data remains in memory until downloaded. This records every message delivered to the active browser socket during the recording window, not packets lost upstream or never delivered. Empty/invalid streams require inspection; `recorded` is not an experimental acceptance verdict.
+
+### Automated verification
+
+`npm test` executes **167 cases**: 84 Stage 1/2A/fusion executions, 38 IMU archive cases, 14 IMU integration cases, and 31 Stage 2C cases. Stage 2B checks packet bursts between React refreshes, independent buffers, raw quaternion preservation, nullable invalid metadata, exact shared origins and stop boundaries, pre-parse timestamps, malformed/binary messages, sequence diagnostics, disconnected sensors, reconnects/stale callbacks, startup/error/unmount/timeout paths, repeated sessions, and the actual eight-download JSON path. These are mocked software checks, not physical camera/IMU validation.
+
+### Physical validation with two cameras and two IMUs
+
+1. Start the existing WebSocket bridge at the configured endpoint (default `ws://localhost:8765`). Confirm IDs `imu_01` and `imu_02` and live updates from both. Start both cameras in the IMU lab and let them stabilize. IMU calibration/fusion need not be active to archive packets.
+2. Record a 15-20 second trial with both sensors streaming and both cameras active. Stop, wait for finalization, then download all eight files. Allow browser multiple-download permission if needed.
+3. Check camera status and independently inspect both videos. Verify both IMU sidecars and camera sidecars have identical recording IDs/origins and identical camera/IMU durations. Confirm receipt times are nonnegative and within the frozen capture window. Check each sensor's raw quaternion/timestamp/sequence fields, packet count, receipt rate, validation issues and timing gaps.
+4. Repeat while fusion is inactive and while reconstruction is running. Packet retention must not depend on failure-trigger activation; rates can still reflect browser/transport workload. Compare retained counters with available bridge/device logs; browser counts alone cannot establish upstream completeness.
+5. Record a controlled interruption of one sensor while the other continues. Check only the affected stream shows silence/gaps. Separately interrupt/reconnect the WebSocket and check connection events, new connection identity, and resumed packet histories without inferred loss across epochs.
+6. Record a trial with one sensor absent and a trial with both absent. Camera recording should still finalize, with explicit empty IMU sidecars. Stop/start repeated trials and verify new IDs and fresh buffers with no prior-session packets.
+7. Test a camera stop/error or navigation away during capture. Encoders and sockets should close safely; navigation intentionally does not persist the in-memory recording. Download successful runs before leaving the lab.
+
+Stage 2C packaging is implemented below. Deterministic replay, P4 fused-output replay/recording and evaluation remain pending. No absolute pose-accuracy claim follows from these recordings.
+
+---
+
+## Stage 2C - Unified Master Experimental Session
+
+### User workflow and controller
+
+In the IMU lab, **Start Master Session** coordinates Camera A, Camera B, IMU 01 and IMU 02 through `useMasterExperimentRecorder`. It wraps `useStereoVideoRecorder` and its existing ingress IMU handle; it does not create another camera recorder, WebSocket, MediaPipe instance or fusion pipeline. Standalone eight-file exports remain available for completed captures. **Download Master ZIP** exports a self-contained raw-input session suitable for developing Stage 3 playback.
+
+The lifecycle is `idle -> warming_up/waiting -> initializing -> ready -> stopping -> idle`. Repeated start actions are ignored until finalization completes, and concurrent stop/export requests share their pending promise. A new UUID is both the camera recording ID and experiment session ID, and is passed unchanged into both IMU archives. Completion is retained in a page-memory recovery store so leaving and returning to the lab does not discard a session that finished after unmount. Reloading/closing the page does discard undownloaded sessions.
+
+### Stabilization, capture start, and evaluation readiness
+
+The stabilization duration is configurable in the UI and initially **3 seconds**. Live processing continues throughout.
+
+1. The initial check requires two live camera tracks with decoded video, a connected socket with fresh (<500 ms) orientation packets from both sensors, running MediaPipe, and the actual stereo/IMU calibrations used by reconstruction. Missing conditions are reported; elapsed time alone never creates readiness.
+2. Once these prechecks pass, the existing recorders start and establish the shared monotonic origin. The stabilization interval is retained in the raw video/IMU capture, not removed from the files.
+3. Evaluation additionally waits for each camera's MediaRecorder start event, first non-empty data chunk and first timing observation, plus a valid archived packet from each IMU. Before evaluation begins, loss of live readiness restarts the stable-stream timer without shifting or restarting the recorded timelines.
+4. When both the stabilization interval and all browser evidence are present, the controller writes `evaluationWindowStartMs` relative to the unchanged recording origin and displays **Begin experimental movement**. Stop sets the evaluation-window end to the same frozen boundary used by the camera/IMU capture. No metrics are computed or discarded by Stage 2C.
+
+These are browser-observed readiness checks, not guarantees about exposure alignment, encoded frame coverage, physical sensor sampling or tracking accuracy. If required browser observations never arrive, the session remains initializing and can be stopped/exported as partial. Starting a master session requires calibration in the actual reconstruction view, not merely a different mounted component's cached calibration.
+
+### Runtime configuration snapshot
+
+`config/runtime_snapshot.json` has `schemaVersion: "1.0.0-runtime-configuration"`, an immutable `initial` snapshot, and timestamped `changes`. Each snapshot uses `"1.0.0-runtime-snapshot"` and labels every entry by availability and provenance: runtime value, implementation constant, configured default, declared package value, environment value, or unavailable. Missing settings are never silently replaced by defaults. Non-finite runtime values are explicitly tagged unavailable instead of becoming valid-looking zeros.
+
+Snapshots include camera track IDs/settings/constraints; the exact stereo calibration selected by reconstruction (K, distortion, R/T, P matrices and any additional calibration fields); full ALS arm calibration, orientation matrices, bone-local directions and segment lengths; sensor mapping; coordinate units/conventions; actual MediaPipe constructor options/model/WASM URLs; active smoothing/failure thresholds and configured defaults separately; fusion parameters passed to the live controller; manual failure switches; reconstruction constants; app/package versions; browser information; and installed MediaPipe/matrix library versions with the Vite configuration/build timestamp. Optional build/commit IDs are recorded from environment variables or explicitly unavailable.
+
+Read-only callbacks report reconstruction's actual calibration and slider values. Explicitly observed calibration/configuration changes create immutable journal entries on the same experiment timeline. MediaPipe options were moved into a shared configuration module with identical values; no inference, calibration, correction or fusion mathematics changed. Unavailable rectification transforms and model hashes are explicitly reported; the exporter does not invent them. GPU/driver state and per-frame camera exposure settings are not reconstructed by this snapshot.
+
+### Manifest and ZIP contract
+
+Filename: `experiment_session_<sessionId>.zip`. There is no enclosing directory inside the archive:
+
+```text
+manifest.json
+config/runtime_snapshot.json
+cameras/camera_a.webm
+cameras/camera_b.webm
+cameras/camera_a_timing.json
+cameras/camera_b_timing.json
+cameras/stereo_pairing.json
+imus/imu_01.json
+imus/imu_02.json
+diagnostics/clock.json
+diagnostics/errors.json
+```
+
+A camera path uses `.mp4` instead of `.webm` when its actual blob MIME type is MP4. The ZIP uses STORE compression: original video bytes are copied without re-encoding, and the original raw IMU messages and exact decimal nanosecond strings survive JSON export. No timestamps or measurements are rebased, resampled, interpolated or trimmed. Repeat exports use the session creation time for ZIP timestamps. The existing standalone files remain unchanged apart from additive identity/progress/stop instrumentation.
+
+`manifest.json` uses `schemaVersion: "1.0.0-master-session"`. It includes the UUID, creation time, shared clock, warmup/capture/evaluation/stop boundaries, monotonic duration, readiness evidence, per-stream completion/validity/data availability, counts with explicit meanings (camera callback observations, not encoded-frame counts), camera settings and byte sizes, IMU validation counts, stream-specific start/stop observations, stereo pairing diagnostics, configuration reference, archive inventory, errors, warnings and synchronization limitations. This raw-capture manifest complements the existing Stage 1 `ExperimentSession` contract; Stage 3 will populate cycle/pipeline outputs rather than fabricating them here.
+
+- **Complete:** all four required streams have usable data, camera encoders completed, critical configuration is retained, evaluation readiness was observed, and no observed required-stream interruption/fatal error makes capture partial.
+- **Partial:** some usable data exists but a required stream failed/is missing, readiness/evaluation was never established, an availability interruption occurred, or critical configuration is unavailable.
+- **Failed:** no required stream has usable data, including cancellation before capture starts.
+
+Unmatched callback observations, timing gaps or unverified exposure synchronization are diagnostics/warnings; they do not automatically fail otherwise usable streams. A failed encoder's non-empty video is still exported for inspection. If capture never started, the manifest has no fabricated clock; unavailable sidecars are explicit placeholders and absent videos are omitted, with `files[].present = false`. These failed/partial archives are recoverable evidence, not accepted complete experiments.
+
+### Timing contract for Stage 3
+
+- The single authoritative arrival timeline is `performance.now() - recordingOriginPerformanceNowMs`. Camera/IMU sidecars have the identical UUID and origin. Camera/IMU recording duration freezes at stop request, before encoder finalization finishes.
+- Each camera retains its independent media times, browser callback receipt times and presentation metadata. Each encoder retains start-call/start-event, first/last data-chunk, timing-observer registration/first observation, and stop-call/stop-event offsets relative to the shared origin. These offsets can differ between streams and between stop request and final stop events.
+- IMUs retain sensor microseconds, raw fields, exact upstream receiver nanoseconds and browser receipt timestamps separately. Packet histories stop at the camera-owned boundary. Neither upstream clock is assumed synchronized to browser time.
+- Camera callback receipts are not exposure timestamps. Independent camera media-time origins must not be directly subtracted for physical alignment. Stage 3 must select and document a mapping policy from the retained observations; Stage 2C does not invent one or implement playback.
+- `startupDelayAnalysis` compares recorder start-call/start-event delay with first-chunk and first-observation markers. Source inspection confirms observers start independently of the start event, so an approximately 1.61-second start-event delay alone does not establish lost video. A regression simulates that delay while retaining earlier chunks/observations. Its physical cause has not been identified here; original video container timestamps still require independent inspection.
+
+### Failures, cleanup, and export recovery
+
+Camera errors finalize both encoders and close IMU capture using the existing stop boundary. Socket/sensor interruptions are retained in sidecars/readiness events and reflected in partial-session diagnostics. Stopping while waiting for readiness, during stabilization or during initialization never invents an evaluation interval. Encoder stop timeouts preserve available data and mark failures.
+
+Unmount cancels controller timers, camera timing observers, encoder handlers and ingress callbacks; cameras acquired late after unmount are released. The camera owner now reads current streams during cleanup instead of initial null state. Live camera/IMU processing remains active after a normal recording stop; camera hardware is released when the lab itself unmounts.
+
+ZIP generation/download errors remain visible and do not remove source blobs or session metadata. Retry is supported; duplicate concurrent export requests do not generate duplicate downloads. Sessions can be recovered after navigation within the same page. Large captures/ZIPs consume memory and may fail; there is no disk-backed recovery or browser-reload persistence.
+
+### Verification and physical acceptance
+
+`npm test` runs **167 test executions**: the prior 136 plus 31 master-session/cleanup cases. New tests cover shared IDs/origins, retained warmup, readiness failures, explicit evaluation timestamps, simulated delayed start events, immutable actual configuration journals, complete/partial/failed manifests, exact ZIP paths/video bytes/IMU timestamps, MP4 adaptation, startup/error/timeout behavior, consecutive sessions, unmount/late camera acquisition, in-page recovery and ZIP retry/deduplication. No physical recording is established by these mocked tests.
+
+Before accepting a physical master session:
+
+1. Start both cameras and both sensors; verify reconstruction uses the intended stereo calibration and a valid ALS arm calibration. Keep live processing running.
+2. Start a master session. Wait for **Begin experimental movement**, then perform the trial and stop normally.
+3. Download the ZIP and inspect manifest status, configuration availability, all four counts, common IDs/origins, evaluation boundaries, independent camera media times, stop offsets and exact IMU nanosecond strings. Independently inspect/decode both videos.
+4. Repeat with a controlled IMU outage, a socket reconnect, a camera stop and repeated sessions. Verify partial/missing conditions are explicit and retained data remains inspectable.
+5. Test cancellation before readiness and navigation during capture. Return to the lab to recover in-memory finalized sessions; download before reloading/closing the page.
+
+Stage 3 still needs deterministic four-stream decoding/alignment, shared-cycle processing, reset/preroll rules, scheduled visual degradation and P4 fused-output replay. Stage 4 metrics/comparisons and absolute pose-accuracy claims are not implemented here. Existing calibration/rectification/triangulation behavior is recorded as-is, not corrected by Stage 2C.
 
 ---
 

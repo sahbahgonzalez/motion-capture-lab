@@ -40,7 +40,10 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './ui/tabs';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { useDualCamera } from '../hooks/useDualCamera';
 import { useCameraCalibration } from '../hooks/useCameraCalibration';
-import { useStereoVideoRecorder } from '../hooks/useStereoVideoRecorder';
+import { useMasterExperimentRecorder } from '../hooks/useMasterExperimentRecorder';
+import { immutableJson, snapshotValue } from '../utils/masterSession';
+import type { ReconstructionRuntimeReport, RuntimeSnapshot } from '../type/masterSession';
+import packageInfo from '../../../package.json';
 import { StereoRecordingDiagnosticsPanel } from './StereoRecordingDiagnosticsPanel';
 import { CalibrationView } from './CalibrationView';
 import { IMUReconstructionView } from './IMUReconstructionView';
@@ -53,6 +56,7 @@ import {
   type FusionDiagnostics,
   type SimulatedFailures,
   NO_SIMULATED_FAILURES,
+  DEFAULT_FUSION_CONFIG,
 } from '../hooks/useIMUFusionController';
 import {
   type Quaternion,
@@ -972,8 +976,71 @@ export function IMULabView() {
   const bothCamerasActive = isCamera1Active && isCamera2Active;
 
   const [activeInnerTab, setActiveInnerTab] = useState('cameras');
+  const [warmupSeconds,setWarmupSeconds] = useState(3);
+  const runtimeReportRef = useRef<ReconstructionRuntimeReport | null>(null);
+  const notifyMasterConfigurationRef = useRef<() => void>(() => {});
+  const reportRuntimeConfiguration = useCallback((report: ReconstructionRuntimeReport) => {
+    runtimeReportRef.current = report; notifyMasterConfigurationRef.current();
+  }, []);
+
+  // IMU ingress also provides the independent packet recording source.
+  const { connected: imuConnected, imuStates, reconnect: reconnectIMU, getRawIMU, recordingSource } = useIMUWebSocket();
 
   // ── Video recording ──────────────────────────────────────────────────────────
+  const masterRecording = useMasterExperimentRecorder(camera1Stream, camera2Stream, {
+    imuRecordingSource: recordingSource,
+    cameraA: { videoRef: camera1Ref, cameraId: selectedCamera1 },
+    cameraB: { videoRef: camera2Ref, cameraId: selectedCamera2 },
+    warmupMs: warmupSeconds * 1000,
+    getReadiness: () => {
+      const cameraReady = (stream: MediaStream | null, video: HTMLVideoElement | null) => ({
+        ready: !!stream?.getVideoTracks().some(track => track.readyState === "live") && !!video && video.readyState >= 2 && video.videoWidth > 0,
+        reason: "Live camera track and decoded video are required.",
+      });
+      const imuReady = (id: string) => {
+        const raw = getRawIMU(id);
+        return {ready: imuConnected && !!raw?.latest && performance.now() - raw.lastReceivedAt < 500, reason: "Connected socket and a fresh orientation packet (<500 ms) are required."};
+      };
+      const report = runtimeReportRef.current;
+      return {streams:{camera_a:cameraReady(camera1Stream,camera1Ref.current),camera_b:cameraReady(camera2Stream,camera2Ref.current),
+        imu_01:imuReady("imu_01"),imu_02:imuReady("imu_02")},
+        processing:{ready:!!report?.mediaPipe.loaded && !!report?.mediaPipe.running && !report.mediaPipe.error
+          && !!report.stereoCalibration && !!armCalibrationRef.current && armCalibrationRef.current.quality !== "failed",
+          reason:"Live MediaPipe and the actual stereo/IMU calibrations must be available."}};
+    },
+    getRuntimeSnapshot: (): RuntimeSnapshot => {
+      const report = runtimeReportRef.current;
+      const cameraSnapshot = (stream: MediaStream | null) => {
+        const track = stream?.getVideoTracks()[0];
+        return track ? {trackId:track.id,label:track.label,settings:track.getSettings(),constraints:track.getConstraints()} : null;
+      };
+      const stereo = report?.stereoCalibration ?? null;
+      const imu = armCalibrationRef.current;
+      return immutableJson({schemaVersion:"1.0.0-runtime-snapshot",
+        values:{
+          cameraA:snapshotValue(cameraSnapshot(camera1Stream),"runtime"),cameraB:snapshotValue(cameraSnapshot(camera2Stream),"runtime"),
+          stereoCalibration:snapshotValue(stereo,"runtime"),imuCalibration:snapshotValue(imu,"runtime"),
+          rectificationMetadata:snapshotValue(stereo && ("R1" in stereo || "R2" in stereo) ? stereo : null,"runtime","Calibration does not expose R1/R2 or image-remap transforms; P1/P2 remain in the stereo snapshot."),
+          poseCorrection:snapshotValue(report?.correction,"runtime"),correctionDefaults:snapshotValue(report?.correctionDefaults,"configured_default"),
+          mediaPipe:snapshotValue(report?.mediaPipe,"runtime"),fusion:snapshotValue(DEFAULT_FUSION_CONFIG,"runtime"),
+          fusionPolicy:snapshotValue({mode:"failure_triggered",scope:"right_arm",continuousImuArchiving:true},"implementation_constant"),
+          simulatedFailures:snapshotValue(simulatedFailuresRef.current,"runtime"),
+          sensorMapping:snapshotValue({imu_01:"right_upper_arm",imu_02:"right_forearm"},"implementation_constant"),
+          coordinateConventions:snapshotValue({monocular:"MediaPipe image-normalized x/y and inferred relative z; not metric world coordinates",stereo:"OpenCV X right, Y down, Z depth; millimeters",imuQuaternion:"wxyz; sensor to IMU world",imuWorld:"BNO085 ENU/Z-up assumption",angles:"degrees"},"implementation_constant"),
+          stereoReconstruction:snapshotValue({implementation:"SVD DLT",visibilityThreshold:0.5,inputCoordinates:"raw image landmarks multiplied by current video size",undistortionOrRectificationAppliedAtRuntime:false},"implementation_constant"),
+          imuReconstruction:snapshotValue({method:"absolute forward kinematics",displayFreshnessMs:500,segmentMinMm:SEG_MIN_MM,segmentMaxMm:SEG_MAX_MM,calibrationFreshnessMs:150},"implementation_constant"),
+          warmup:snapshotValue({durationMs:warmupSeconds*1000,readinessBasis:"browser observations only"},"runtime"),
+          application:snapshotValue({version:packageInfo.version,declaredMediaPipeVersion:packageInfo.dependencies["@mediapipe/tasks-vision"]},"declared_package"),
+          compiledBuild:snapshotValue(import.meta.env.VITE_RUNTIME_BUILD_METADATA ?? null,"environment"),
+          browser:snapshotValue({userAgent:navigator.userAgent,hardwareConcurrency:navigator.hardwareConcurrency},"runtime"),
+          modelContentHash:snapshotValue(null,"runtime","Model URL/options are retained; no downloaded model content hash is exposed."),
+          buildIdentifier:snapshotValue(import.meta.env.VITE_BUILD_ID ?? null,"environment"),commitIdentifier:snapshotValue(import.meta.env.VITE_COMMIT_SHA ?? null,"environment"),
+        },
+        criticalMissing:[...(!stereo?["stereoCalibration"]:[]),...(!imu || imu.quality === "failed"?["imuCalibration"]:[]),...(!report?.mediaPipe.loaded?["mediaPipe"]:[])],
+      });
+    },
+  });
+  notifyMasterConfigurationRef.current = masterRecording.notifyConfigurationChange;
   const {
     isRecording: isVideoRecording,
     recordings: videoRecordings,
@@ -983,10 +1050,7 @@ export function IMULabView() {
     downloadRecording: downloadVideoRecording,
     deleteRecording: deleteVideoRecording,
     recordingDiagnostics,
-  } = useStereoVideoRecorder(camera1Stream, camera2Stream, {
-    cameraA: { videoRef: camera1Ref, cameraId: selectedCamera1 },
-    cameraB: { videoRef: camera2Ref, cameraId: selectedCamera2 },
-  });
+  } = masterRecording;
 
   const [videoRecordingMs, setVideoRecordingMs] = useState(0);
   const videoRecordStartRef = useRef<number>(0);
@@ -996,9 +1060,6 @@ export function IMULabView() {
     const interval = setInterval(() => setVideoRecordingMs(performance.now() - videoRecordStartRef.current), 100);
     return () => clearInterval(interval);
   }, [isVideoRecording]);
-
-  // ── IMU WebSocket ────────────────────────────────────────────────────────────
-  const { connected: imuConnected, imuStates, reconnect: reconnectIMU, getRawIMU } = useIMUWebSocket();
 
   // ── Corrected pose + IMU reconstruction ──────────────────────────────────────
   const correctedPoseRef = useRef<TriangulatedPose>(Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as TriangulatedPose);
@@ -1016,7 +1077,7 @@ export function IMULabView() {
   const simulatedFailuresRef = useRef<SimulatedFailures>(NO_SIMULATED_FAILURES);
   useEffect(() => { simulatedFailuresRef.current = simulatedFailures; }, [simulatedFailures]);
 
-  const { processFusionFrame, getEffectiveShoulder, reset: resetFusion } = useIMUFusionController();
+  const { processFusionFrame, getEffectiveShoulder, reset: resetFusion } = useIMUFusionController(DEFAULT_FUSION_CONFIG);
   const processFusionFrameRef = useRef(processFusionFrame);
   const getEffectiveShoulderRef = useRef(getEffectiveShoulder);
   useEffect(() => { processFusionFrameRef.current = processFusionFrame; }, [processFusionFrame]);
@@ -1042,7 +1103,10 @@ export function IMULabView() {
 
   const [armCalibration, setArmCalibration] = useState<ArmCalibration | null>(null);
   const armCalibrationRef = useRef<ArmCalibration | null>(null);
-  useEffect(() => { armCalibrationRef.current = armCalibration; }, [armCalibration]);
+  useEffect(() => {
+    armCalibrationRef.current = armCalibration; masterRecording.notifyConfigurationChange();
+  }, [armCalibration]);
+  useEffect(() => { masterRecording.notifyConfigurationChange(); }, [simulatedFailures,camera1Stream,camera2Stream]);
 
   // ── Last Reliable Vision (positional velocity gate only) ─────────────────────
   const [lastReliable, setLastReliable]   = useState<LastReliableVision | null>(null);
@@ -1982,6 +2046,7 @@ export function IMULabView() {
               isBothCamerasActive={bothCamerasActive}
               preloadedCalibration={calibrationResult}
               onCorrectedPose={onCorrectedPose}
+              onRuntimeConfiguration={reportRuntimeConfiguration}
               imuReconstructionPose={imuReconPose}
               fusedReconstructionPose={fusedReconPose}
               fusionDiagnostics={fusionDiag}
@@ -2582,13 +2647,13 @@ export function IMULabView() {
             <Card className="bg-gray-900 border-gray-700 p-6">
               <div className="flex items-center justify-between mb-4">
                 <div>
-                  <h3 className="text-lg font-semibold">Synchronized Dual-Camera Recording</h3>
-                  <p className="text-sm text-gray-400 mt-1">Records raw video from both cameras simultaneously.</p>
+                  <h3 className="text-lg font-semibold">Master Experimental Session</h3>
+                  <p className="text-sm text-gray-400 mt-1">Captures both cameras, both IMUs, timing, and runtime configuration in one session.</p>
                 </div>
                 {isVideoRecording && (
                   <div className="flex items-center gap-2 text-red-400 font-mono text-sm">
                     <Circle className="h-3 w-3 fill-red-500 text-red-500 animate-pulse" />
-                    {formatVideoDuration(videoRecordingMs)}
+                    Session elapsed: {formatVideoDuration(videoRecordingMs)}
                   </div>
                 )}
               </div>
@@ -2605,20 +2670,48 @@ export function IMULabView() {
                 </div>
               )}
 
+              <div className="mb-4 space-y-2 text-sm">
+                <label>Stabilization seconds: <input aria-label="Stabilization seconds" type="number" min="0" step="0.5" value={warmupSeconds}
+                  disabled={isVideoRecording} onChange={event => setWarmupSeconds(Number(event.target.value))} className="w-20 bg-gray-800 rounded px-2 py-1" /></label>
+                <p>Capture duration: {formatVideoDuration(recordingDiagnostics.durationMs)}</p>
+                <p>Session: {masterRecording.phase}. {masterRecording.phase === 'ready' ? 'Browser readiness observed. Begin experimental movement.' : isVideoRecording ? 'Wait before beginning experimental movement.' : 'Keep all streams live before starting.'}</p>
+                {isVideoRecording && masterRecording.evaluationStartMs !== null && <p>Evaluation window begins at {masterRecording.evaluationStartMs.toFixed(1)} ms on the unchanged capture timeline.</p>}
+                {masterRecording.missing.length > 0 && <ul className="text-yellow-300 list-disc pl-5">{masterRecording.missing.map(issue => <li key={issue}>{issue}</li>)}</ul>}
+                <p className="text-gray-400">Readiness is based on browser events and fresh packets; exposure synchronization and encoded coverage remain unverified.</p>
+              </div>
               <div className="flex gap-3">
                 {!isVideoRecording ? (
                   <Button onClick={startVideoRecording} disabled={!bothCamerasActive}
                     className="bg-red-600 hover:bg-red-700 text-white">
-                    <Circle className="h-4 w-4 mr-2 fill-white" /> Start Recording
+                    <Circle className="h-4 w-4 mr-2 fill-white" /> Start Master Session
                   </Button>
                 ) : (
                   <Button onClick={stopVideoRecording} className="bg-gray-600 hover:bg-gray-700 text-white">
-                    <Square className="h-4 w-4 mr-2 fill-white" /> Stop Recording
+                    <Square className="h-4 w-4 mr-2 fill-white" /> Stop Master Session
                   </Button>
                 )}
               </div>
               <StereoRecordingDiagnosticsPanel diagnostics={recordingDiagnostics} />
             </Card>
+
+            {masterRecording.sessions.length > 0 && (
+              <Card className="bg-gray-900 border-gray-700 p-6 space-y-3">
+                <h3 className="text-lg font-semibold">Master sessions (retained in this page)</h3>
+                {masterRecording.sessions.map(session => (
+                  <div key={session.manifest.sessionId} className="rounded bg-gray-800 p-3 space-y-2 text-sm">
+                    <p>{session.manifest.sessionId} | {session.manifest.status}</p>
+                    <p className="text-gray-400">{session.manifest.warnings.join(' ')}</p>
+                    <div className="flex gap-2">
+                      <Button disabled={masterRecording.exportingId === session.manifest.sessionId} onClick={() => {
+                        void masterRecording.downloadSession(session).catch(() => {});
+                      }}><Download className="h-4 w-4 mr-1" />{masterRecording.exportingId === session.manifest.sessionId ? 'Creating ZIP...' : 'Download Master ZIP'}</Button>
+                      <Button variant="destructive" disabled={masterRecording.exportingId === session.manifest.sessionId}
+                        onClick={() => masterRecording.deleteSession(session.manifest.sessionId)}>Delete master session</Button>
+                    </div>
+                  </div>
+                ))}
+              </Card>
+            )}
 
             {videoRecordings.length > 0 && (
               <Card className="bg-gray-900 border-gray-700 p-6">
@@ -2629,7 +2722,7 @@ export function IMULabView() {
                       <div>
                         <p className="font-medium text-sm text-white">{rec.name}</p>
                         <p className="text-xs text-gray-400 mt-0.5">
-                          {Math.round(rec.duration/1000)}s · Cam1: {(rec.cam1Blob.size/1e6).toFixed(1)} MB · Cam2: {(rec.cam2Blob.size/1e6).toFixed(1)} MB · Status: {rec.status}
+                          {Math.round(rec.duration/1000)}s · Cam1: {(rec.cam1Blob.size/1e6).toFixed(1)} MB · Cam2: {(rec.cam2Blob.size/1e6).toFixed(1)} MB · Status: {rec.status} | IMU packets: {rec.imuRecording?.imu_01.diagnostics.packetCount ?? 0} / {rec.imuRecording?.imu_02.diagnostics.packetCount ?? 0}
                         </p>
                       </div>
                       <div className="flex gap-2">

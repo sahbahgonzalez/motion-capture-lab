@@ -222,7 +222,8 @@ describe('Fusion controller state machine', () => {
     const oneFrame = ctrl.processFusionFrame(baseInput({ nowMs: 2016 }));
     expect(oneFrame.diagnostics.uaState).toBe('RECOVERY');
     expect(oneFrame.diagnostics.uaRecoveryPhase).toBe('confirming');
-    expect(oneFrame.diagnostics.uaRecoveryFrame).toBe(1);
+    // Entry into RECOVERY initializes the counter; subsequent frames confirm.
+    expect(oneFrame.diagnostics.uaRecoveryFrame).toBe(0);
     // Output must still be non-null (holding IMU position)
     expect(oneFrame.finalElbow).not.toBeNull();
   });
@@ -238,18 +239,18 @@ describe('Fusion controller state machine', () => {
       nowMs: 2000,
     }));
 
-    // Run 3 confirmation frames
+    // One entry frame followed by 3 confirmation frames
     let result!: FusionFrameResult;
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i < 4; i++) {
       result = ctrl.processFusionFrame(baseInput({ nowMs: 2016 + i * 16 }));
     }
-    // 3rd frame should transition to blending
+    // The third confirmation frame transitions to blending
     expect(result.diagnostics.uaState).toBe('RECOVERY');
     expect(result.diagnostics.uaRecoveryPhase).toBe('blending');
 
     // Run 4 blend frames
     for (let i = 0; i < 4; i++) {
-      result = ctrl.processFusionFrame(baseInput({ nowMs: 2064 + i * 16 }));
+      result = ctrl.processFusionFrame(baseInput({ nowMs: 2080 + i * 16 }));
     }
     expect(result.diagnostics.uaState).toBe('STEREO');
     expect(result.finalElbow).toEqual(elbow);

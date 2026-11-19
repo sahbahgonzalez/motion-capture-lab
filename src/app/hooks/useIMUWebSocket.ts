@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
+import { createIMURecordingSource } from '../utils/imuRecording';
 
 // ── Packet types ──────────────────────────────────────────────────────────────
 
@@ -194,82 +195,84 @@ export function useIMUWebSocket(
       )
   );
 
+  const recordingRef = useRef<ReturnType<typeof createIMURecordingSource> | null>(null);
+  if (!recordingRef.current) recordingRef.current = createIMURecordingSource();
+  const mountedRef = useRef(true);
+  const connectionSequenceRef = useRef(0);
+  const connectionIdRef = useRef<string | null>(null);
+
+  const detachAndClose = (ws: WebSocket | null) => {
+    if (!ws) return;
+    ws.onopen = null; ws.onclose = null; ws.onerror = null; ws.onmessage = null;
+    ws.close();
+  };
+
   const connect = useCallback(() => {
-    wsRef.current?.close();
-
-    for (const id of IMU_IDS) {
-      rawRef.current[id] = makeRaw();
-    }
-
+    if (!mountedRef.current) return;
+    const previous = wsRef.current;
+    wsRef.current = null; // Invalidate old callbacks before close/replacement.
+    const connectionId = 'imu_socket_' + ++connectionSequenceRef.current;
+    connectionIdRef.current = connectionId;
+    const snapshot = {state: 'connecting' as const, connectionId, url};
+    recordingRef.current!.connectionEvent(previous ? 'reconnect' : 'connecting', snapshot, performance.now());
+    detachAndClose(previous);
+    setConnected(false);
+    for (const id of IMU_IDS) rawRef.current[id] = makeRaw();
     let ws: WebSocket;
-
     try {
       ws = new WebSocket(url);
+      ws.binaryType = 'arraybuffer';
     } catch {
-      setConnected(false);
+      recordingRef.current!.connectionEvent('construction_error', {...snapshot, state: 'error'}, performance.now(), 'WebSocket construction failed.');
       return;
     }
-
     wsRef.current = ws;
-
+    const current = () => wsRef.current === ws;
     ws.onopen = () => {
+      if (!current()) return;
+      recordingRef.current!.connectionEvent('open', {...snapshot, state: 'open'}, performance.now());
       setConnected(true);
     };
-
-    ws.onclose = () => {
+    ws.onclose = event => {
+      if (!current()) return;
+      recordingRef.current!.connectionEvent('close', {...snapshot, state: 'closed'}, performance.now(),
+        'code=' + event.code + '; reason=' + event.reason + '; clean=' + event.wasClean);
       setConnected(false);
     };
-
     ws.onerror = () => {
+      if (!current()) return;
+      recordingRef.current!.connectionEvent('error', {...snapshot, state: 'error'}, performance.now(), 'WebSocket transport error.');
       setConnected(false);
     };
-
     ws.onmessage = event => {
-      try {
-        const parsed = JSON.parse(event.data as string);
-
-        const packet = safeParsePacket(parsed);
-
-        if (!packet) {
-          return;
-        }
-
-        const id = packet.sensor_id;
-
-        if (!(id in rawRef.current)) {
-          return;
-        }
-
-        const now = performance.now();
-
-        const entry = rawRef.current[id];
-
-        entry.latest = packet;
-        entry.lastReceivedAt = now;
-
-        entry.timestamps.push(now);
-
-        const cutoff = now - 2000;
-
-        entry.timestamps =
-          entry.timestamps.filter(
-            timestamp => timestamp > cutoff
-          );
-
-      } catch {
-        // Ignore malformed packets.
-      }
+      const now = performance.now(); // First operation: receipt time, before JSON parsing or validation.
+      if (!current()) return;
+      const wallClockMs = Date.now();
+      const parsed = recordingRef.current!.receive(event.data, now, wallClockMs);
+      const packet = safeParsePacket(parsed);
+      if (!packet || !Object.hasOwn(rawRef.current, packet.sensor_id)) return;
+      const entry = rawRef.current[packet.sensor_id];
+      entry.latest = packet;
+      entry.lastReceivedAt = now;
+      entry.timestamps.push(now);
+      entry.timestamps = entry.timestamps.filter(timestamp => timestamp > now - 2000);
     };
   }, [url]);
 
-  // Connect on mount.
   useEffect(() => {
+    mountedRef.current = true;
     connect();
-
     return () => {
-      wsRef.current?.close();
+      mountedRef.current = false;
+      recordingRef.current!.connectionEvent('unmount', {
+        state: 'closed', connectionId: connectionIdRef.current, url,
+      }, performance.now());
+      const ws = wsRef.current;
+      wsRef.current = null;
+      detachAndClose(ws);
+      // The camera session owns the recording boundary and closes its handle in its cleanup.
     };
-  }, [connect]);
+  }, [connect, url]);
 
   // Push React state at approximately 10 Hz.
   useEffect(() => {
@@ -319,5 +322,6 @@ export function useIMUWebSocket(
     imuStates,
     reconnect: connect,
     getRawIMU,
+    recordingSource: recordingRef.current.source,
   };
 }
