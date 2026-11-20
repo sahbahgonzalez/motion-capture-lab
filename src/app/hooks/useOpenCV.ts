@@ -1,4 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useSyncExternalStore, useCallback } from 'react';
+import {subscribeOpenCVRuntime,getOpenCVRuntimeState,retryOpenCVRuntime,calibrationCapabilities} from '../utils/openCVRuntime';
 
 declare global {
   interface Window {
@@ -7,89 +8,7 @@ declare global {
 }
 
 export function useOpenCV() {
-  const [isLoaded, setIsLoaded] = useState(false);
-  const [isLoading, setIsLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  useEffect(() => {
-    // Check if OpenCV is already loaded
-    if (window.cv && window.cv.Mat && window.cv.findChessboardCorners) {
-      console.log('✅ OpenCV.js already loaded (calib3d available)');
-      setIsLoaded(true);
-      return;
-    }
-
-    // Load OpenCV.js
-    const loadOpenCV = async () => {
-      setIsLoading(true);
-      console.log('📦 Loading OpenCV.js...');
-
-      try {
-        const script = document.createElement('script');
-        // Load OpenCV.js from local public directory
-        script.src = '/opencv.js';
-        script.async = true;
-
-        await new Promise<void>((resolve, reject) => {
-          const timeout = setTimeout(() => {
-            const missing = !window.cv ? 'cv not loaded'
-              : !window.cv.Mat ? 'cv.Mat missing'
-              : 'cv.findChessboardCorners missing';
-            reject(new Error(`OpenCV.js init timeout: ${missing}`));
-          }, 30000);
-
-          const finish = () => {
-            clearTimeout(timeout);
-            if (typeof window.cv?.findChessboardCorners === 'function') {
-              console.log('✅ OpenCV.js ready (calib3d confirmed)');
-              resolve();
-            } else {
-              reject(new Error('OpenCV loaded but calib3d not available'));
-            }
-          };
-
-          script.onload = () => {
-            console.log('📦 OpenCV.js script loaded, waiting for WASM...');
-
-            const tryAttach = () => {
-              if (!window.cv) return false;
-              // Already fully initialized
-              if (typeof window.cv.findChessboardCorners === 'function') {
-                finish();
-                return true;
-              }
-              // WASM not done yet — hook onRuntimeInitialized
-              window.cv['onRuntimeInitialized'] = finish;
-              return true;
-            };
-
-            if (!tryAttach()) {
-              const poll = setInterval(() => {
-                if (tryAttach()) clearInterval(poll);
-              }, 50);
-            }
-          };
-
-          script.onerror = () => {
-            clearTimeout(timeout);
-            reject(new Error('Failed to load OpenCV.js script'));
-          };
-
-          document.head.appendChild(script);
-        });
-
-        setIsLoaded(true);
-        setIsLoading(false);
-      } catch (err) {
-        const errorMsg = 'Failed to load OpenCV.js: ' + (err as Error).message;
-        console.error('❌', errorMsg);
-        setError(errorMsg);
-        setIsLoading(false);
-      }
-    };
-
-    loadOpenCV();
-  }, []);
+  const {isLoaded,isLoading,error}=useSyncExternalStore(subscribeOpenCVRuntime,getOpenCVRuntimeState,getOpenCVRuntimeState);
 
   const detectCheckerboard = useCallback(
     (
@@ -124,7 +43,7 @@ export function useOpenCV() {
         if (found) {
           // Refine corner positions for sub-pixel accuracy
           const criteria = new cv.TermCriteria(
-            cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER,
+            cv.TermCriteria_EPS + cv.TermCriteria_MAX_ITER,
             30,
             0.001
           );
@@ -163,8 +82,11 @@ export function useOpenCV() {
 
   return {
     isLoaded,
+    calibrationReady: isLoaded && calibrationCapabilities(window.cv).ready,
+    missingCalibrationBindings: calibrationCapabilities(typeof window==='undefined'?null:window.cv).missing,
     isLoading,
     error,
     detectCheckerboard,
+    retry: retryOpenCVRuntime,
   };
 }

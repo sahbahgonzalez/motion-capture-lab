@@ -1,3 +1,4 @@
+import {ActiveCalibrationStatus} from './ActiveCalibrationStatus';
 import { StereoGeometryNotice } from './StereoGeometryNotice';
 import { useRef, useState, useEffect, useCallback, type RefObject } from 'react';
 import { Card } from './ui/card';
@@ -135,7 +136,7 @@ export function TriangulationView({
   isBothCamerasActive,
   preloadedCalibration,
 }: TriangulationViewProps) {
-  const { loadCalibration, calibrationResult } = useCameraCalibration();
+  const { loadCalibration, calibrationResult, calibrationIdentity } = useCameraCalibration();
   const calibFileRef = useRef<HTMLInputElement>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [showFeeds, setShowFeeds] = useState(true);
@@ -266,7 +267,7 @@ export function TriangulationView({
     setLoadError(null);
     const reader = new FileReader();
     reader.onload = (ev) => {
-      try { loadCalibration(ev.target?.result as string); }
+      try { loadCalibration(ev.target?.result as string,file.name); }
       catch (err) { setLoadError((err as Error).message); }
     };
     reader.readAsText(file);
@@ -277,6 +278,7 @@ export function TriangulationView({
 
   return (
     <div className="space-y-6">
+      <ActiveCalibrationStatus calibration={calibration} identity={calibrationIdentity}/>
       <StereoGeometryNotice calibration={calibration} dimensions={[cam1W,cam1H,cam2W,cam2H]} />
 
       {/* ── Status bar ───────────────────────────────────────────── */}

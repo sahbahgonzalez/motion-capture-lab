@@ -1,3 +1,4 @@
+import {resolveShoulderWidths} from './bodyScale';
 import { MotionRecording, MotionFrame } from '../hooks/useMotionRecorder';
 import { PoseLandmarks, LandmarkPoint } from '../hooks/useMediaPipePose';
 
@@ -44,6 +45,24 @@ function frameShoulderWidth(frame: MotionFrame): number | null {
   return w > 0 ? w : null;
 }
 
+/** Original jitter formulas, shared with comparison analysis without changing the legacy API. */
+export function normalizedIntervalSpeed(a:{x:number;y:number;z?:number},b:{x:number;y:number;z?:number},dtSeconds:number,width:number){
+ const dx=(b.x-a.x)/width,dy=(b.y-a.y)/width,dz=((b.z??0)-(a.z??0))/width;
+ return dtSeconds>0?Math.sqrt(dx*dx+dy*dy+dz*dz)/dtSeconds:0;
+}
+export function summarizeVelocityGroups(groups:number[][]){
+ const values=groups.flat(),meanVelocity=values.length?values.reduce((a,b)=>a+b,0)/values.length:0;
+ const velocityVariance=values.length?values.reduce((sum,v)=>sum+(v-meanVelocity)**2,0)/values.length:0;
+ let rapidChanges=0;for(const group of groups)for(let i=2;i<group.length;i++)if(Math.abs(group[i]-group[i-1])>meanVelocity*2)rapidChanges++;
+ const highFrequencyNoise=values.length?rapidChanges/values.length:0;
+ return {meanVelocity,velocityVariance,highFrequencyNoise,smoothnessScore:Math.max(0,Math.min(100,100-(velocityVariance+highFrequencyNoise*10)*1000))};
+}
+export function positionStandardDeviation(positions:Array<{x:number;y:number;z?:number}>){
+ if(!positions.length)return {x:0,y:0,z:0};
+ const center={x:positions.reduce((s,p)=>s+p.x,0)/positions.length,y:positions.reduce((s,p)=>s+p.y,0)/positions.length,z:positions.reduce((s,p)=>s+(p.z??0),0)/positions.length};
+ return {x:Math.sqrt(positions.reduce((s,p)=>s+(p.x-center.x)**2,0)/positions.length),y:Math.sqrt(positions.reduce((s,p)=>s+(p.y-center.y)**2,0)/positions.length),z:Math.sqrt(positions.reduce((s,p)=>s+((p.z??0)-center.z)**2,0)/positions.length)};
+}
+
 export function calculateJitterMetrics(
   recording: MotionRecording,
   jointName: keyof PoseLandmarks
@@ -66,26 +85,11 @@ export function calculateJitterMetrics(
   // normalisation adapts as the person moves toward/away from the camera,
   // keeping the body-scale reference geometrically consistent across depths.
   // Falls back to the nearest valid frame's width when shoulders are occluded.
-  const perFrameWidth: number[] = new Array(frames.length);
-  let lastValid: number | null = null;
-  for (let i = 0; i < frames.length; i++) {
-    const w = frameShoulderWidth(frames[i]);
-    if (w !== null) lastValid = w;
-    perFrameWidth[i] = lastValid ?? 0;
-  }
-  // Forward-fill from the first valid frame for any leading nulls
-  let firstValid: number | null = null;
-  for (let i = 0; i < frames.length; i++) {
-    if (perFrameWidth[i] > 0) { firstValid = perFrameWidth[i]; break; }
-  }
-  if (firstValid === null) {
-    // No shoulder data at all — fall back to un-normalised (scale = 1)
-    perFrameWidth.fill(1);
-  } else {
-    for (let i = 0; i < frames.length; i++) {
-      if (perFrameWidth[i] === 0) perFrameWidth[i] = firstValid;
-    }
-  }
+  const resolvedWidths=resolveShoulderWidths(frames.map(frameShoulderWidth));
+  const firstValid=resolvedWidths.find(width=>width!==null)??null;
+  // Legacy scalar API retains its old numeric fallback. The comparison evaluator
+  // consumes nullable widths directly and never labels this fallback normalized.
+  const perFrameWidth=resolvedWidths.map(width=>width??1);
 
   // Mean shoulder width across the recording — reported in the UI for reference
   const shoulderWidthRef = firstValid !== null
@@ -103,46 +107,10 @@ export function calculateJitterMetrics(
     const timeDelta = (frames[i].timestamp - frames[i - 1].timestamp) / 1000;
     const bodyScale = (perFrameWidth[i - 1] + perFrameWidth[i]) / 2;
 
-    const dx = (curr.x - prev.x) / bodyScale;
-    const dy = (curr.y - prev.y) / bodyScale;
-    const dz = ((curr.z ?? 0) - (prev.z ?? 0)) / bodyScale;
-    const speed = timeDelta > 0 ? Math.sqrt(dx * dx + dy * dy + dz * dz) / timeDelta : 0;
-    velocities.push(speed);
+    velocities.push(normalizedIntervalSpeed(prev,curr,timeDelta,bodyScale));
   }
-
-  // Velocity variance in (body-widths/s)^2
-  const meanVelocity = velocities.reduce((a, b) => a + b, 0) / velocities.length;
-  const velocityVariance =
-    velocities.reduce((sum, v) => sum + Math.pow(v - meanVelocity, 2), 0) / velocities.length;
-
-  // Position std dev — only over frames where the joint was actually visible.
-  // Occluded joints are stored as (0,0,0) with visibility=0; including those
-  // zeros would pull the mean toward the origin and inflate std dev.
-  const validPositions = positions.filter(p => (p.visibility ?? 1) >= 0.5);
-  const positionStdDev = (() => {
-    if (validPositions.length === 0) return { x: 0, y: 0, z: 0 };
-    const mean = {
-      x: validPositions.reduce((s, p) => s + p.x, 0) / validPositions.length,
-      y: validPositions.reduce((s, p) => s + p.y, 0) / validPositions.length,
-      z: validPositions.reduce((s, p) => s + (p.z ?? 0), 0) / validPositions.length,
-    };
-    return {
-      x: Math.sqrt(validPositions.reduce((s, p) => s + Math.pow(p.x - mean.x, 2), 0) / validPositions.length),
-      y: Math.sqrt(validPositions.reduce((s, p) => s + Math.pow(p.y - mean.y, 2), 0) / validPositions.length),
-      z: Math.sqrt(validPositions.reduce((s, p) => s + Math.pow((p.z ?? 0) - mean.z, 2), 0) / validPositions.length),
-    };
-  })();
-
-  // High-frequency noise: fraction of frames where acceleration > 2× mean velocity
-  let rapidChanges = 0;
-  for (let i = 2; i < velocities.length; i++) {
-    if (Math.abs(velocities[i] - velocities[i - 1]) > meanVelocity * 2) rapidChanges++;
-  }
-  const highFrequencyNoise = rapidChanges / velocities.length;
-
-  // Smoothness score — thresholds calibrated for body-width-normalised velocity units
-  const jitterScore = velocityVariance + highFrequencyNoise * 10;
-  const smoothnessScore = Math.max(0, Math.min(100, 100 - jitterScore * 1000));
+  const {meanVelocity,velocityVariance,highFrequencyNoise,smoothnessScore}=summarizeVelocityGroups([velocities]);
+  const positionStdDev=positionStandardDeviation(positions.filter(p=>(p.visibility??1)>=.5));
 
   return {
     jointName,
@@ -230,10 +198,10 @@ export function detectLimbSwaps(recording: MotionRecording): LimbSwapMetrics {
     const landmarks = frames[i].landmarks;
 
     // Check if left wrist is on the right side of the body
-    const shoulderMidX = (landmarks.leftShoulder.x + landmarks.rightShoulder.x) / 2;
+    const shoulderMidX = landmarks.leftShoulder&&landmarks.rightShoulder?(landmarks.leftShoulder.x+landmarks.rightShoulder.x)/2:NaN;
 
     // Left wrist should be < midpoint (on left side)
-    if (landmarks.leftWrist.x > shoulderMidX + 0.1) {
+    if (landmarks.leftWrist&&landmarks.leftWrist.x > shoulderMidX + 0.1) {
       detectedSwaps.push({
         frame: i,
         timestamp: frames[i].timestamp,
@@ -243,7 +211,7 @@ export function detectLimbSwaps(recording: MotionRecording): LimbSwapMetrics {
     }
 
     // Right wrist should be > midpoint (on right side)
-    if (landmarks.rightWrist.x < shoulderMidX - 0.1) {
+    if (landmarks.rightWrist&&landmarks.rightWrist.x < shoulderMidX - 0.1) {
       detectedSwaps.push({
         frame: i,
         timestamp: frames[i].timestamp,
@@ -253,9 +221,9 @@ export function detectLimbSwaps(recording: MotionRecording): LimbSwapMetrics {
     }
 
     // Check ankles
-    const hipMidX = (landmarks.leftHip.x + landmarks.rightHip.x) / 2;
+    const hipMidX = landmarks.leftHip&&landmarks.rightHip?(landmarks.leftHip.x+landmarks.rightHip.x)/2:NaN;
 
-    if (landmarks.leftAnkle.x > hipMidX + 0.1) {
+    if (landmarks.leftAnkle&&landmarks.leftAnkle.x > hipMidX + 0.1) {
       detectedSwaps.push({
         frame: i,
         timestamp: frames[i].timestamp,
@@ -264,7 +232,7 @@ export function detectLimbSwaps(recording: MotionRecording): LimbSwapMetrics {
       });
     }
 
-    if (landmarks.rightAnkle.x < hipMidX - 0.1) {
+    if (landmarks.rightAnkle&&landmarks.rightAnkle.x < hipMidX - 0.1) {
       detectedSwaps.push({
         frame: i,
         timestamp: frames[i].timestamp,
@@ -274,7 +242,7 @@ export function detectLimbSwaps(recording: MotionRecording): LimbSwapMetrics {
     }
 
     // Check if left landmarks have higher x values than right (should be opposite)
-    if (landmarks.leftShoulder.x > landmarks.rightShoulder.x) {
+    if (landmarks.leftShoulder&&landmarks.rightShoulder&&landmarks.leftShoulder.x > landmarks.rightShoulder.x) {
       detectedSwaps.push({
         frame: i,
         timestamp: frames[i].timestamp,
@@ -283,7 +251,7 @@ export function detectLimbSwaps(recording: MotionRecording): LimbSwapMetrics {
       });
     }
 
-    if (landmarks.leftHip.x > landmarks.rightHip.x) {
+    if (landmarks.leftHip&&landmarks.rightHip&&landmarks.leftHip.x > landmarks.rightHip.x) {
       detectedSwaps.push({
         frame: i,
         timestamp: frames[i].timestamp,

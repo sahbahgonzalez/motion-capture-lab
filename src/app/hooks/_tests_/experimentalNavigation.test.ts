@@ -1,0 +1,17 @@
+import * as React from 'react';
+import {create,act,type ReactTestRenderer} from 'react-test-renderer';
+import {it,expect,vi,afterEach} from 'vitest';
+import App from '../../App';
+import {OpenExperimentalComparison} from '../../components/ExperimentalWorkspace';
+import {experimentRegistry} from '../../experiment/registry';
+vi.mock('../../components/MotionCaptureView',()=>({MotionCaptureView:()=>null}));
+vi.mock('../../components/ThreeDMotionCaptureView',()=>({ThreeDMotionCaptureView:()=>null}));
+vi.mock('../../components/FailureCorrectionLabView',()=>({FailureCorrectionLabView:()=>null}));
+vi.mock('../../components/IMULabView',()=>({IMULabView:()=>null}));
+vi.mock('../../components/OfflineEvaluationDashboard',()=>({OfflineEvaluationDashboard:()=>null}));
+vi.mock('../../components/ui/sonner',()=>({Toaster:()=>null}));
+vi.mock('../../components/ExperimentalWorkspace',async original=>{const actual=await original<typeof import('../../components/ExperimentalWorkspace')>();return {...actual,ExperimentalWorkspace:()=>null};});
+vi.mock('../../components/ui/tabs',()=>({Tabs:(props:any)=>React.createElement('div',{'data-active-tab':props.value},props.children),TabsContent:(props:any)=>React.createElement('div',{},props.children),TabsList:(props:any)=>React.createElement('div',{},props.children),TabsTrigger:(props:any)=>React.createElement('button',{},props.children)}));
+let renderer:ReactTestRenderer|null=null;
+afterEach(()=>{act(()=>renderer?.unmount());vi.unstubAllGlobals();});
+for(const pipeline of ['P1','P2','P3'] as const)it(pipeline+' Comparison navigates to existing experimental playback without starting a recorder',()=>{vi.stubGlobal('React',React);const recorder=vi.fn();vi.stubGlobal('MediaRecorder',recorder);act(()=>{renderer=create(React.createElement(React.Fragment,null,React.createElement(App),React.createElement(OpenExperimentalComparison,{pipeline})));});act(()=>renderer!.root.findAllByType('button').find(b=>b.children.join('')==='Comparison')!.props.onClick());expect(experimentRegistry.getSnapshot().navigation!.pipeline).toBe(pipeline);expect(renderer!.root.findByProps({'data-active-tab':'experiment'})).toBeDefined();expect(recorder).not.toHaveBeenCalled();});

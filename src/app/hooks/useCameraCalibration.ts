@@ -1,4 +1,6 @@
-import { useState, useCallback } from 'react';
+import {activeStereoCalibration} from '../utils/activeStereoCalibration';
+import {calibrationCapabilities} from '../utils/openCVRuntime';
+import { useState, useCallback, useSyncExternalStore } from 'react';
 import { StereoCalibration, CalibrationCapture, IntrinsicCalibration } from '../type/calibration';
 import { validateStereoCalibration } from '../utils/stereoGeometry';
 
@@ -9,7 +11,7 @@ declare global {
 }
 
 // Build 3D object points for a checkerboard pattern
-// Inner corners: (cols-1) x (rows-1), Z=0 (flat board)
+// Rows and columns are inner-corner counts; Z=0 (flat board).
 function buildObjectPoints(
   cv: any,
   numCorners: number,
@@ -18,8 +20,8 @@ function buildObjectPoints(
   squareSize: number
 ): any {
   const objPts = new cv.Mat(numCorners, 1, cv.CV_32FC3);
-  const innerCols = checkerboardCols - 1;
-  for (let i = 0; i < checkerboardRows - 1; i++) {
+  const innerCols = checkerboardCols;
+  for (let i = 0; i < checkerboardRows; i++) {
     for (let j = 0; j < innerCols; j++) {
       const idx = i * innerCols + j;
       objPts.data32F[idx * 3 + 0] = j * squareSize;
@@ -68,31 +70,10 @@ function matToDistCoeffs(mat: any): number[] {
   return result;
 }
 
-const CALIBRATION_STORAGE_KEY = 'stereo_calibration_v1';
-
-function loadFromStorage(): StereoCalibration | null {
-  try {
-    const raw = localStorage.getItem(CALIBRATION_STORAGE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw);
-    const validation = validateStereoCalibration(parsed);
-    if (!validation.valid) {
-      console.warn('Stored stereo calibration is incompatible. Load a complete calibration or recalibrate.', validation.errors);
-      return null;
-    }
-    return parsed as StereoCalibration;
-  } catch {
-    return null;
-  }
-}
-
-function saveToStorage(cal: StereoCalibration) {
-  try { localStorage.setItem(CALIBRATION_STORAGE_KEY, JSON.stringify(cal)); } catch {}
-}
-
 export function useCameraCalibration() {
   const [captures, setCaptures] = useState<CalibrationCapture[]>([]);
-  const [calibrationResult, setCalibrationResult] = useState<StereoCalibration | null>(loadFromStorage);
+  const active = useSyncExternalStore(activeStereoCalibration.subscribe,activeStereoCalibration.getSnapshot,activeStereoCalibration.getSnapshot);
+  const calibrationResult = active.calibration;
   const [isCalibrating, setIsCalibrating] = useState(false);
 
   const addCapture = useCallback((capture: CalibrationCapture) => {
@@ -126,6 +107,7 @@ export function useCameraCalibration() {
         return null;
       }
 
+      const startingRevision=activeStereoCalibration.getSnapshot().revision;
       setIsCalibrating(true);
       console.log('🔬 Starting stereo calibration with', captures.length, 'image pairs...');
 
@@ -161,10 +143,13 @@ export function useCameraCalibration() {
 
         console.log(`✅ Using ${validCaptures.length} valid capture pairs`);
 
-        const numCorners = (checkerboardRows - 1) * (checkerboardCols - 1);
+        if(!Number.isInteger(checkerboardRows)||!Number.isInteger(checkerboardCols)||checkerboardRows<1||checkerboardCols<1)throw Error('Inner-corner rows and columns must be positive integers.');
+        const numCorners = checkerboardRows * checkerboardCols;
         if (validCaptures.some(c => c.camera1Image.corners!.length !== numCorners || c.camera2Image.corners!.length !== numCorners)) {
           throw new Error('Calibration corner counts do not match the selected checkerboard. Redetect corners with the correct pattern.');
         }
+
+        if(validCaptures.some(c=>[c.camera1Image,c.camera2Image].some(i=>i.detectionPattern&&(i.detectionPattern.rows!==checkerboardRows||i.detectionPattern.cols!==checkerboardCols))))throw Error('Checkerboard pattern changed; reprocess the captured images first.');
 
         // Determine image size from first valid capture
         const imgW = validCaptures[0].camera1Image.imageWidth;
@@ -174,6 +159,8 @@ export function useCameraCalibration() {
           throw new Error('Browser calibration requires every image in both cameras to have the same known resolution. Recapture consistently; mixed resolutions cannot share one OpenCV imageSize.');
         }
         if (!Number.isFinite(squareSize) || squareSize <= 0) throw new Error('Measured checkerboard square size in millimeters is required.');
+        const capabilities=calibrationCapabilities(cv);
+        if(!capabilities.ready)throw Error('OpenCV browser calibration unavailable: '+capabilities.missing.join(', '));
         const imageSize = new cv.Size(imgW, imgH);
         track(imageSize);
 
@@ -317,8 +304,7 @@ export function useCameraCalibration() {
         console.log('  Translation (baseline):', result.extrinsic.T);
 
         cleanup();
-        setCalibrationResult(result);
-        saveToStorage(result);
+        activeStereoCalibration.activate(result,'Browser calibration',startingRevision);
         setIsCalibrating(false);
         return result;
       } catch (err) {
@@ -352,7 +338,7 @@ export function useCameraCalibration() {
     [calibrationResult]
   );
 
-  const loadCalibration = useCallback((json: string) => {
+  const loadCalibration = useCallback((json: string, sourceName = 'Loaded calibration') => {
     try {
       const parsed = JSON.parse(json);
 
@@ -372,8 +358,7 @@ export function useCameraCalibration() {
       if (!validation.valid) throw new Error('Incompatible stereo calibration: ' + validation.errors.join(' ') + ' Load a complete calibration or recalibrate.');
 
       const calibration: StereoCalibration = parsed;
-      setCalibrationResult(calibration);
-      saveToStorage(calibration);
+      activeStereoCalibration.activate(calibration,sourceName);
       console.log('📂 Loaded calibration from file');
       console.log('  Calibration date:', calibration.calibrationDate);
       console.log('  Stereo error:', calibration.stereoReprojectionError);
@@ -391,6 +376,7 @@ export function useCameraCalibration() {
     clearCaptures,
     importCaptures,
     calibrationResult,
+    calibrationIdentity: active.identity,
     isCalibrating,
     performCalibration,
     saveCalibration,

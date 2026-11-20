@@ -1,3 +1,4 @@
+import {OpenExperimentalComparison} from './ExperimentalWorkspace';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
@@ -76,6 +77,7 @@ export function ThreeDMotionCaptureView() {
       <div className="max-w-7xl mx-auto">
         <div className="mb-6">
           <h1 className="text-3xl font-bold mb-2">3D Motion Capture</h1>
+          <OpenExperimentalComparison pipeline="P2"/>
           <p className="text-gray-400">Stereo vision pipeline with DLT triangulation</p>
         </div>
 

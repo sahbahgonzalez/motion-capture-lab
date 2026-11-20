@@ -44,7 +44,7 @@ export const COMPARISON_LIMITATIONS = [
   'P1 is image-normalized XY with inferred relative Z, not metric world coordinates. P2/P3/P4 inherit calibration millimeters.',
   'Every eligible processing callback is retained, including failed poses. Camera frames not scheduled by the browser are not reconstructed.',
   'Start recording preserves existing correction, calibration, fusion and MediaPipe state. State at start is observational, not a complete restorable controller checkpoint.',
-  'This JSON contains processed poses and selected live IMU samples, not video or a complete IMU packet archive. It is separate from Stage 2C ZIP recording.',
+  'This JSON retains processed P1?P4 poses, shared cycle timing and fusion diagnostics. Primary live analysis omits selected IMU samples; historical recordings may contain them. It is separate from optional video/ZIP recording.',
   'No absolute accuracy or hardware synchronization is established. Measurements are not ground truth.',
 ];
 
@@ -55,7 +55,7 @@ export function comparisonSnapshot<T>(value: T): T {
 export function emptyComparisonPose(): ComparisonPose {
   return Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as ComparisonPose;
 }
-function output(pose: ComparisonPose | null, reason: (key: keyof ComparisonPose) => string): PipelineOutput {
+export function comparisonOutput(pose: ComparisonPose | null, reason: (key: keyof ComparisonPose) => string): PipelineOutput {
   const points = emptyComparisonPose();
   const joints = {} as PipelineOutput['joints'];
   let availableJoints = 0;
@@ -80,9 +80,9 @@ export function buildComparisonFrame(input: ComparisonCycleInput): ComparisonFra
     if ((input.cameraA[key].visibility ?? 1) < 0.5 || (input.cameraB[key].visibility ?? 1) < 0.5) return 'low_visibility';
     return input.geometry?.joints[key]?.reason ?? 'triangulation_unavailable';
   };
-  const p2 = output(input.p2, visualReason);
-  const p3 = output(input.p3, k => p2.joints[k].reason ?? 'corrected_pose_unavailable');
-  const p4 = output(input.fusion.pose, k => {
+  const p2 = comparisonOutput(input.p2, visualReason);
+  const p3 = comparisonOutput(input.p3, k => p2.joints[k].reason ?? 'corrected_pose_unavailable');
+  const p4 = comparisonOutput(input.fusion.pose, k => {
     if (['rightShoulder', 'rightElbow', 'rightWrist'].includes(k)) return 'fusion_unavailable';
     return p3.joints[k].reason ?? 'fused_pose_unavailable';
   });
@@ -91,7 +91,7 @@ export function buildComparisonFrame(input: ComparisonCycleInput): ComparisonFra
     processingCompletedPerformanceNowMs: input.processingCompletedPerformanceNowMs,
     processingDurationMs: Math.max(0, input.processingCompletedPerformanceNowMs - input.timing.processingStartedPerformanceNowMs),
     cameras: {cameraA: {valid: !!input.cameraA, landmarks: input.cameraA}, cameraB: {valid: !!input.cameraB, landmarks: input.cameraB}},
-    pipelines: {P1: output(input.cameraA, () => 'missing_camera_a_pose'), P2: p2, P3: p3, P4: p4},
+    pipelines: {P1: comparisonOutput(input.cameraA, () => 'missing_camera_a_pose'), P2: p2, P3: p3, P4: p4},
     correction: input.correction, fusion: input.fusion.diagnostics,
     imuCorrectionActive: [input.fusion.diagnostics?.uaState, input.fusion.diagnostics?.faState]
       .some(state => state === 'IMU_CORRECTION' || state === 'RECOVERY'),

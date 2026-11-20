@@ -1,0 +1,5 @@
+import {LANDMARK_KEYS} from '../useTriangulation';
+export function source(xs:number[],times=xs.map((_,i)=>i*100)){
+ const camera1={K:[[100,0,100],[0,100,100],[0,0,1]],distortion:[],imageWidth:200,imageHeight:200};
+ return {schemaVersion:'1.0.0-live-pipeline-comparison',sessionId:'synthetic-comparative',status:'stopped',durationMs:Math.max(...times)+100,warmupEndExperimentTimeMs:0,metadata:{stereoCalibration:{camera1},cameraA:{width:200,height:200}},frames:xs.map((x,index)=>({cycleId:index,experimentTimeMs:times[index],phase:'measurement',pipelines:Object.fromEntries(['P1','P2','P3','P4'].map(id=>{const pose=Object.fromEntries(LANDMARK_KEYS.map(j=>[j,{x:id==='P1'?.5+x*.05:x,y:id==='P1'?.5:0,z:id==='P1'?0:10,visibility:1}]));pose.leftShoulder={x:id==='P1'?.45:-1,y:id==='P1'?.5:0,z:id==='P1'?0:10,visibility:1};pose.rightShoulder={x:id==='P1'?.55:1,y:id==='P1'?.5:0,z:id==='P1'?0:10,visibility:1};return [id,{pose,joints:Object.fromEntries(LANDMARK_KEYS.map(j=>[j,{valid:true,reason:null}]))}];})),fusion:{uaState:'STEREO',faState:'STEREO'}}))};
+}

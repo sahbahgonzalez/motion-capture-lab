@@ -59,6 +59,9 @@ export interface CalibrationImage {
   timestamp: number;
   imageData: string; // base64 encoded
   cornersDetected: boolean;
+  detectionStatus?: 'unprocessed' | 'detected' | 'not_found' | 'processing_error';
+  detectionError?: string | null;
+  detectionPattern?: {rows:number;cols:number};
   cornerCount?: number;
   corners?: number[][]; // detected corner [x, y] coordinates
   imageWidth?: number;

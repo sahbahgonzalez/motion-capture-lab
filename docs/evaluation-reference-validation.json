@@ -1,0 +1,37 @@
+{
+  "engineVersion": "1.0.0",
+  "sourceFile": "pipeline_comparison_70eb9f95-4f44-4106-8253-f11db4a0368e.json",
+  "sourceSha256": "b73e36f57707b8d2b2af21b33cee6d7c1d1d6cb95b3e906b4595e62d3fc4598d",
+  "sourceFingerprint": {
+    "algorithm": "fnv1a-32",
+    "value": "5e226aee",
+    "purpose": "Non-cryptographic source change detection; original recording is never rewritten."
+  },
+  "phaseProvenance": "User-specified first 114 measurement frames followed by remaining 178; not inferred from controller states.",
+  "absoluteFrameBoundary": 176,
+  "configurationSidecar": "evaluation-visible-occluded.sidecar.json",
+  "expectedReferenceChecks": {
+    "measurementFrames": 292,
+    "firstPhaseFrames": 114,
+    "firstPhaseUpperArmStereo": 114,
+    "firstPhaseForearmStereo": 114,
+    "firstPhaseImuActive": 0,
+    "secondPhaseFrames": 178,
+    "secondPhaseP3WristValid": 45,
+    "secondPhaseP4WristValid": 178,
+    "secondPhaseImuActive": 142
+  },
+  "observed": {
+    "measurementFrames": 292,
+    "firstPhaseFrames": 114,
+    "firstPhaseUpperArmStereo": 114,
+    "firstPhaseForearmStereo": 114,
+    "firstPhaseImuActive": 0,
+    "secondPhaseFrames": 178,
+    "secondPhaseP3WristValid": 45,
+    "secondPhaseP4WristValid": 178,
+    "secondPhaseImuActive": 142
+  },
+  "allChecksPassed": true,
+  "originalRecordingUnchanged": true
+}

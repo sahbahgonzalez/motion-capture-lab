@@ -1,0 +1,5 @@
+import type {StereoCalibration} from '../type/calibration';
+import {calibrationContentId,type CalibrationIdentity} from '../utils/activeStereoCalibration';
+export function ActiveCalibrationStatus({calibration,identity}:{calibration:StereoCalibration|null;identity?:CalibrationIdentity|null}){
+ return <div aria-label="Active stereo calibration" className="text-xs text-gray-300 rounded border border-gray-700 p-2">{calibration?<><strong>Active stereo calibration:</strong> {identity?.contentId===calibrationContentId(calibration)?identity.sourceName:'Provided calibration'} | content ID {calibrationContentId(calibration)} (noncryptographic) | calibrated {calibration.calibrationDate||'timestamp unavailable'}{identity?.activatedAtMs?<> | activated {new Date(identity.activatedAtMs).toISOString()}</>:null}<p>Saved training-fit stereo error: {Number.isFinite(calibration.stereoReprojectionError)?calibration.stereoReprojectionError.toFixed(3):'N/A'} px. Availability does not establish current rig validity or OpenCV runtime readiness.</p></>:'No active stereo calibration.'}</div>;
+}

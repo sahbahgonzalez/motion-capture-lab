@@ -1,3 +1,6 @@
+import {ActiveCalibrationStatus} from './ActiveCalibrationStatus';
+import {useLiveP4Experiment} from '../hooks/useLiveP4Experiment';
+import {LiveP4ExperimentPanel} from './LiveP4ExperimentPanel';
 import { SkeletonView, LANDMARK_COLORS, projectPose, computeBounds } from './PoseSkeletonView';
 import { LivePipelineComparison } from './LivePipelineComparison';
 import { useComparisonRecording } from '../hooks/useComparisonRecording';
@@ -52,6 +55,11 @@ import {
 
 interface IMUReconstructionViewProps {
   comparison?: {
+    experimental?: boolean;
+    onAnalysisActiveChange?: (active:boolean)=>void;
+    recordingBlocked?: boolean;
+    armCalibrated?: boolean;
+    onActiveChange?: (active:boolean)=>void;
     getFusionSnapshot: () => ComparisonFusionSnapshot;
     getConfiguration: () => unknown;
     imuConnected: boolean;
@@ -306,9 +314,10 @@ export function IMUReconstructionView({
   simulatedFailures = NO_SIMULATED_FAILURES,
   onSimulatedFailuresChange,
 }: IMUReconstructionViewProps) {
-  const comparisonRecorder = useComparisonRecording();
+  const comparisonRecorder = useComparisonRecording({onActiveChange:comparison?.onAnalysisActiveChange,omitIMUSamples:true});
+  const experiment = useLiveP4Experiment(camera1Stream,camera2Stream,camera1Ref,camera2Ref,comparison?.onActiveChange);
   const comparisonCycleId = useRef(0);
-  const { loadCalibration, calibrationResult } = useCameraCalibration();
+  const { loadCalibration, calibrationResult, calibrationIdentity } = useCameraCalibration();
   const calibFileRef = useRef<HTMLInputElement>(null);
   const [loadError, setLoadError]   = useState<string | null>(null);
   const [showFeeds, setShowFeeds]   = useState(true);
@@ -376,6 +385,7 @@ export function IMUReconstructionView({
         readFusion: comparison.getFusionSnapshot,
         now: () => performance.now(),
       });
+      if(comparison.experimental)experiment.accept(frame,getComparisonConfiguration());
       comparisonRecorder.accept(frame, getComparisonConfiguration());
       return;
     }
@@ -445,7 +455,7 @@ export function IMUReconstructionView({
     setLoadError(null);
     const reader = new FileReader();
     reader.onload = (ev) => {
-      try { loadCalibration(ev.target?.result as string); }
+      try { loadCalibration(ev.target?.result as string,file.name); }
       catch (err) { setLoadError((err as Error).message); }
     };
     reader.readAsText(file);
@@ -457,22 +467,24 @@ export function IMUReconstructionView({
   const jitterCount      = jointStatuses.filter(s => s.failureType !== 'none' && s.reliable).length;
 
   if (comparison) return <div className="space-y-4">
+    <ActiveCalibrationStatus calibration={calibration} identity={calibrationIdentity}/>
     <StereoGeometryNotice calibration={calibration} dimensions={[cam1W,cam1H,cam2W,cam2H]} />
     <div className="flex flex-wrap items-center gap-3">
-      <Button variant="outline" onClick={() => calibFileRef.current?.click()}>Load Stereo Calibration</Button>
+      <Button variant="outline" disabled={comparison.experimental&&['recording','finalizing'].includes(experiment.session?.manifest.status??'')} onClick={() => calibFileRef.current?.click()}>Load Stereo Calibration</Button>
       <input ref={calibFileRef} type="file" accept=".json" onChange={handleLoadCalibration} className="hidden" />
       <span>{calibration ? 'Stereo calibration loaded' : 'No stereo calibration - P2/P3 unavailable'}</span>
     </div>
     {loadError && <p role="alert">{loadError}</p>}
     <p className="text-xs text-gray-400">Camera Setup and Calibration use the existing controls. Open IMU Monitor for the existing right-arm calibration workflow.</p>
-    <LivePipelineComparison recorder={comparisonRecorder} getConfiguration={getComparisonConfiguration} camerasActive={isBothCamerasActive}
-      processing={poseRunning} error={poseError} imuConnected={comparison.imuConnected} imuCalibrationStatus={comparison.imuCalibrationStatus} />
-    <details><summary>P3 correction configuration</summary><ConfigPanel config={config} onChange={handleConfigChange} /></details>
+    {comparison.experimental?<LiveP4ExperimentPanel experiment={experiment} frame={comparisonRecorder.latest} getConfiguration={getComparisonConfiguration} camerasActive={isBothCamerasActive&&!comparison.recordingBlocked} processing={poseRunning} imuConnected={comparison.imuConnected} calibrated={!!calibration&&!!comparison.armCalibrated} error={poseError}/>:<LivePipelineComparison recorder={comparisonRecorder} getConfiguration={getComparisonConfiguration} camerasActive={isBothCamerasActive}
+      processing={poseRunning} error={poseError} imuConnected={comparison.imuConnected} imuCalibrationStatus={comparison.imuCalibrationStatus} />}
+    <details><summary>P3 correction configuration</summary><fieldset disabled={comparison.experimental&&['recording','finalizing'].includes(experiment.session?.manifest.status??'')}><ConfigPanel config={config} onChange={handleConfigChange} /></fieldset></details>
   </div>;
 
 
   return (
     <div className="space-y-6">
+      <ActiveCalibrationStatus calibration={calibration} identity={calibrationIdentity}/>
       <StereoGeometryNotice calibration={calibration} dimensions={[cam1W,cam1H,cam2W,cam2H]} />
       {/* ── Status bar ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-3 flex-wrap">

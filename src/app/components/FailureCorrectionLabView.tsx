@@ -1,3 +1,4 @@
+import {OpenExperimentalComparison} from './ExperimentalWorkspace';
 /**
  * FailureCorrectionLabView
  *
@@ -85,6 +86,7 @@ export function FailureCorrectionLabView() {
       <div className="max-w-7xl mx-auto">
         <div className="mb-6">
           <h1 className="text-3xl font-bold mb-1">3D + Failure Correction</h1>
+          <OpenExperimentalComparison pipeline="P3"/>
           <p className="text-gray-400 text-sm">
             Stereo pipeline with per-joint jitter detection and EMA correction.
             RAW output preserved alongside corrected output.

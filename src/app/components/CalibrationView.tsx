@@ -1,4 +1,7 @@
-import { useState, useRef, type RefObject } from 'react';
+import {ActiveCalibrationStatus} from './ActiveCalibrationStatus';
+import {processCheckerboardCaptures,detectionStatus} from '../utils/checkerboardCaptureProcessing';
+import {StereoCalibrationValidation} from './StereoCalibrationValidation';
+import { useState, useRef, useEffect, type RefObject } from 'react';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
 import { Input } from './ui/input';
@@ -32,21 +35,23 @@ async function detectCornersFromDataURL(
   dataURL: string,
   patternSize: { width: number; height: number },
   cv: any,
-): Promise<{ found: boolean; corners?: number[][]; width: number; height: number }> {
+): Promise<{ found: boolean; corners?: number[][]; width: number; height: number; error?:string }> {
   return new Promise((resolve) => {
     const img = new Image();
     img.onload = () => {
       const canvas = document.createElement('canvas');
       canvas.width = img.width;
       canvas.height = img.height;
-      const ctx = canvas.getContext('2d')!;
+      let src:any,gray:any,corners:any;
+      try {
+      const ctx = canvas.getContext('2d');
+      if(!ctx)throw Error('Canvas 2D context unavailable.');
       ctx.drawImage(img, 0, 0);
       const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
 
-      const src = cv.matFromImageData(imageData);
-      const gray = new cv.Mat();
-      const corners = new cv.Mat();
-      try {
+      src = cv.matFromImageData(imageData);
+      gray = new cv.Mat();
+      corners = new cv.Mat();
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
 
         const found = cv.findChessboardCorners(
@@ -58,7 +63,7 @@ async function detectCornersFromDataURL(
 
         if (found) {
           const criteria = new cv.TermCriteria(
-            cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001,
+            cv.TermCriteria_EPS + cv.TermCriteria_MAX_ITER, 30, 0.001,
           );
           cv.cornerSubPix(gray, corners, new cv.Size(11, 11), new cv.Size(-1, -1), criteria);
           const cornerArray: number[][] = [];
@@ -69,13 +74,13 @@ async function detectCornersFromDataURL(
         } else {
           resolve({ found: false, width: img.width, height: img.height });
         }
-      } catch {
-        resolve({ found: false, width: img.width, height: img.height });
+      } catch(error) {
+        resolve({ found: false, width: img.width, height: img.height, error:String(error) });
       } finally {
-        src.delete(); gray.delete(); corners.delete();
+        for(const mat of [src,gray,corners]){try{mat?.delete();}catch{}}
       }
     };
-    img.onerror = () => resolve({ found: false, width: 0, height: 0 });
+    img.onerror = () => resolve({ found: false, width: 0, height: 0, error:'Image could not be decoded.' });
     img.src = dataURL;
   });
 }
@@ -94,13 +99,15 @@ export function CalibrationView({
     clearCaptures,
     importCaptures,
     calibrationResult,
+    calibrationIdentity,
     isCalibrating,
     performCalibration,
     saveCalibration,
     loadCalibration,
   } = useCameraCalibration();
 
-  const { isLoaded: cvLoaded, isLoading: cvLoading } = useOpenCV();
+  const validationOpenCV = useOpenCV();
+  const { isLoaded: cvLoaded, isLoading: cvLoading, calibrationReady, missingCalibrationBindings, error: cvError } = validationOpenCV;
 
   const [checkerboardRows, setCheckerboardRows] = useState(5);
   const [checkerboardCols, setCheckerboardCols] = useState(8);
@@ -115,7 +122,10 @@ export function CalibrationView({
   const calibFileRef = useRef<HTMLInputElement>(null);
   const capturesFileRef = useRef<HTMLInputElement>(null);
 
+  const processingGeneration=useRef(0);
+  useEffect(()=>()=>{processingGeneration.current++;},[]);
   const captureFrame = () => {
+    if(importProgress)return;
     const v1 = camera1Ref.current;
     const v2 = camera2Ref.current;
     if (!v1 || !v2 || !canvas1Ref.current || !canvas2Ref.current) return;
@@ -143,6 +153,7 @@ export function CalibrationView({
       timestamp: ts,
       imageData: c1.toDataURL('image/jpeg', 0.85),
       cornersDetected: false,
+      detectionStatus: 'unprocessed',
       imageWidth: w1,
       imageHeight: h1,
     };
@@ -153,6 +164,7 @@ export function CalibrationView({
       timestamp: ts,
       imageData: c2.toDataURL('image/jpeg', 0.85),
       cornersDetected: false,
+      detectionStatus: 'unprocessed',
       imageWidth: w2,
       imageHeight: h2,
     };
@@ -188,7 +200,7 @@ export function CalibrationView({
     const reader = new FileReader();
     reader.onload = (ev) => {
       try {
-        loadCalibration(ev.target?.result as string);
+        loadCalibration(ev.target?.result as string,file.name);
       } catch (err) {
         setLoadError((err as Error).message);
       }
@@ -197,98 +209,28 @@ export function CalibrationView({
     e.target.value = '';
   };
 
+  const reprocess = async (items=captures,rows=checkerboardRows,cols=checkerboardCols,token=++processingGeneration.current) => {
+    if(!cvLoaded||!window.cv){setImportStatus('Images retained. Checkerboard processing unavailable; resolve the OpenCV capability error, then click Reprocess Captured Images.');return;}
+    setImportProgress({done:0,total:items.length});setLoadError(null);
+    try{
+      const processed=await processCheckerboardCaptures(items,{rows,cols},url=>detectCornersFromDataURL(url,{width:cols,height:rows},window.cv),done=>{if(processingGeneration.current===token)setImportProgress({done,total:items.length});},()=>processingGeneration.current===token);
+      if(!processed||processingGeneration.current!==token)return;
+      importCaptures(processed);
+      const both=processed.filter(c=>c.bothCornersDetected).length,errors=processed.flatMap(c=>[c.camera1Image,c.camera2Image]).filter(i=>i.detectionStatus==='processing_error').length;
+      setImportStatus(`Processed ${processed.length} pairs: ${both} detected in both cameras; ${errors} image processing errors. Original images retained. No calibration was run.`);
+    }catch(error){if(processingGeneration.current===token)setLoadError(String(error));}finally{if(processingGeneration.current===token)setImportProgress(null);}
+  };
   const handleImportCaptures = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    setLoadError(null);
-    setImportStatus(null);
-    setCalibError(null);
-
-    const reader = new FileReader();
-    reader.onload = async (ev) => {
-      try {
-        const parsed = JSON.parse(ev.target?.result as string);
-        if (!parsed.captures || !Array.isArray(parsed.captures)) {
-          throw new Error('Not a captures file — expected a JSON with a "captures" array.');
-        }
-
-        const config = parsed.checkerboardConfig;
-        const rows = config?.rows ?? checkerboardRows;
-        const cols = config?.cols ?? checkerboardCols;
-        const sq = config?.squareSize ?? squareSize;
-        if (config) {
-          setCheckerboardRows(rows);
-          setCheckerboardCols(cols);
-          setSquareSize(sq);
-        }
-
-        const rawCaptures: CalibrationCapture[] = parsed.captures;
-
-        if (!cvLoaded || !window.cv) {
-          importCaptures(rawCaptures);
-          setImportStatus(
-            `Loaded ${rawCaptures.length} captures. OpenCV not ready yet — wait for it to finish loading, then try again.`,
-          );
-          return;
-        }
-
-        const cv = window.cv;
-        // cols/rows are inner-corner counts (Squares − 1) as labeled in the UI.
-        const patternSize = { width: cols, height: rows };
-
-        setImportProgress({ done: 0, total: rawCaptures.length });
-        setImportStatus('Detecting checkerboard corners in each image…');
-
-        const processed: CalibrationCapture[] = [];
-        let bothDetected = 0;
-
-        for (let i = 0; i < rawCaptures.length; i++) {
-          const cap = rawCaptures[i];
-          setImportProgress({ done: i + 1, total: rawCaptures.length });
-
-          const [r1, r2] = await Promise.all([
-            detectCornersFromDataURL(cap.camera1Image.imageData, patternSize, cv),
-            detectCornersFromDataURL(cap.camera2Image.imageData, patternSize, cv),
-          ]);
-
-          processed.push({
-            ...cap,
-            camera1Image: {
-              ...cap.camera1Image,
-              cornersDetected: r1.found,
-              corners: r1.corners,
-              imageWidth: r1.width || cap.camera1Image.imageWidth,
-              imageHeight: r1.height || cap.camera1Image.imageHeight,
-            },
-            camera2Image: {
-              ...cap.camera2Image,
-              cornersDetected: r2.found,
-              corners: r2.corners,
-              imageWidth: r2.width || cap.camera2Image.imageWidth,
-              imageHeight: r2.height || cap.camera2Image.imageHeight,
-            },
-            bothCornersDetected: r1.found && r2.found,
-          });
-
-          if (r1.found && r2.found) bothDetected++;
-          await new Promise(r => setTimeout(r, 0));
-        }
-
-        importCaptures(processed);
-        setImportProgress(null);
-        setImportStatus(
-          `Imported ${processed.length} captures — ${bothDetected} have corners detected in both cameras.` +
-          (bothDetected >= 10
-            ? ' Ready to calibrate!'
-            : ` Need at least 10 good pairs (${10 - bothDetected} more needed).`),
-        );
-      } catch (err) {
-        setImportProgress(null);
-        setLoadError((err as Error).message);
-      }
-    };
-    reader.readAsText(file);
-    e.target.value = '';
+    const file=e.target.files?.[0];if(!file)return;const token=++processingGeneration.current;setLoadError(null);setImportStatus(null);setImportProgress({done:0,total:0});
+    const reader=new FileReader();reader.onload=async ev=>{if(processingGeneration.current!==token)return;
+      try{const parsed=JSON.parse(ev.target?.result as string);if(!Array.isArray(parsed.captures))throw Error('Expected a captures array.');
+        const config=parsed.checkerboardConfig,rows=config?.rows??checkerboardRows,cols=config?.cols??checkerboardCols,sq=config?.squareSize??squareSize;
+        if(!Number.isInteger(rows)||!Number.isInteger(cols)||rows<1||cols<1||!Number.isFinite(sq)||sq<=0)throw Error('Invalid checkerboard configuration.');
+        if(parsed.captures.some((c:CalibrationCapture)=>!c.camera1Image?.imageData||!c.camera2Image?.imageData))throw Error('Every pair must contain both original images.');
+        setCheckerboardRows(rows);setCheckerboardCols(cols);setSquareSize(sq);const retained=parsed.captures.map((c:CalibrationCapture)=>({...c,camera1Image:{...c.camera1Image,detectionStatus:detectionStatus(c.camera1Image)},camera2Image:{...c.camera2Image,detectionStatus:detectionStatus(c.camera2Image)}}));importCaptures(retained);
+        if(cvLoaded)await reprocess(retained,rows,cols,token);else setImportStatus(`Loaded ${parsed.captures.length} pairs without processing. OpenCV checkerboard functions are unavailable; images remain reusable in Python or through Reprocess Captured Images.`);
+      }catch(error){if(processingGeneration.current===token)setLoadError(String(error));}finally{if(processingGeneration.current===token)setImportProgress(null);}
+    };reader.onerror=()=>{if(processingGeneration.current===token){setLoadError('Capture file could not be read.');setImportProgress(null);}};reader.readAsText(file);e.target.value='';
   };
 
   const runCalibration = async () => {
@@ -300,7 +242,7 @@ export function CalibrationView({
     }
   };
 
-  const goodCaptures = captures.filter(c => c.bothCornersDetected).length;
+  const goodCaptures = captures.filter(c => c.bothCornersDetected&&[c.camera1Image,c.camera2Image].every(i=>!i.detectionPattern||i.detectionPattern.rows===checkerboardRows&&i.detectionPattern.cols===checkerboardCols)).length;
 
   return (
     <div className="space-y-6">
@@ -342,6 +284,7 @@ export function CalibrationView({
             <Label className="text-gray-300">Inner Rows</Label>
             <Input
               type="number"
+              disabled={!!importProgress||isCalibrating}
               value={checkerboardRows}
               onChange={(e) => setCheckerboardRows(parseInt(e.target.value))}
               className="bg-gray-800 border-gray-700 text-white mt-1"
@@ -353,6 +296,7 @@ export function CalibrationView({
             <Label className="text-gray-300">Inner Cols</Label>
             <Input
               type="number"
+              disabled={!!importProgress||isCalibrating}
               value={checkerboardCols}
               onChange={(e) => setCheckerboardCols(parseInt(e.target.value))}
               className="bg-gray-800 border-gray-700 text-white mt-1"
@@ -364,6 +308,7 @@ export function CalibrationView({
             <Label className="text-gray-300">Square Size (mm)</Label>
             <Input
               type="number"
+              disabled={!!importProgress||isCalibrating}
               value={squareSize}
               onChange={(e) => setSquareSize(parseInt(e.target.value))}
               className="bg-gray-800 border-gray-700 text-white mt-1"
@@ -406,7 +351,7 @@ export function CalibrationView({
             </div>
           ))}
         </div>
-        <Button onClick={captureFrame} disabled={!isBothCamerasActive} className="bg-blue-600 hover:bg-blue-700">
+        <Button onClick={captureFrame} disabled={!isBothCamerasActive||!!importProgress} className="bg-blue-600 hover:bg-blue-700">
           <Camera className="h-4 w-4 mr-2" />
           Capture Frame
         </Button>
@@ -428,7 +373,7 @@ export function CalibrationView({
             </p>
           </div>
           {captures.length > 0 && (
-            <Button onClick={clearCaptures} variant="outline" size="sm">
+            <Button onClick={clearCaptures} disabled={!!importProgress} variant="outline" size="sm">
               <Trash2 className="h-4 w-4 mr-2" />
               Clear
             </Button>
@@ -445,15 +390,10 @@ export function CalibrationView({
                   <img src={cap.camera2Image.imageData} alt="cam2" className="flex-1 h-16 object-cover rounded" />
                 </div>
                 <div className="shrink-0 text-xs text-center w-16">
-                  {cap.bothCornersDetected ? (
-                    <span className="text-green-400">✓ both</span>
-                  ) : (
-                    <span className="text-red-400">
-                      {cap.camera1Image.cornersDetected ? '✓' : '✗'}/{cap.camera2Image.cornersDetected ? '✓' : '✗'}
-                    </span>
-                  )}
+                  <span> A: {detectionStatus(cap.camera1Image)} / B: {detectionStatus(cap.camera2Image)}</span>
+                  {[cap.camera1Image,cap.camera2Image].map((image,i)=><p key={i}>{image.detectionError?`Camera ${i+1}: ${image.detectionError}`:null}{image.detectionPattern&&(image.detectionPattern.rows!==checkerboardRows||image.detectionPattern.cols!==checkerboardCols)?' Pattern changed; reprocess.':null}</p>)}
                 </div>
-                <button onClick={() => removeCapture(cap.id)} className="bg-red-600 hover:bg-red-700 rounded p-1 shrink-0">
+                <button disabled={!!importProgress} onClick={() => removeCapture(cap.id)} className="bg-red-600 hover:bg-red-700 rounded p-1 shrink-0">
                   <Trash2 className="h-3 w-3" />
                 </button>
               </div>
@@ -462,6 +402,7 @@ export function CalibrationView({
         )}
       </Card>
 
+      <div className="text-sm text-gray-300 space-y-2" aria-label="OpenCV calibration capabilities"><p>Checkerboard processing: {cvLoaded?'ready':cvLoading?'initializing':'unavailable'} | Browser calibration: {calibrationReady?'ready':'unavailable'}</p>{cvError&&<p role="alert">{cvError}</p>}{missingCalibrationBindings.length>0&&<p>Missing calibration bindings: {missingCalibrationBindings.join(', ')}</p>}<p>Saved calibration availability is independent of OpenCV readiness. Exported images can still be calibrated using the existing Python workflow; load its output explicitly after independent validation.</p><Button onClick={()=>void reprocess()} disabled={!captures.length||!cvLoaded||!!importProgress||isCalibrating}>Reprocess Captured Images</Button></div>
       {/* Import / Export / Calibrate */}
       <Card className="bg-gray-900 border-gray-700 p-6">
         <h3 className="text-lg font-semibold text-white mb-4">Import / Export / Calibrate</h3>
@@ -487,10 +428,10 @@ export function CalibrationView({
 
           <Button
             onClick={runCalibration}
-            disabled={goodCaptures < 10 || isCalibrating || !cvLoaded}
+            disabled={goodCaptures < 10 || isCalibrating || !calibrationReady || !!importProgress}
             className="bg-green-700 hover:bg-green-600 disabled:opacity-50"
             title={
-              !cvLoaded ? 'OpenCV not ready' :
+              !calibrationReady ? 'Required browser calibration functions are unavailable' :
               goodCaptures < 10 ? `Need ${10 - goodCaptures} more good pairs` : ''
             }
           >
@@ -531,13 +472,14 @@ export function CalibrationView({
         )}
       </Card>
 
+      <ActiveCalibrationStatus calibration={calibrationResult} identity={calibrationIdentity}/>
       {/* Calibration result */}
       {calibrationResult?.camera1 && calibrationResult?.camera2 && (
         <Card className="bg-gray-900 border-gray-700 p-6">
           <div className="flex items-center justify-between mb-4">
             <h3 className="text-lg font-semibold text-white flex items-center gap-2">
               <CheckCircle2 className="h-5 w-5 text-green-500" />
-              Calibration Ready
+              Saved Calibration Available
             </h3>
             <Button onClick={() => saveCalibration()} className="bg-green-700 hover:bg-green-600" size="sm">
               <Download className="h-4 w-4 mr-2" />
@@ -565,7 +507,7 @@ export function CalibrationView({
             </div>
           </div>
           <p className="text-sm text-gray-400">
-            Save the file above, then load it in the <strong className="text-white">3D Reconstruction</strong> tab.
+            Export this calibration for independent validation. The active snapshot is shared with reconstruction; the original calibration file on disk is not changed.
           </p>
           {calibrationResult.calibrationDate && (
             <div className="text-xs text-gray-500 mt-2">
@@ -574,6 +516,8 @@ export function CalibrationView({
           )}
         </Card>
       )}
+
+      <StereoCalibrationValidation openCV={validationOpenCV} camera1Stream={camera1Stream} camera2Stream={camera2Stream} camera1Ref={camera1Ref} camera2Ref={camera2Ref} isBothCamerasActive={isBothCamerasActive}/>
 
       <canvas ref={canvas1Ref} style={{ display: 'none' }} />
       <canvas ref={canvas2Ref} style={{ display: 'none' }} />

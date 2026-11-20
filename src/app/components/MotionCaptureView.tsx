@@ -1,3 +1,4 @@
+import {OpenExperimentalComparison} from './ExperimentalWorkspace';
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { useMediaPipePose } from '../hooks/useMediaPipePose';
 import { useMotionRecorderWithSync } from '../hooks/useMotionRecorderWithSync';
@@ -222,6 +223,7 @@ export function MotionCaptureView({}: MotionCaptureViewProps) {
         {/* Header */}
         <div className="flex items-center justify-center mb-6">
           <h1 className="text-2xl font-bold">Motion Capture Lab</h1>
+          <OpenExperimentalComparison pipeline="P1"/>
         </div>
 
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">

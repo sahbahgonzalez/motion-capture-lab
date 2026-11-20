@@ -37,7 +37,7 @@ it('rejects mixed browser calibration resolutions before invoking OpenCV calibra
   const image=(w:number)=>({imageWidth:w,imageHeight:720,corners:[[10,10]],cornersDetected:true});
   const captures=Array.from({length:10},(_,i)=>({bothCornersDetected:true,camera1Image:image(1280),camera2Image:image(i===9?640:1280)})) as CalibrationCapture[];
   act(()=>h.hook.importCaptures(captures));
-  // A 2x2 square pattern contains one inner corner; dimension validation is next.
-  await act(async()=>{await expect(h.hook.performCalibration(2,2,25)).rejects.toThrow(/same known resolution/);});
+  // One inner corner isolates the subsequent resolution guard.
+  await act(async()=>{await expect(h.hook.performCalibration(1,1,25)).rejects.toThrow(/same known resolution/);});
   expect(h.hook.calibrationResult).toBeNull();expect(h.hook.isCalibrating).toBe(false);
 });

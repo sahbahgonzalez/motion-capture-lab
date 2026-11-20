@@ -1,0 +1,14 @@
+import {useEffect,useState} from 'react';
+import {ComparisonJointAnalysis} from './ComparisonJointAnalysis';
+import {useLiveComparisonResults} from '../evaluation/liveSessions';
+import {importComparisonSession} from '../evaluation/importSession';
+export function ComparisonResults({sessionId}:{sessionId?:string}={}){
+ const snapshot=useLiveComparisonResults(),[selected,setSelected]=useState(sessionId??snapshot.selectedId??'historical'),[imports,setImports]=useState<Array<{id:string;source:unknown;name:string}>>([]),[open,setOpen]=useState(false),[error,setError]=useState<string|null>(null),[loading,setLoading]=useState(false);
+ useEffect(()=>{setSelected(sessionId??snapshot.selectedId??'historical');setOpen(false);},[sessionId,snapshot.selectedId]);
+ const entry=snapshot.sessions.find(s=>s.source.sessionId===selected),historical=imports.find(s=>s.id===selected),source=entry?.source??historical?.source;
+ return <section aria-label="Comparison results" className="text-gray-200 p-4 space-y-3"><h2 className="text-xl font-semibold">Comparison recordings</h2><label>Completed session <select aria-label="Completed comparison session" className="bg-gray-800 rounded p-2" value={selected} onChange={e=>{setSelected(e.target.value);setOpen(false);}}><option value="historical">Import historical comparison JSON</option>{snapshot.sessions.map(s=><option key={s.source.sessionId} value={s.source.sessionId}>{s.source.sessionId} - {s.source.frames.length} cycles</option>)}{imports.map(s=><option key={s.id} value={s.id}>{s.name}</option>)}</select></label>
+ <label className="block">Import comparison recording <input aria-label="Import comparison recordings" type="file" accept=".json,application/json" onChange={async e=>{const file=e.target.files?.[0];if(!file)return;e.target.value='';setLoading(true);setError(null);try{const source=JSON.parse(await file.text());const imported=importComparisonSession(source);const id='import-'+Date.now()+'-'+file.name;setImports(old=>[...old,{id,source,name:(imported.sessionId??file.name)+' - '+imported.frames.length+' cycles'}]);setSelected(id);setOpen(false);setError(null);}catch(err){setError(err instanceof Error?err.message:String(err));}finally{setLoading(false);}}}/></label>
+ {loading&&<p role="status">Loading comparison recording...</p>}{error&&<p role="alert">{error}</p>}<button className="bg-blue-600 rounded px-4 py-2 disabled:opacity-50" disabled={!source||loading} onClick={()=>setOpen(true)}>Analyze</button><p className="text-xs text-gray-400">Stop a recording, then click Analyze. Completed sessions are held in memory until exported. Historical JSON is analyzed directly without reconstruction.</p>
+ {open&&source&&<ComparisonJointAnalysis source={source} initialConfig={entry?.config} onClose={()=>setOpen(false)}/>}
+ </section>;
+}

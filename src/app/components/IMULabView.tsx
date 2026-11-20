@@ -977,7 +977,9 @@ export function IMULabView({ comparisonMode = false }: {comparisonMode?: boolean
   const { calibrationResult } = useCameraCalibration();
   const bothCamerasActive = isCamera1Active && isCamera2Active;
 
-  const [activeInnerTab, setActiveInnerTab] = useState(comparisonMode ? 'reconstruction' : 'cameras');
+  const [activeInnerTab, setActiveInnerTab] = useState(comparisonMode ? 'comparison' : 'cameras');
+  const [experimentalActive,setExperimentalActive]=useState(false);
+  const [liveAnalysisActive,setLiveAnalysisActive]=useState(false);
   const [warmupSeconds,setWarmupSeconds] = useState(3);
   const runtimeReportRef = useRef<ReconstructionRuntimeReport | null>(null);
   const notifyMasterConfigurationRef = useRef<() => void>(() => {});
@@ -1923,6 +1925,8 @@ export function IMULabView({ comparisonMode = false }: {comparisonMode?: boolean
             <TabsTrigger value="cameras">Camera Setup</TabsTrigger>
             <TabsTrigger value="calibration">Calibration</TabsTrigger>
             <TabsTrigger value="reconstruction">Reconstruction + Correction</TabsTrigger>
+            <TabsTrigger value="comparison" disabled={experimentalActive}>Comparison - LIVE P1-P4</TabsTrigger>
+            <TabsTrigger value="experiment" disabled={liveAnalysisActive}>Optional P4 + video capture</TabsTrigger>
             <TabsTrigger value="imu" className="data-[state=active]:bg-blue-900">
               <Activity className="h-3.5 w-3.5 mr-1.5" />IMU
             </TabsTrigger>
@@ -2032,10 +2036,11 @@ export function IMULabView({ comparisonMode = false }: {comparisonMode?: boolean
           <TabsContent
             value="reconstruction"
             forceMount
-            className={activeInnerTab === 'reconstruction' ? '' : 'hidden'}
+            className={activeInnerTab === 'reconstruction'||activeInnerTab === 'comparison'||activeInnerTab === 'experiment' ? '' : 'hidden'}
           >
             <IMUReconstructionView
-              comparison={comparisonMode ? {
+              comparison={comparisonMode||activeInnerTab==='comparison'||activeInnerTab==='experiment'||experimentalActive||liveAnalysisActive ? {
+                experimental:activeInnerTab==='experiment'||experimentalActive,onAnalysisActiveChange:active=>{setLiveAnalysisActive(active);if(!active)setActiveInnerTab('comparison');},recordingBlocked:isVideoRecording,armCalibrated:!!armCalibration&&armCalibration.quality!=='failed',onActiveChange:setExperimentalActive,
                 imuConnected, imuCalibrationStatus: armCalibration?.quality ?? 'not calibrated',
                 getFusionSnapshot: () => ({
                   pose: fusedReconPoseRef.current, diagnostics: fusionDiagRef.current,
@@ -2705,7 +2710,7 @@ export function IMULabView({ comparisonMode = false }: {comparisonMode?: boolean
               </div>
               <div className="flex gap-3">
                 {!isVideoRecording ? (
-                  <Button onClick={startVideoRecording} disabled={!bothCamerasActive}
+                  <Button onClick={startVideoRecording} disabled={!bothCamerasActive||experimentalActive||liveAnalysisActive}
                     className="bg-red-600 hover:bg-red-700 text-white">
                     <Circle className="h-4 w-4 mr-2 fill-white" /> Start Master Session
                   </Button>

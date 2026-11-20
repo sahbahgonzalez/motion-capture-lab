@@ -29,6 +29,9 @@ function figmaAssetResolver() {
 }
 
 export default defineConfig({
+  // Compiler/source trees in ignored tmp folders are not application entries.
+  optimizeDeps: { entries: ['index.html'] },
+  server: { watch: { ignored: ['**/tmp/**', '**/temp/**'] } },
   define: { 'import.meta.env.VITE_RUNTIME_BUILD_METADATA': JSON.stringify(buildMetadata) },
   plugins: [
     figmaAssetResolver(),

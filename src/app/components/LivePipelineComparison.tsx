@@ -1,3 +1,4 @@
+import {ComparisonResults} from './ComparisonResults';
 import { useEffect, useState } from 'react';
 import { LivePoseOverlay } from './LivePoseOverlay';
 import { SkeletonView } from './PoseSkeletonView';
@@ -26,12 +27,14 @@ export function LivePipelineComparison({ recorder, getConfiguration, camerasActi
   imuCalibrationStatus: string;
 }) {
   const [warmup, setWarmup] = useState(3);
+  const [now,setNow]=useState(()=>performance.now());
   const frame = recorder.latest;
   const [bounds, setBounds] = useState<ReturnType<typeof boundsFor>>(null);
   useEffect(() => { if (!bounds) { const next = boundsFor(frame); if (next) setBounds(next); } }, [bounds, frame]);
   const session = recorder.session, active = session?.status === 'recording';
   const diag = frame?.fusion;
-  const duration = session ? (active && frame?.experimentTimeMs !== null ? frame?.experimentTimeMs ?? 0 : session.durationMs) : 0;
+  useEffect(()=>{if(!active)return;setNow(performance.now());const timer=setInterval(()=>setNow(performance.now()),200);return()=>clearInterval(timer);},[active,session?.sessionId]);
+  const duration=session?(active?Math.max(0,now-session.originPerformanceNowMs):session.durationMs):0;
   const count = session?.frames.length ?? 0;
   const first = session?.frames[0], last = session?.frames.at(-1);
   const span = first && last ? last.timing.processingStartedPerformanceNowMs - first.timing.processingStartedPerformanceNowMs : 0;
@@ -39,8 +42,8 @@ export function LivePipelineComparison({ recorder, getConfiguration, camerasActi
   return <section className="space-y-4 text-gray-200" aria-label="Live Pipeline Comparison">
     <div className="flex flex-wrap gap-3 text-sm">
       <span>Cameras: {camerasActive ? 'connected' : 'inactive'}</span><span>Processing: {processing ? 'running' : 'stopped'}</span>
-      <span>IMU socket: {imuConnected ? 'connected' : 'disconnected'}</span><span>Arm calibration: {imuCalibrationStatus}</span>
-      <span>Current processing rate: {recorder.processingRateHz === null ? 'unavailable' : recorder.processingRateHz.toFixed(1) + ' Hz'}</span>
+      <span>IMU socket: {imuConnected ? 'connected' : 'disconnected'}</span><span>Arm calibration: {imuCalibrationStatus}</span><span>IMU receipt ages UA/FA: {diag?.imu01AgeMs??'unavailable'} / {diag?.imu02AgeMs??'unavailable'} ms</span>
+      <span>Live FPS: {frame&&now-frame.timing.processingStartedPerformanceNowMs>1000?'0.0 Hz (no recent cycle)':recorder.processingRateHz === null ? 'unavailable' : recorder.processingRateHz.toFixed(1) + ' Hz'}</span>
       <span>Session rate: {rate === null ? 'unavailable' : rate.toFixed(1) + ' Hz'}</span>
     </div>
     {error && <p role="alert" className="text-red-300">{error}</p>}
@@ -53,19 +56,19 @@ export function LivePipelineComparison({ recorder, getConfiguration, camerasActi
     </div>}
     <div className="flex flex-wrap gap-3 items-center">
       <label>Warmup seconds <input aria-label="Comparison warmup seconds" type="number" min="0" step="0.5" disabled={active} value={warmup} onChange={e => setWarmup(Number(e.target.value))} className="w-20 bg-gray-800 p-1" /></label>
-      <button className="rounded bg-green-800 px-3 py-2 disabled:opacity-40" disabled={!!session || !processing || !Number.isFinite(warmup) || warmup < 0} onClick={() => recorder.start(warmup * 1000, getConfiguration())}>Start Comparison</button>
-      <button className="rounded bg-red-800 px-3 py-2 disabled:opacity-40" disabled={!active} onClick={recorder.stop}>Stop Comparison</button>
+      <button className="rounded bg-green-800 px-3 py-2 disabled:opacity-40" disabled={!!session || !camerasActive || !processing || !Number.isFinite(warmup) || warmup < 0} onClick={() => recorder.start(warmup * 1000, getConfiguration())}>Start Analysis</button>
+      <button className="rounded bg-red-800 px-3 py-2 disabled:opacity-40" disabled={!active} onClick={recorder.stop}>Stop Analysis</button>
       <button className="rounded bg-blue-800 px-3 py-2 disabled:opacity-40" disabled={!session || active} onClick={recorder.exportSession}>Export Session</button>
       <button className="rounded bg-gray-700 px-3 py-2 disabled:opacity-40" disabled={!session || active} onClick={recorder.clear}>Clear Session</button>
       <button className="rounded bg-gray-700 px-3 py-2" onClick={() => setBounds(boundsFor(frame))}>Fit shared viewport</button>
     </div>
     <p className="text-sm">{active ? 'RECORDING' : session ? 'Stopped' : 'Preview'} | {count} cycles | {(duration / 1000).toFixed(2)} s | {active ? frame?.phase ?? 'waiting for cycle' : 'Warmup samples retained'} | Cycle {frame?.cycleId ?? '-'}</p>
-    <p className="text-xs text-gray-400">Viewport is fixed after its first valid stereo pose. Use Fit shared viewport to reframe. Stop and export before leaving this application tab; sessions are held in memory.</p>
+    <p className="text-xs text-gray-400">Viewport is fixed after its first valid stereo pose. Use Fit shared viewport to reframe. Stop Analysis retains the P1-P4 outputs; click Analyze below to open Joint Analysis. Completed sessions also remain available in Evaluation Results until page refresh; export to keep them.</p>
     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
       {(['P1', 'P2', 'P3', 'P4'] as const).map(id => <article key={id} className="rounded border border-gray-700 bg-gray-900 p-3 overflow-auto">
         <h3 className="font-semibold">{id} - {{P1: 'Camera A monocular', P2: 'Raw stereo', P3: 'Corrected stereo', P4: 'Final conditional IMU fusion'}[id]}</h3>
         <p className="text-xs text-gray-400">{frame?.pipelines[id].availableJoints ?? 0}/{LANDMARK_KEYS.length} joints | {frame?.pipelines[id].status ?? 'unavailable'} | {id === 'P1' ? 'image-normalized, inferred Z' : 'mm, front projection'}</p>
-        {id === 'P1' ? <div className="relative" style={{width: 420, height: 270}}>
+        {id === 'P1' ? <div className="relative max-w-full overflow-auto" style={{width: 420, height: 270}}>
           <LivePoseOverlay landmarks={frame ? frame.pipelines.P1.pose as PoseLandmarks : null} videoWidth={420} videoHeight={270} />
         </div> : <SkeletonView pose3D={(frame?.pipelines[id].pose ?? Object.fromEntries(LANDMARK_KEYS.map(k => [k, null]))) as TriangulatedPose} view="front" width={420} height={270} sharedBounds={bounds} />}
       </article>)}
@@ -85,6 +88,7 @@ export function LivePipelineComparison({ recorder, getConfiguration, camerasActi
       <p>Cycle processing: {frame?.processingDurationMs.toFixed(1) ?? '-'} ms (includes inference and reconstruction; excludes rendering/export)</p>
       {!!frame?.errors.length && <p role="alert" className="text-red-300">{frame.errors.join('; ')}</p>}
     </div>
+    {session?.status==='stopped'&&<ComparisonResults sessionId={session.sessionId}/>}
     <details><summary>Recording limitations</summary><ul className="list-disc pl-5 text-xs space-y-1">{COMPARISON_LIMITATIONS.map(text => <li key={text}>{text}</li>)}</ul></details>
   </section>;
 }

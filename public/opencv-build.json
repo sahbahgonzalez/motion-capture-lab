@@ -1,0 +1,24 @@
+{
+  "opencvVersion": "4.12.0",
+  "opencvCommit": "49486f61fb25722cbcf586b7f4320921d46fb38e",
+  "officialSource": "https://github.com/opencv/opencv",
+  "emsdkCommit": "0b3bcbc3b005cbb811d48e497eabcc6846d43001",
+  "emscriptenVersion": "3.1.64",
+  "sha256": "a759a1bb460b6b7fda9ce904831b0e417518b5e2f78b01f122fd8b01ac5f97e9",
+  "bindingConfig": "scripts/opencv-calibration.config.py",
+  "bindingConfigSha256": "3b2d1ca11db06259b54c6ed10ddcda8cebe7ba20951a677ed4398b07971d61bf",
+  "buildScript": "scripts/build-opencv-calibration.py",
+  "upstreamSourceModifications": false,
+  "buildWorkaround": "Quote generated Ninja --post-js path for Windows paths containing spaces.",
+  "verification": {
+    "requiredBindings": "passed",
+    "realWasmRegressionTests": 3,
+    "browserDetectedPairs": 14,
+    "browserDetectedImages": 28,
+    "cornersPerImage": 24,
+    "browserCalibrationAndExport": "passed",
+    "productionSchemaCompatible": true,
+    "independentPythonGeometryAgreement": "passed",
+    "limitations": "Training-image software compatibility verification; calibration quality is not approved and physical cameras were not exercised."
+  }
+}

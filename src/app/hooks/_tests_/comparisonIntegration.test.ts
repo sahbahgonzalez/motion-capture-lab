@@ -70,6 +70,14 @@ describe('comparison lab wiring',()=>{
     cycle();act(()=>mocks.panel.recorder.stop());const stopped=mocks.panel.recorder.session;cycle();
     expect(stopped.frames).toHaveLength(1);expect(h.advance).toHaveBeenCalledTimes(before+2);
   });
+  it('P4 experimental Comparison opens live Start/Stop Analysis rather than legacy four-live recording',()=>{
+    const video={current:{videoWidth:1280,videoHeight:720}} as any;
+    act(()=>{renderer=create(React.createElement(IMUReconstructionView,{camera1Ref:video,camera2Ref:video,camera1Stream:null,camera2Stream:null,isBothCamerasActive:true,
+      comparison:{experimental:true,armCalibrated:true,getFusionSnapshot:()=>({pose:null,diagnostics:null,imuSamples:null}),getConfiguration:()=>({}),imuConnected:true,imuCalibrationStatus:'good'}}));});
+    expect(renderer!.root.findByProps({'aria-label':'P4 live experimental comparison'})).toBeDefined();
+    const buttons=renderer!.root.findAllByType('button').map(b=>b.children.join(''));
+    expect(buttons).toContain('Start Analysis');expect(buttons).toContain('Stop Analysis');expect(mocks.panel).toBeNull();
+  });
   it('the original IMU reconstruction lab retains its missing-pose early return',()=>{
     const video={current:{videoWidth:1280,videoHeight:720}} as any;const callback=vi.fn();
     act(()=>{renderer=create(React.createElement(IMUReconstructionView,{camera1Ref:video,camera2Ref:video,camera1Stream:null,camera2Stream:null,isBothCamerasActive:true,onCorrectedPose:callback}));});

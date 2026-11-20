@@ -1,0 +1,40 @@
+{
+  "schemaVersion": "1.0.0-evaluation-sidecar",
+  "sessionId": "70eb9f95-4f44-4106-8253-f11db4a0368e",
+  "sourceFingerprint": {
+    "algorithm": "fnv1a-32",
+    "value": "5e226aee",
+    "purpose": "Non-cryptographic source change detection; original recording is never rewritten."
+  },
+  "config": {
+    "schemaVersion": "1.0.0-evaluation-config",
+    "includeWarmup": false,
+    "includeUnclassified": true,
+    "maxObservationGapMs": 250,
+    "transitionWindowMs": 100,
+    "jumpDistanceMm": 100,
+    "jumpSpeedMmPerSecond": 3000,
+    "jumpDistanceNormalizedXY": 0.1,
+    "jumpSpeedNormalizedXYPerSecond": 2,
+    "lengthDeviationThresholdFraction": 0.25,
+    "annotations": [
+      {
+        "id": "visible",
+        "label": "Visible baseline (user-specified reference split)",
+        "coordinate": "frame_index",
+        "start": 62,
+        "end": 176,
+        "healthyVisibility": true
+      },
+      {
+        "id": "occluded",
+        "label": "Occlusion (user-specified reference split)",
+        "coordinate": "frame_index",
+        "start": 176,
+        "end": 354,
+        "healthyVisibility": false
+      }
+    ],
+    "controllerFilter": null
+  }
+}

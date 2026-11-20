@@ -1,3 +1,5 @@
+import {JointAnalysisPositionPlot} from './JointAnalysisPositionPlot';
+import {JointAnalysisSelector,JointAnalysisTabList} from './JointAnalysisControls';
 import { useState } from 'react';
 import { MotionRecording } from '../hooks/useMotionRecorder';
 import { PoseLandmarks } from '../hooks/useMediaPipePose';
@@ -83,55 +85,10 @@ export function MotionDataVisualizer({ recording, onClose }: MotionDataVisualize
             </Button>
           </div>
 
-          {/* Joint Selection */}
-          <div className="mb-6">
-            <h3 className="text-sm font-semibold text-gray-300 mb-2">Select Joint to Analyze</h3>
-            <div className="flex flex-wrap gap-2">
-              {joints.map((joint) => (
-                <Button
-                  key={joint}
-                  variant={selectedJoint === joint ? 'default' : 'outline'}
-                  size="sm"
-                  onClick={() => setSelectedJoint(joint)}
-                  className={
-                    selectedJoint === joint
-                      ? 'bg-blue-600 hover:bg-blue-700 text-white'
-                      : 'border-gray-600 text-gray-300 hover:bg-gray-700'
-                  }
-                >
-                  {joint}
-                </Button>
-              ))}
-            </div>
-          </div>
+          <JointAnalysisSelector joints={joints} selected={selectedJoint} onSelect={setSelectedJoint}/>
 
           <Tabs defaultValue="quality" className="w-full">
-            <TabsList className="bg-gray-700 mb-4 grid grid-cols-4 lg:grid-cols-8 gap-1">
-              <TabsTrigger value="quality" className="data-[state=active]:bg-gray-600 text-xs">
-                Quality
-              </TabsTrigger>
-              <TabsTrigger value="jitter" className="data-[state=active]:bg-gray-600 text-xs">
-                Jitter
-              </TabsTrigger>
-              <TabsTrigger value="occlusion" className="data-[state=active]:bg-gray-600 text-xs">
-                Occlusion
-              </TabsTrigger>
-              <TabsTrigger value="limbswap" className="data-[state=active]:bg-gray-600 text-xs">
-                Limb Swap
-              </TabsTrigger>
-              <TabsTrigger value="depth" className="data-[state=active]:bg-gray-600 text-xs">
-                Depth
-              </TabsTrigger>
-              <TabsTrigger value="position" className="data-[state=active]:bg-gray-600 text-xs">
-                Position
-              </TabsTrigger>
-              <TabsTrigger value="trajectory" className="data-[state=active]:bg-gray-600 text-xs">
-                Trajectory
-              </TabsTrigger>
-              <TabsTrigger value="raw" className="data-[state=active]:bg-gray-600 text-xs">
-                Raw Data
-              </TabsTrigger>
-            </TabsList>
+            <JointAnalysisTabList/>
 
             <TabsContent value="quality" className="space-y-6">
               {(() => {
@@ -623,61 +580,19 @@ export function MotionDataVisualizer({ recording, onClose }: MotionDataVisualize
               {/* X Coordinate Chart */}
               <div>
                 <h4 className="text-white font-semibold mb-2">X Coordinate (Horizontal)</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis
-                      dataKey="frameNumber"
-                      stroke="#9CA3AF"
-                      label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
-                    />
-                    <YAxis stroke="#9CA3AF" domain={[0, 1]} />
-                    <Tooltip
-                      contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }}
-                    />
-                    <Line type="monotone" isAnimationActive={false} dataKey="x" stroke="#3B82F6" strokeWidth={2} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
+                <JointAnalysisPositionPlot data={chartData} axis="x"/>
               </div>
 
               {/* Y Coordinate Chart */}
               <div>
                 <h4 className="text-white font-semibold mb-2">Y Coordinate (Vertical)</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis
-                      dataKey="frameNumber"
-                      stroke="#9CA3AF"
-                      label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
-                    />
-                    <YAxis stroke="#9CA3AF" domain={[0, 1]} />
-                    <Tooltip
-                      contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }}
-                    />
-                    <Line type="monotone" isAnimationActive={false} dataKey="y" stroke="#10B981" strokeWidth={2} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
+                <JointAnalysisPositionPlot data={chartData} axis="y"/>
               </div>
 
               {/* Z Coordinate Chart */}
               <div>
                 <h4 className="text-white font-semibold mb-2">Z Coordinate (Depth)</h4>
-                <ResponsiveContainer width="100%" height={200}>
-                  <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis
-                      dataKey="frameNumber"
-                      stroke="#9CA3AF"
-                      label={{ value: 'Frame', position: 'insideBottom', offset: -5, fill: '#9CA3AF' }}
-                    />
-                    <YAxis stroke="#9CA3AF" />
-                    <Tooltip
-                      contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', color: '#fff' }}
-                    />
-                    <Line type="monotone" isAnimationActive={false} dataKey="z" stroke="#F59E0B" strokeWidth={2} dot={false} />
-                  </LineChart>
-                </ResponsiveContainer>
+                <JointAnalysisPositionPlot data={chartData} axis="z"/>
               </div>
             </TabsContent>
 
