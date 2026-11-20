@@ -1,3 +1,4 @@
+import { StereoGeometryNotice } from './StereoGeometryNotice';
 import { useRef, useState, useEffect, useCallback, type RefObject } from 'react';
 import { Card } from './ui/card';
 import { Button } from './ui/button';
@@ -323,10 +324,10 @@ export function FailureCorrectionView({
     debugRecorderSummaryRef.current.onStereoFrameCalls += 1;
     if (!lm1 || !lm2 || !calibrationRef.current) return;
 
-    const w1 = camera1Ref.current?.videoWidth  ?? 1280;
-    const h1 = camera1Ref.current?.videoHeight ?? 720;
-    const w2 = camera2Ref.current?.videoWidth  ?? 1280;
-    const h2 = camera2Ref.current?.videoHeight ?? 720;
+    const w1 = camera1Ref.current?.videoWidth  ?? 0;
+    const h1 = camera1Ref.current?.videoHeight ?? 0;
+    const w2 = camera2Ref.current?.videoWidth  ?? 0;
+    const h2 = camera2Ref.current?.videoHeight ?? 0;
 
     // 1. Triangulate — exactly once per stereo frame.
     debugRecorderSummaryRef.current.triangulationCalls += 1;
@@ -363,10 +364,10 @@ export function FailureCorrectionView({
     onStereoFrameRef,
   );
 
-  const cam1W = camera1Ref.current?.videoWidth  ?? 1280;
-  const cam1H = camera1Ref.current?.videoHeight ?? 720;
-  const cam2W = camera2Ref.current?.videoWidth  ?? 1280;
-  const cam2H = camera2Ref.current?.videoHeight ?? 720;
+  const cam1W = camera1Ref.current?.videoWidth  ?? 0;
+  const cam1H = camera1Ref.current?.videoHeight ?? 0;
+  const cam2W = camera2Ref.current?.videoWidth  ?? 0;
+  const cam2H = camera2Ref.current?.videoHeight ?? 0;
 
   const handleStartRecording = useCallback(() => {
     debugRecorderSummaryRef.current = { onStereoFrameCalls: 0, triangulationCalls: 0, correctionCalls: 0 };
@@ -407,6 +408,7 @@ export function FailureCorrectionView({
 
   return (
     <div className="space-y-6">
+      <StereoGeometryNotice calibration={calibration} dimensions={[cam1W,cam1H,cam2W,cam2H]} />
 
       {/* ── Status bar ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-3 flex-wrap">

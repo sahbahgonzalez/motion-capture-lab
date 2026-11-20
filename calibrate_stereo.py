@@ -289,11 +289,15 @@ def run_calibration(pairs: list, inner_rows: int, inner_cols: int, square_size_m
     print(f"  Camera 2 resolution: {w2s}x{h2s}")
     if (w1s, h1s) != (w2s, h2s):
         print(f"  *** WARNING: cameras have different resolutions! ***")
-        print(f"  This will cause stereoRectify to produce wrong P matrices.")
-        print(f"  Set both cameras to the same resolution in Camera Setup.")
+        print(f"  Intrinsics and saved image dimensions are camera-specific.")
+        print(f"  Runtime normalized-ray triangulation supports this; the rectified diagnostic canvas uses Camera 1 size.")
 
     image_size1 = (w1s, h1s)
     image_size2 = (w2s, h2s)
+    if any(g1.shape[:2] != (h1s, w1s) or g2.shape[:2] != (h2s, w2s) for g1, g2 in pairs):
+        raise ValueError('Each camera must use one fixed calibration resolution across all pairs.')
+    if not np.isfinite(square_size_mm) or square_size_mm <= 0:
+        raise ValueError('Measured checkerboard square size in millimeters is required.')
 
     valid = 0
     for i, (g1, g2) in enumerate(pairs):
@@ -394,8 +398,13 @@ def run_calibration(pairs: list, inner_rows: int, inner_cols: int, square_size_m
     if valid > 0:
         c1_demo = img_points1_list[0].reshape(-1, 2).T.astype(np.float64)
         c2_demo = img_points2_list[0].reshape(-1, 2).T.astype(np.float64)
-        pts4d = cv2.triangulatePoints(P1, P2, c1_demo, c2_demo)
-        pts3d = (pts4d[:3] / pts4d[3]).T
+        # Rectified P matrices require matching undistorted, rectified pixels.
+        undistort_criteria = (cv2.TERM_CRITERIA_COUNT | cv2.TERM_CRITERIA_EPS, 50, 1e-12)
+        rect1 = cv2.undistortPointsIter(c1_demo.T.reshape(-1, 1, 2), K1, dist1, R1, P1, undistort_criteria).reshape(-1, 2).T
+        rect2 = cv2.undistortPointsIter(c2_demo.T.reshape(-1, 1, 2), K2, dist2, R2, P2, undistort_criteria).reshape(-1, 2).T
+        pts4d = cv2.triangulatePoints(P1, P2, rect1, rect2)
+        # Return demo coordinates to the original Camera A frame, like runtime.
+        pts3d = (R1.T @ (pts4d[:3] / pts4d[3])).T
         print(f"  Triangulated {len(pts3d)} checkerboard corners.")
         print(f"  Sample 3D points (first 3, in mm):")
         for pt in pts3d[:3]:
@@ -409,16 +418,26 @@ def run_calibration(pairs: list, inner_rows: int, inner_cols: int, square_size_m
         "camera1": {
             "K": K1.tolist(),
             "distortion": dist1.flatten().tolist(),
-            "imageWidth": w,
-            "imageHeight": h,
+            "imageWidth": image_size1[0],
+            "imageHeight": image_size1[1],
             "reprojectionError": float(err1),
+            "imageGeometry": {
+                "observationSpace": "raw_distorted",
+                "rawToCalibrationNormalized": [[-1, 0, (w1s - 1) / w1s], [0, 1, 0], [0, 0, 1]] if flip_cam1 else np.eye(3).tolist(),
+                "description": "Raw decoded frame to calibration image; horizontal flip recorded: " + str(flip_cam1),
+            },
         },
         "camera2": {
             "K": K2.tolist(),
             "distortion": dist2.flatten().tolist(),
-            "imageWidth": w,
-            "imageHeight": h,
+            "imageWidth": image_size2[0],
+            "imageHeight": image_size2[1],
             "reprojectionError": float(err2),
+            "imageGeometry": {
+                "observationSpace": "raw_distorted",
+                "rawToCalibrationNormalized": [[-1, 0, (w2s - 1) / w2s], [0, 1, 0], [0, 0, 1]] if flip_cam2 else np.eye(3).tolist(),
+                "description": "Raw decoded frame to calibration image; horizontal flip recorded: " + str(flip_cam2),
+            },
         },
         "extrinsic": {
             "R": R.tolist(),
@@ -428,6 +447,10 @@ def run_calibration(pairs: list, inner_rows: int, inner_cols: int, square_size_m
         },
         "P1": P1.tolist(),
         "P2": P2.tolist(),
+        "R1": R1.tolist(),
+        "R2": R2.tolist(),
+        "projectionSpace": "rectified",
+        "units": "mm",
         "stereoReprojectionError": float(stereo_err),
         "calibrationDate": datetime.utcnow().isoformat() + "Z",
         "checkerboardConfig": {

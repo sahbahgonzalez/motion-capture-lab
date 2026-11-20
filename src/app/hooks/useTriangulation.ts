@@ -1,4 +1,4 @@
-import { Matrix, SVD } from 'ml-matrix';
+import { prepareStereoGeometry, triangulateRawObservations, STEREO_GEOMETRY_METHOD, type GeometryJointResult } from '../utils/stereoGeometry';
 import { StereoCalibration } from '../type/calibration';
 import { PoseLandmarks } from './useMediaPipePose';
 
@@ -33,70 +33,50 @@ export const SKELETON_CONNECTIONS: Array<[keyof PoseLandmarks, keyof PoseLandmar
   ['rightHip', 'rightKnee'], ['rightKnee', 'rightAnkle'],
 ];
 
-/**
- * DLT triangulation via real SVD null-space extraction.
- *
- * Builds the 4×4 DLT matrix A from the two projection equations per camera:
- *   x1*(P1[2]·X) - P1[0]·X = 0
- *   y1*(P1[2]·X) - P1[1]·X = 0
- *   (same for camera 2)
- *
- * Then decomposes A with SVD (A = U · diag(S) · Vᵀ). The right singular
- * vector corresponding to the smallest singular value — the last column of V
- * since ml-matrix sorts S in descending order — is the least-squares solution
- * to the homogeneous system AX = 0. Dividing by the homogeneous coordinate W
- * yields the 3D Cartesian point.
- */
-function triangulatePoint(
-  p1: number[][], p2: number[][],
-  x1: number, y1: number,
-  x2: number, y2: number,
-): Point3D | null {
-  const A = new Matrix([
-    [x1*p1[2][0]-p1[0][0], x1*p1[2][1]-p1[0][1], x1*p1[2][2]-p1[0][2], x1*p1[2][3]-p1[0][3]],
-    [y1*p1[2][0]-p1[1][0], y1*p1[2][1]-p1[1][1], y1*p1[2][2]-p1[1][2], y1*p1[2][3]-p1[1][3]],
-    [x2*p2[2][0]-p2[0][0], x2*p2[2][1]-p2[0][1], x2*p2[2][2]-p2[0][2], x2*p2[2][3]-p2[0][3]],
-    [y2*p2[2][0]-p2[1][0], y2*p2[2][1]-p2[1][1], y2*p2[2][2]-p2[1][2], y2*p2[2][3]-p2[1][3]],
-  ]);
-
-  // SVD: A = U · diag(S) · Vᵀ, singular values sorted descending.
-  // rightSingularVectors is V; its last column is the null vector.
-  const svd = new SVD(A, { autoTranspose: true });
-  const col = svd.rightSingularVectors.getColumn(3); // [X, Y, Z, W]
-  const w = col[3];
-  if (Math.abs(w) < 1e-10) return null;
-
-  return { x: col[0] / w, y: col[1] / w, z: col[2] / w };
+export interface StereoGeometryDiagnostics {
+  method: typeof STEREO_GEOMETRY_METHOD;
+  status: 'ready' | 'invalid_calibration_or_capture';
+  calibrationError: string | null;
+  calibrationFitErrorPx: number | null;
+  warnings: string[];
+  validJointCount: number;
+  invalidJointCount: number;
+  degenerateJointCount: number;
+  joints: Partial<Record<keyof PoseLandmarks, GeometryJointResult>>;
 }
 
-/**
- * Triangulate all landmarks for a stereo frame.
- * Pure function — safe to call inside rAF/rVFC callbacks outside React.
- */
+/** Shared by every stereo lab and playback path. Observations must be raw,
+ * distorted image-normalized coordinates, never pre-rectified landmarks. */
 export function triangulateAllLandmarks(
   calibration: StereoCalibration,
   cam1Landmarks: PoseLandmarks,
   cam2Landmarks: PoseLandmarks,
   cam1Width: number, cam1Height: number,
   cam2Width: number, cam2Height: number,
+  options?: {onDiagnostics?: (diagnostics: StereoGeometryDiagnostics) => void},
 ): TriangulatedPose {
-  const empty = Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as TriangulatedPose;
-  const P1 = calibration.P1;
-  const P2 = calibration.P2;
-  if (!P1 || !P2) return empty;
-
-  const pose = { ...empty };
-  for (const key of LANDMARK_KEYS) {
-    const lm1 = cam1Landmarks[key];
-    const lm2 = cam2Landmarks[key];
-    if (!lm1 || !lm2) continue;
-    if ((lm1.visibility ?? 1) < 0.5 || (lm2.visibility ?? 1) < 0.5) continue;
-    pose[key] = triangulatePoint(
-      P1, P2,
-      lm1.x * cam1Width, lm1.y * cam1Height,
-      lm2.x * cam2Width, lm2.y * cam2Height,
-    );
+  const pose = Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as TriangulatedPose;
+  const diagnostics: StereoGeometryDiagnostics = {method: STEREO_GEOMETRY_METHOD, status:'ready',calibrationError:null,
+    calibrationFitErrorPx:Number.isFinite(calibration?.stereoReprojectionError) ? calibration.stereoReprojectionError : null,
+    warnings:[],validJointCount:0,invalidJointCount:0,degenerateJointCount:0,joints:{}};
+  let context: ReturnType<typeof prepareStereoGeometry>;
+  try {context=prepareStereoGeometry(calibration,[cam1Width,cam1Height,cam2Width,cam2Height]);diagnostics.warnings=context.warnings;}
+  catch(err) {
+    diagnostics.status='invalid_calibration_or_capture';diagnostics.calibrationError=String(err);
+    diagnostics.invalidJointCount=LANDMARK_KEYS.length;options?.onDiagnostics?.(diagnostics);return pose;
   }
+  for (const key of LANDMARK_KEYS) {
+    const a=cam1Landmarks?.[key],b=cam2Landmarks?.[key];
+    let result:GeometryJointResult;
+    const invalidVisibility = [a?.visibility,b?.visibility].some(v => v !== undefined && !Number.isFinite(v));
+    if (!a||!b||invalidVisibility||(a.visibility ?? 1)<0.5||(b.visibility ?? 1)<0.5) {
+      result={point:null,reason:!a||!b?'missing_landmark':invalidVisibility?'invalid_visibility':'low_visibility',rayAngleSin:null,reprojectionErrorCameraAPx:null,reprojectionErrorCameraBPx:null,normalizedEpipolarResidual:null,rectifiedEpipolarResidualPx:null,rectifiedEpipolarAxis:null};
+    } else result=triangulateRawObservations(context,a,b);
+    pose[key]=result.point;diagnostics.joints[key]=result;
+    if (result.point) diagnostics.validJointCount++;else diagnostics.invalidJointCount++;
+    if (result.reason?.startsWith('degenerate')) diagnostics.degenerateJointCount++;
+  }
+  options?.onDiagnostics?.(diagnostics);
   return pose;
 }
 

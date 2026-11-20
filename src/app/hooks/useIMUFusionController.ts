@@ -67,11 +67,6 @@ export interface FusionConfig {
    * (500ms) because stale orientation data causes visible drift during occlusion.
    */
   imuFreshnessMs: number;
-  /**
-   * Max allowed deviation of current stereo segment length from calibrated value
-   * (fraction, e.g. 0.25 = 25%). Catches MediaPipe grabbing the wrong joint.
-   */
-  segLengthTolerance: number;
   /** EMA factor for learning current segment lengths from reliable stereo. */
   visionLengthEmaAlpha: number;
 }
@@ -81,9 +76,25 @@ export const DEFAULT_FUSION_CONFIG: FusionConfig = {
   recoveryConfirmFrames: 5,
   blendFrames: 4,
   imuFreshnessMs: 150,
-  segLengthTolerance: 0.25,
   visionLengthEmaAlpha: 0.08,
 };
+
+export const FUSION_FAILURE_POLICY = {
+  id: 'stereo-reliability-no-length-v1',
+  priority: 'stereo_first',
+  segmentLengthDeviation: 'diagnostic_only',
+  stereoFailureTriggers: ['missing_joint', 'correction_status_unreliable', 'explicit_simulated_failure'],
+  lowVisibility: 'upstream visibility rejection produces missing/unreliable stereo joints',
+  kinematicLengths: 'Calibrated/learned reference lengths remain for IMU endpoint reconstruction and transition constraints only; no mismatch gate.',
+  calibrationSampling: 'Initial calibration range/stability checks remain; they do not classify runtime stereo or gate its recovery.',
+} as const;
+
+export interface SegmentLengthObservation {
+  observedStereoMm: number | null;
+  calibratedMm: number | null;
+  deviationMm: number | null;
+  deviationFraction: number | null;
+}
 
 export interface SimulatedFailures {
   shoulder: boolean;
@@ -116,6 +127,11 @@ export interface FusionDiagnostics {
   blendAlphaFA: number;
   uaReferenceLengthMm: number;
   faReferenceLengthMm: number;
+  segmentLengthDiagnostics: {
+    usage: 'diagnostic_only';
+    upperArm: SegmentLengthObservation;
+    forearm: SegmentLengthObservation;
+  };
   uaOutputLengthMm: number;
   faOutputLengthMm: number;
   fullyAvailable: boolean;
@@ -266,8 +282,17 @@ function constrainEndpoint(origin: Pt3, endpoint: Pt3 | null, length: number, fa
     : endpoint;
 }
 
-function updateReferenceLength(previous: number | null, measured: number, alpha: number): number {
-  if (!(measured > 0) || !Number.isFinite(measured)) return previous ?? 0;
+function observeSegmentLength(proximal: Pt3 | null, distal: Pt3 | null, calibratedLength: number): SegmentLengthObservation {
+  const observedStereoMm = proximal && distal && [proximal.x,proximal.y,proximal.z,distal.x,distal.y,distal.z].every(Number.isFinite)
+    ? dist3d(proximal, distal) : null;
+  const calibratedMm = Number.isFinite(calibratedLength) && calibratedLength > 0 ? calibratedLength : null;
+  return {observedStereoMm, calibratedMm,
+    deviationMm: observedStereoMm !== null && calibratedMm !== null ? observedStereoMm - calibratedMm : null,
+    deviationFraction: observedStereoMm !== null && calibratedMm !== null ? (observedStereoMm - calibratedMm) / calibratedMm : null};
+}
+
+function updateReferenceLength(previous: number | null, measured: number, alpha: number): number | null {
+  if (!(measured > 0) || !Number.isFinite(measured)) return previous;
   if (previous === null || !(previous > 0)) return measured;
   const a = Math.max(0, Math.min(1, alpha));
   return previous + a * (measured - previous);
@@ -287,15 +312,14 @@ function computeBlended(seg: SegState, liveTarget: Pt3 | null, blendFrames: numb
 
 /**
  * Evaluate whether a stereo segment is reliable enough for Pipeline 4 use.
- * Combines jitter status with anatomical segment length gate.
+ * Uses joint availability, correction reliability and explicit simulation only.
+ * Segment lengths are intentionally absent from this decision.
  */
 function evalStereoReliable(
   proxJoint: Pt3 | null,
   distJoint: Pt3 | null,
   proxStatus: JointFailureStatus | undefined,
   distStatus: JointFailureStatus | undefined,
-  calibLength: number,
-  tolerance: number,
   simProx: boolean,
   simDist: boolean,
 ): { reliable: boolean; reason: string | null } {
@@ -305,12 +329,6 @@ function evalStereoReliable(
   if (!distJoint) return { reliable: false, reason: 'Distal joint missing' };
   if (!proxStatus?.reliable) return { reliable: false, reason: `Proximal joint unreliable (${proxStatus?.failureType ?? 'no data'})` };
   if (!distStatus?.reliable) return { reliable: false, reason: `Distal joint unreliable (${distStatus?.failureType ?? 'no data'})` };
-  if (calibLength > 0) {
-    const len = dist3d(proxJoint, distJoint);
-    if (Math.abs(len - calibLength) / calibLength > tolerance) {
-      return { reliable: false, reason: `Segment length ${len.toFixed(0)}mm vs calib ${calibLength.toFixed(0)}mm (>${(tolerance * 100).toFixed(0)}% deviation)` };
-    }
-  }
   return { reliable: true, reason: null };
 }
 
@@ -564,7 +582,6 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
   const uaEval = evalStereoReliable(
     effStereoShoulder, effStereoElbow,
     byJoint['rightShoulder'], byJoint['rightElbow'],
-    calibUaLengthMm, cfg.segLengthTolerance,
     simulated.shoulder, simulated.elbow,
   );
 
@@ -579,7 +596,6 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
   const faVisionEval = evalStereoReliable(
     effStereoElbow, effStereoWrist,
     byJoint['rightElbow'], byJoint['rightWrist'],
-    calibFaLengthMm, cfg.segLengthTolerance,
     simulated.elbow, simulated.wrist,
   );
   if (faVisionEval.reliable && effStereoElbow && effStereoWrist) {
@@ -624,24 +640,11 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
 
   const imuFAAvailable = imuFABaseAvailable && finalElbow !== null;
 
-  const effectiveElbow = finalElbow;
-  let faEval: { reliable: boolean; reason: string | null };
-  if (!effectiveElbow) {
-    faEval = { reliable: false, reason: 'Elbow unavailable' };
-  } else if (!effStereoWrist) {
-    faEval = { reliable: false, reason: simulated.wrist ? 'Simulated wrist failure' : 'Wrist missing' };
-  } else if (!byJoint['rightWrist']?.reliable) {
-    faEval = { reliable: false, reason: `Wrist unreliable (${byJoint['rightWrist']?.failureType ?? 'no data'})` };
-  } else if (calibFaLengthMm > 0) {
-    const faLen = dist3d(effectiveElbow, effStereoWrist);
-    if (Math.abs(faLen - calibFaLengthMm) / calibFaLengthMm > cfg.segLengthTolerance) {
-      faEval = { reliable: false, reason: `FA length ${faLen.toFixed(0)}mm vs calib ${calibFaLengthMm.toFixed(0)}mm (>${(cfg.segLengthTolerance * 100).toFixed(0)}% deviation)` };
-    } else {
-      faEval = { reliable: true, reason: null };
-    }
-  } else {
-    faEval = { reliable: true, reason: null };
-  }
+  // Forearm reliability comes from its own visual elbow/wrist observations.
+  // A changed fused elbow or a length mismatch cannot reject a valid visual segment.
+  const faEval = finalElbow
+    ? faVisionEval
+    : { reliable: false, reason: 'Elbow unavailable' };
 
   let finalWrist = advanceSeg(
     s.fa, effStereoWrist, imuTargetWrist,
@@ -696,6 +699,11 @@ function _processFusionFrame(s: FusionState, input: FusionFrameInput): FusionFra
     blendAlphaFA:         faBlendAlpha,
     uaReferenceLengthMm:  uaReferenceLengthMm > 0 ? uaReferenceLengthMm : 0,
     faReferenceLengthMm:  faReferenceLengthMm > 0 ? faReferenceLengthMm : 0,
+    segmentLengthDiagnostics: {
+      usage: 'diagnostic_only',
+      upperArm: observeSegmentLength(stereoShoulder, stereoElbow, calibUaLengthMm),
+      forearm: observeSegmentLength(stereoElbow, stereoWrist, calibFaLengthMm),
+    },
     uaOutputLengthMm:     finalShoulder && finalElbow ? dist3d(finalShoulder, finalElbow) : 0,
     faOutputLengthMm:     finalElbow && finalWrist ? dist3d(finalElbow, finalWrist) : 0,
     fullyAvailable:       finalShoulder !== null && finalElbow !== null && finalWrist !== null,

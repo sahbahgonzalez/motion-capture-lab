@@ -25,6 +25,9 @@ export default function App() {
               <TabsTrigger value="imu" className="data-[state=active]:bg-blue-900">
                 3D + Failure Correction + IMU
               </TabsTrigger>
+              <TabsTrigger value="comparison" className="data-[state=active]:bg-green-900">
+                Live Pipeline Comparison
+              </TabsTrigger>
             </TabsList>
           </div>
 
@@ -42,6 +45,9 @@ export default function App() {
 
           <TabsContent value="imu" className="m-0">
             <IMULabView />
+          </TabsContent>
+          <TabsContent value="comparison" className="m-0">
+            <IMULabView comparisonMode />
           </TabsContent>
         </Tabs>
       </div>

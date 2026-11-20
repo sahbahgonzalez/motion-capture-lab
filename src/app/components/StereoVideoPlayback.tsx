@@ -211,10 +211,10 @@ export function StereoVideoPlayback({ calibration: calibrationProp }: StereoVide
   const { camera1Landmarks, camera2Landmarks, isLoaded: poseLoaded } =
     useDualMediaPipePose(video1El, video2El, bothLoaded && isPlaying);
 
-  const cam1W = video1El?.videoWidth  ?? 1280;
-  const cam1H = video1El?.videoHeight ?? 720;
-  const cam2W = video2El?.videoWidth  ?? 1280;
-  const cam2H = video2El?.videoHeight ?? 720;
+  const cam1W = video1El?.videoWidth  ?? 0;
+  const cam1H = video1El?.videoHeight ?? 0;
+  const cam2W = video2El?.videoWidth  ?? 0;
+  const cam2H = video2El?.videoHeight ?? 0;
 
   const { pose: pose3D } = useTriangulation(
     calibration, camera1Landmarks, camera2Landmarks,

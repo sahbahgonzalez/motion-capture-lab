@@ -10,6 +10,15 @@ export interface IntrinsicCalibration {
   imageHeight: number;
   // Reprojection error (lower is better)
   reprojectionError: number;
+  /** Maps decoded raw normalized coordinates into the calibration image domain.
+   * Optional only for legacy files whose orientation/crop provenance was not saved. */
+  imageGeometry?: {
+    observationSpace: 'raw_distorted';
+    rawToCalibrationNormalized: number[][];
+    /** Explicit assertion for a verified full-frame anisotropic resize, not a driver crop. */
+    fullFrameResizeVerified?: boolean;
+    description: string;
+  };
 }
 
 export interface ExtrinsicCalibration {
@@ -27,9 +36,13 @@ export interface StereoCalibration {
   camera1: IntrinsicCalibration;
   camera2: IntrinsicCalibration;
   extrinsic: ExtrinsicCalibration;
-  // Projection matrices for DLT triangulation
-  P1: number[][];
-  P2: number[][];
+  // Legacy rectified projection matrices: NOT compatible with raw image pixels.
+  P1?: number[][];
+  P2?: number[][];
+  R1?: number[][];
+  R2?: number[][];
+  projectionSpace?: 'rectified';
+  units?: 'mm';
   // Quality metrics
   stereoReprojectionError: number;
   calibrationDate: string;

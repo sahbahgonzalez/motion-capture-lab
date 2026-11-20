@@ -55,6 +55,7 @@ export const IMU_SEGMENT: Record<string, string> = {
 // ── Internal hot-path store ───────────────────────────────────────────────────
 
 interface IMURawData {
+  sourceMetadata: { sequence: number | null; timestampUs: number | null; accuracy: number | null; connectionId: string | null } | null;
   latest: IMUPacket | null;
   lastReceivedAt: number;
   timestamps: number[];
@@ -62,6 +63,7 @@ interface IMURawData {
 
 function makeRaw(): IMURawData {
   return {
+    sourceMetadata: null,
     latest: null,
     lastReceivedAt: 0,
     timestamps: [],
@@ -252,6 +254,11 @@ export function useIMUWebSocket(
       const packet = safeParsePacket(parsed);
       if (!packet || !Object.hasOwn(rawRef.current, packet.sensor_id)) return;
       const entry = rawRef.current[packet.sensor_id];
+      const fields = parsed as Record<string, unknown>;
+      const counter = (key: string) => typeof fields[key] === 'number' && Number.isSafeInteger(fields[key]) && (fields[key] as number) >= 0 ? fields[key] as number : null;
+      entry.sourceMetadata = {sequence: counter('sequence'), timestampUs: counter('timestamp_us'),
+        accuracy: typeof fields.accuracy === 'number' && Number.isFinite(fields.accuracy) ? fields.accuracy : null,
+        connectionId: connectionIdRef.current};
       entry.latest = packet;
       entry.lastReceivedAt = now;
       entry.timestamps.push(now);

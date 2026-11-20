@@ -306,10 +306,10 @@ export function FailureCorrectionPlayback({ calibration: calibrationProp }: Fail
     setCurrentTime(t);
   }, []);
 
-  const cam1W = video1El?.videoWidth  ?? 1280;
-  const cam1H = video1El?.videoHeight ?? 720;
-  const cam2W = video2El?.videoWidth  ?? 1280;
-  const cam2H = video2El?.videoHeight ?? 720;
+  const cam1W = video1El?.videoWidth  ?? 0;
+  const cam1H = video1El?.videoHeight ?? 0;
+  const cam2W = video2El?.videoWidth  ?? 0;
+  const cam2H = video2El?.videoHeight ?? 0;
 
   const [rawPose, setRawPose] = useState<TriangulatedPose>(
     () => Object.fromEntries(LANDMARK_KEYS.map(k => [k, null])) as TriangulatedPose

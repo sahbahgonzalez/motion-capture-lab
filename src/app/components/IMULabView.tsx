@@ -1,3 +1,5 @@
+import { FUSION_FAILURE_POLICY } from '../hooks/useIMUFusionController';
+import { STEREO_GEOMETRY_DESCRIPTION } from '../utils/stereoGeometry';
 /**
  * IMULabView — Phase C
  *
@@ -892,7 +894,7 @@ function DualArmValidationSVG({ stereo, validation, width, height }: {
 
 interface CalibConditionDebug {
   shoulderOk: boolean; elbowOk: boolean; wristOk: boolean;
-  tracked: number; segOk: boolean; uaLenMm: number; faLenMm: number;
+  tracked: number; segmentRangeDiagnosticOk: boolean; uaLenMm: number; faLenMm: number;
   armCalibOk: boolean;
   imu01Fresh: boolean; imu02Fresh: boolean; imu01AgeMs: number; imu02AgeMs: number;
 }
@@ -960,7 +962,7 @@ const POSE_META = [
   },
 ] as const;
 
-export function IMULabView() {
+export function IMULabView({ comparisonMode = false }: {comparisonMode?: boolean} = {}) {
   // ── Camera ──────────────────────────────────────────────────────────────────
   const {
     camera1Stream, camera2Stream, availableCameras,
@@ -975,7 +977,7 @@ export function IMULabView() {
   const { calibrationResult } = useCameraCalibration();
   const bothCamerasActive = isCamera1Active && isCamera2Active;
 
-  const [activeInnerTab, setActiveInnerTab] = useState('cameras');
+  const [activeInnerTab, setActiveInnerTab] = useState(comparisonMode ? 'reconstruction' : 'cameras');
   const [warmupSeconds,setWarmupSeconds] = useState(3);
   const runtimeReportRef = useRef<ReconstructionRuntimeReport | null>(null);
   const notifyMasterConfigurationRef = useRef<() => void>(() => {});
@@ -1020,15 +1022,15 @@ export function IMULabView() {
         values:{
           cameraA:snapshotValue(cameraSnapshot(camera1Stream),"runtime"),cameraB:snapshotValue(cameraSnapshot(camera2Stream),"runtime"),
           stereoCalibration:snapshotValue(stereo,"runtime"),imuCalibration:snapshotValue(imu,"runtime"),
-          rectificationMetadata:snapshotValue(stereo && ("R1" in stereo || "R2" in stereo) ? stereo : null,"runtime","Calibration does not expose R1/R2 or image-remap transforms; P1/P2 remain in the stereo snapshot."),
+          rectificationMetadata:snapshotValue(stereo && ("R1" in stereo || "R2" in stereo) ? stereo : null,"runtime","Legacy calibration does not expose rectification rotations. Runtime triangulation uses undistorted normalized rays and original R/T, not saved rectified P1/P2."),
           poseCorrection:snapshotValue(report?.correction,"runtime"),correctionDefaults:snapshotValue(report?.correctionDefaults,"configured_default"),
           mediaPipe:snapshotValue(report?.mediaPipe,"runtime"),fusion:snapshotValue(DEFAULT_FUSION_CONFIG,"runtime"),
-          fusionPolicy:snapshotValue({mode:"failure_triggered",scope:"right_arm",continuousImuArchiving:true},"implementation_constant"),
+          fusionPolicy:snapshotValue({mode:"failure_triggered",scope:"right_arm",continuousImuArchiving:true,...FUSION_FAILURE_POLICY},"implementation_constant"),
           simulatedFailures:snapshotValue(simulatedFailuresRef.current,"runtime"),
           sensorMapping:snapshotValue({imu_01:"right_upper_arm",imu_02:"right_forearm"},"implementation_constant"),
           coordinateConventions:snapshotValue({monocular:"MediaPipe image-normalized x/y and inferred relative z; not metric world coordinates",stereo:"OpenCV X right, Y down, Z depth; millimeters",imuQuaternion:"wxyz; sensor to IMU world",imuWorld:"BNO085 ENU/Z-up assumption",angles:"degrees"},"implementation_constant"),
-          stereoReconstruction:snapshotValue({implementation:"SVD DLT",visibilityThreshold:0.5,inputCoordinates:"raw image landmarks multiplied by current video size",undistortionOrRectificationAppliedAtRuntime:false},"implementation_constant"),
-          imuReconstruction:snapshotValue({method:"absolute forward kinematics",displayFreshnessMs:500,segmentMinMm:SEG_MIN_MM,segmentMaxMm:SEG_MAX_MM,calibrationFreshnessMs:150},"implementation_constant"),
+          stereoReconstruction:snapshotValue({...STEREO_GEOMETRY_DESCRIPTION,visibilityThreshold:0.5},"implementation_constant"),
+          imuReconstruction:snapshotValue({method:"absolute forward kinematics",displayFreshnessMs:500,initialCalibrationSamplingRangeMm:{min:SEG_MIN_MM,max:SEG_MAX_MM},runtimeSegmentLengthFailureGate:false,calibrationFreshnessMs:150},"implementation_constant"),
           warmup:snapshotValue({durationMs:warmupSeconds*1000,readinessBasis:"browser observations only"},"runtime"),
           application:snapshotValue({version:packageInfo.version,declaredMediaPipeVersion:packageInfo.dependencies["@mediapipe/tasks-vision"]},"declared_package"),
           compiledBuild:snapshotValue(import.meta.env.VITE_RUNTIME_BUILD_METADATA ?? null,"environment"),
@@ -1450,9 +1452,9 @@ export function IMULabView() {
       // into the window repeatedly on subsequent timer ticks before the
       // next stereo frame arrives.
       const isNewStabilityFrame = lastProcessedStereoTimestampRef.current !== lastStabilityProcessedTimestampRef.current;
-      // Require segOk so frames with out-of-range (stereo-unreliable) bone lengths
-      // cannot accumulate in the window and falsely claim stability with fewer than
-      // STABILITY_WINDOW truly valid, distinct frames.
+      // Initial calibration sampling only: exclude out-of-range bone lengths.
+      // This does not classify runtime stereo reliability or affect recovery.
+      // Only valid, distinct calibration samples enter the stability window.
       if (isNewStabilityFrame && jointsOk && segOk && shoulder && elbow && wrist) {
         stabilityWindowRef.current.push({ shoulder: {...shoulder}, elbow: {...elbow}, wrist: {...wrist} });
         if (stabilityWindowRef.current.length > STABILITY_WINDOW)
@@ -1556,7 +1558,7 @@ export function IMULabView() {
     const wristOk    = isValidVec(wrist);
     const uaLen      = (shoulderOk && elbowOk) ? dist3D(shoulder!, elbow!) : 0;
     const faLen      = (elbowOk && wristOk)    ? dist3D(elbow!,   wrist!)  : 0;
-    const segOk      = uaLen > SEG_MIN_MM && uaLen < SEG_MAX_MM && faLen > SEG_MIN_MM && faLen < SEG_MAX_MM;
+    const segmentRangeDiagnosticOk = uaLen > SEG_MIN_MM && uaLen < SEG_MAX_MM && faLen > SEG_MIN_MM && faLen < SEG_MAX_MM;
 
     // ── Jitter gate (two variants) ───────────────────────────────────────────
     const byJoint = Object.fromEntries(statuses.map(s => [s.joint, s]));
@@ -1567,12 +1569,8 @@ export function IMULabView() {
       joint => byJoint[joint]?.reliable && byJoint[joint]?.failureType !== 'heavy_jitter',
     );
 
-    // Calibrated segment-length gate (active only after calibration)
+    // Length measurements are observational in live processing, never reliability gates.
     const calibData = armCalibrationRef.current;
-    const segCalibOk = (calibData && calibData.quality !== 'failed' && calibData.uaLengthMm > 0 && calibData.faLengthMm > 0)
-      ? Math.abs(uaLen - calibData.uaLengthMm) / calibData.uaLengthMm <= 0.20 &&
-        Math.abs(faLen - calibData.faLengthMm) / calibData.faLengthMm <= 0.20
-      : true;
 
     // Position velocity gate — catches teleporting joints; 120mm/frame ≈ 3.6 m/s at 30fps
     const ref = lastReliableRef.current;
@@ -1582,10 +1580,8 @@ export function IMULabView() {
       : true;
 
     const armReliable = shoulderOk && elbowOk && wristOk && tracked >= 3 &&
-      segOk && rightArmClean && segCalibOk && posVelocityOk;
+      rightArmClean && posVelocityOk;
 
-    const calibArmOk = shoulderOk && elbowOk && wristOk && tracked >= 3 &&
-      segOk && rightArmCalibOk;
 
     // ── Update Last Reliable Vision (strict gate) ────────────────────────────
     if (armReliable && shoulder && elbow && wrist) {
@@ -1612,7 +1608,7 @@ export function IMULabView() {
       const imu02Age = imu02RawDbg ? imuNowMs - imu02RawDbg.lastReceivedAt : Infinity;
       calibCondDebugRef.current = {
         shoulderOk, elbowOk, wristOk, tracked,
-        segOk, uaLenMm: uaLen, faLenMm: faLen,
+        segmentRangeDiagnosticOk, uaLenMm: uaLen, faLenMm: faLen,
         armCalibOk: rightArmCalibOk,
         imu01Fresh: imu01Age <= 500, imu02Fresh: imu02Age <= 500,
         imu01AgeMs: isFinite(imu01Age) ? Math.round(imu01Age) : 9999,
@@ -1885,7 +1881,7 @@ export function IMULabView() {
       <div className="max-w-7xl mx-auto">
         <div className="mb-6">
           <div className="flex items-center gap-3 flex-wrap">
-            <h1 className="text-3xl font-bold">3D Failure Correction + IMU</h1>
+            <h1 className="text-3xl font-bold">{comparisonMode ? 'Live Pipeline Comparison' : '3D Failure Correction + IMU'}</h1>
             <Badge className={imuConnected ? 'bg-green-700' : 'bg-red-900 text-red-300'}>
               {imuConnected ? <><Wifi className="h-3 w-3 mr-1" />IMU Connected</> : <><WifiOff className="h-3 w-3 mr-1" />IMU Offline</>}
             </Badge>
@@ -2039,6 +2035,34 @@ export function IMULabView() {
             className={activeInnerTab === 'reconstruction' ? '' : 'hidden'}
           >
             <IMUReconstructionView
+              comparison={comparisonMode ? {
+                imuConnected, imuCalibrationStatus: armCalibration?.quality ?? 'not calibrated',
+                getFusionSnapshot: () => ({
+                  pose: fusedReconPoseRef.current, diagnostics: fusionDiagRef.current,
+                  imuSamples: {
+                    fusionProcessedPerformanceNowMs: lastProcessedStereoTimestampRef.current,
+                    samples: ['imu_01', 'imu_02'].map(sensorId => {
+                      const raw = getRawIMU(sensorId), packet = raw?.latest;
+                      return {sensorId, segment: sensorId === 'imu_01' ? 'right_upper_arm' : 'right_forearm',
+                        available: !!packet, receiptPerformanceNowMs: packet ? raw!.lastReceivedAt : null,
+                        source: raw?.sourceMetadata ?? null,
+                        quaternionWXYZ: packet ? [packet.qw,packet.qx,packet.qy,packet.qz] : null};
+                    }),
+                  },
+                }),
+                getConfiguration: () => ({
+                  pipelines: {P1:'Camera A image landmarks',P2:'raw stereo DLT',P3:'corrected stereo',P4:'conditional right-arm IMU substitution into P3'},
+                  cameraA: camera1Stream?.getVideoTracks()[0]?.getSettings() ?? null,
+                  cameraB: camera2Stream?.getVideoTracks()[0]?.getSettings() ?? null,
+                  imuCalibration: armCalibrationRef.current, fusionConfiguration: DEFAULT_FUSION_CONFIG, fusionFailurePolicy: FUSION_FAILURE_POLICY,
+                  simulatedFailures: simulatedFailuresRef.current,
+                  sensorMapping: {imu_01:'right_upper_arm',imu_02:'right_forearm'},
+                  coordinateSystems: {P1:'image-normalized x/y; inferred relative z; not metric',P2:'OpenCV calibration millimeters; X right, Y down, Z depth',P3:'same as P2',P4:'same as P2; quaternion wxyz'},
+                  clock: {origin:'performance.now() at Start Comparison',frameTime:'processing callback start minus origin, milliseconds',wallClock:'Date.now() separately; not used for frame intervals',cameraTime:'sampled HTMLVideoElement currentTime; independent origins',imuTime:'browser receipt performance.now(); ESP32 timestamp_us separate; no hardware synchronization'},
+                  liveReconstructionConstants: {imuDisplayFreshnessMs:500, fusionFreshnessMs:DEFAULT_FUSION_CONFIG.imuFreshnessMs,initialCalibrationSamplingRangeMm:{min:SEG_MIN_MM,max:SEG_MAX_MM},runtimeSegmentLengthFailureGate:false},
+                  configurationPolicy:'Initial runtime configuration plus changes observed at processing cycles. No recording-triggered state reset.',
+                }),
+              } : undefined}
               camera1Ref={camera1Ref}
               camera2Ref={camera2Ref}
               camera1Stream={camera1Stream}

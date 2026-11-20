@@ -18,6 +18,15 @@ const SUPPORTS_RVFC =
   typeof HTMLVideoElement !== 'undefined' &&
   'requestVideoFrameCallback' in HTMLVideoElement.prototype;
 
+export interface StereoCycleTiming {
+  processingStartedPerformanceNowMs: number;
+  inferenceCompletedPerformanceNowMs: number;
+  cameraA: { sampledPerformanceNowMs: number; mediaTimeSeconds: number | null };
+  cameraB: { sampledPerformanceNowMs: number; mediaTimeSeconds: number | null };
+  cameraAPresentation: { mediaTimeSeconds: number | null; presentedFrames: number | null; expectedDisplayPerformanceNowMs: number | null } | null;
+  inferenceErrors: string[];
+}
+
 export function useDualMediaPipePose(
   videoElement1: HTMLVideoElement | null,
   videoElement2: HTMLVideoElement | null,
@@ -26,7 +35,7 @@ export function useDualMediaPipePose(
   // video-frame callback, before any React state update, so it always runs
   // at most once per genuine new camera frame.
   onStereoFrame?: React.MutableRefObject<
-    ((lm1: PoseLandmarks | null, lm2: PoseLandmarks | null) => void) | null
+    ((lm1: PoseLandmarks | null, lm2: PoseLandmarks | null, timing: StereoCycleTiming) => void) | null
   >,
 ) {
   const runtimeOptionsRef = useRef<typeof DUAL_MEDIAPIPE_OPTIONS | null>(null);
@@ -128,11 +137,21 @@ export function useDualMediaPipePose(
   // Runs cam1 detect → cam2 detect in sequence, then fires onStereoFrame and
   // updates React display state. Called at most once per genuine new cam1 frame.
   const processStereoFrame = useCallback(
-    (timestamp: number) => {
+    (timestamp: number, presentation?: unknown) => {
       const v1 = videoEl1Ref.current;
       const v2 = videoEl2Ref.current;
       let lm1: PoseLandmarks | null = null;
       let lm2: PoseLandmarks | null = null;
+      const started = performance.now();
+      const meta = presentation as {mediaTime?: number; presentedFrames?: number; expectedDisplayTime?: number} | undefined;
+      const finiteOrNull = (v: unknown): number | null => typeof v === 'number' && Number.isFinite(v) ? v : null;
+      const timing: StereoCycleTiming = {
+        processingStartedPerformanceNowMs: started, inferenceCompletedPerformanceNowMs: started,
+        cameraA: {sampledPerformanceNowMs: started, mediaTimeSeconds: finiteOrNull(v1?.currentTime)},
+        cameraB: {sampledPerformanceNowMs: started, mediaTimeSeconds: null},
+        cameraAPresentation: meta ? {mediaTimeSeconds: finiteOrNull(meta.mediaTime), presentedFrames: finiteOrNull(meta.presentedFrames), expectedDisplayPerformanceNowMs: finiteOrNull(meta.expectedDisplayTime)} : null,
+        inferenceErrors: [],
+      };
 
       debugStatsRef.current.processStereoFrameCalls += 1;
       if (debugStatsRef.current.lastProcessedFrameAt > 0) {
@@ -144,6 +163,7 @@ export function useDualMediaPipePose(
       }
       debugStatsRef.current.lastProcessedFrameAt = timestamp;
 
+      try {
       if (v1 && poseLandmarker1Ref.current && v1.readyState >= 2) {
         const w = v1.videoWidth, h = v1.videoHeight;
         if (
@@ -164,6 +184,9 @@ export function useDualMediaPipePose(
         }
       }
 
+      } catch (err) { timing.inferenceErrors.push('camera_a: ' + String(err)); }
+      timing.cameraB = {sampledPerformanceNowMs: performance.now(), mediaTimeSeconds: finiteOrNull(v2?.currentTime)};
+      try {
       if (v2 && poseLandmarker2Ref.current && v2.readyState >= 2) {
         const w = v2.videoWidth, h = v2.videoHeight;
         if (
@@ -184,9 +207,11 @@ export function useDualMediaPipePose(
         }
       }
 
+      } catch (err) { timing.inferenceErrors.push('camera_b: ' + String(err)); }
+      timing.inferenceCompletedPerformanceNowMs = performance.now();
       // Per-frame callback runs synchronously here — before setState — so
       // triangulation and recording happen exactly once per stereo cycle.
-      onStereoFrame?.current?.(lm1, lm2);
+      onStereoFrame?.current?.(lm1, lm2, timing);
 
       // One batched React update per stereo frame for the 2D overlay display.
       setCamera1Landmarks(lm1);
@@ -257,7 +282,7 @@ export function useDualMediaPipePose(
             stats.lastLogAt = nowMs;
           }
 
-          processStereoFrame(now);
+          processStereoFrame(now, metadata);
           schedule();
         });
       } else {

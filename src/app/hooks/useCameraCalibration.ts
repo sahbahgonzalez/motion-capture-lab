@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react';
 import { StereoCalibration, CalibrationCapture, IntrinsicCalibration } from '../type/calibration';
+import { validateStereoCalibration } from '../utils/stereoGeometry';
 
 declare global {
   interface Window {
@@ -74,7 +75,11 @@ function loadFromStorage(): StereoCalibration | null {
     const raw = localStorage.getItem(CALIBRATION_STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw);
-    if (!parsed.camera1 || !parsed.camera2 || !parsed.P1 || !parsed.P2) return null;
+    const validation = validateStereoCalibration(parsed);
+    if (!validation.valid) {
+      console.warn('Stored stereo calibration is incompatible. Load a complete calibration or recalibrate.', validation.errors);
+      return null;
+    }
     return parsed as StereoCalibration;
   } catch {
     return null;
@@ -157,10 +162,18 @@ export function useCameraCalibration() {
         console.log(`✅ Using ${validCaptures.length} valid capture pairs`);
 
         const numCorners = (checkerboardRows - 1) * (checkerboardCols - 1);
+        if (validCaptures.some(c => c.camera1Image.corners!.length !== numCorners || c.camera2Image.corners!.length !== numCorners)) {
+          throw new Error('Calibration corner counts do not match the selected checkerboard. Redetect corners with the correct pattern.');
+        }
 
         // Determine image size from first valid capture
-        const imgW = validCaptures[0].camera1Image.imageWidth ?? 1280;
-        const imgH = validCaptures[0].camera1Image.imageHeight ?? 720;
+        const imgW = validCaptures[0].camera1Image.imageWidth;
+        const imgH = validCaptures[0].camera1Image.imageHeight;
+        if (!imgW || !imgH || !Number.isFinite(imgW) || !Number.isFinite(imgH)) throw new Error('Calibration capture dimensions are missing. Recapture at a known resolution.');
+        if (validCaptures.some(c => [c.camera1Image,c.camera2Image].some(image => image.imageWidth !== imgW || image.imageHeight !== imgH))) {
+          throw new Error('Browser calibration requires every image in both cameras to have the same known resolution. Recapture consistently; mixed resolutions cannot share one OpenCV imageSize.');
+        }
+        if (!Number.isFinite(squareSize) || squareSize <= 0) throw new Error('Measured checkerboard square size in millimeters is required.');
         const imageSize = new cv.Size(imgW, imgH);
         track(imageSize);
 
@@ -264,6 +277,7 @@ export function useCameraCalibration() {
             imageWidth: imgW,
             imageHeight: imgH,
             reprojectionError: err1,
+            imageGeometry: {observationSpace: 'raw_distorted', rawToCalibrationNormalized: [[1,0,0],[0,1,0],[0,0,1]], description: 'Browser raw decoded frame, CSS display mirroring excluded; unchanged optical crop/orientation required.'},
           },
           camera2: {
             K: matTo3x3(K2),
@@ -271,6 +285,7 @@ export function useCameraCalibration() {
             imageWidth: imgW,
             imageHeight: imgH,
             reprojectionError: err2,
+            imageGeometry: {observationSpace: 'raw_distorted', rawToCalibrationNormalized: [[1,0,0],[0,1,0],[0,0,1]], description: 'Browser raw decoded frame, CSS display mirroring excluded; unchanged optical crop/orientation required.'},
           },
           extrinsic: {
             R: matTo3x3(R),
@@ -280,6 +295,10 @@ export function useCameraCalibration() {
           },
           P1: matTo3x4(P1),
           P2: matTo3x4(P2),
+          R1: matTo3x3(R1),
+          R2: matTo3x3(R2),
+          projectionSpace: 'rectified',
+          units: 'mm',
           stereoReprojectionError: stereoErr,
           calibrationDate: new Date().toISOString(),
           checkerboardConfig: {
@@ -288,6 +307,8 @@ export function useCameraCalibration() {
             squareSize,
           },
         };
+        const validation = validateStereoCalibration(result);
+        if (!validation.valid) throw new Error('Calibration produced invalid optical parameters: ' + validation.errors.join(' '));
 
         console.log('✅ Stereo calibration complete!');
         console.log(`  Camera 1 reprojection error: ${result.camera1.reprojectionError.toFixed(4)} px`);
@@ -347,12 +368,8 @@ export function useCameraCalibration() {
       if (!parsed.camera1 || !parsed.camera2 || parsed.stereoReprojectionError == null) {
         throw new Error('Invalid calibration file — missing required fields (camera1, camera2, stereoReprojectionError).');
       }
-      if (!parsed.P1 || !parsed.P2) {
-        throw new Error(
-          'Invalid calibration file — missing P1/P2 projection matrices.\n' +
-          'Make sure you used the Python calibration script that outputs stereo_calibration.json with P1 and P2 fields.'
-        );
-      }
+      const validation = validateStereoCalibration(parsed);
+      if (!validation.valid) throw new Error('Incompatible stereo calibration: ' + validation.errors.join(' ') + ' Load a complete calibration or recalibrate.');
 
       const calibration: StereoCalibration = parsed;
       setCalibrationResult(calibration);

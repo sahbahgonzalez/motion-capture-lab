@@ -1,3 +1,12 @@
+import { SkeletonView, LANDMARK_COLORS, projectPose, computeBounds } from './PoseSkeletonView';
+import { LivePipelineComparison } from './LivePipelineComparison';
+import { useComparisonRecording } from '../hooks/useComparisonRecording';
+import { COMPARISON_LIMITATIONS, processComparisonCycle } from '../utils/pipelineComparison';
+import type { ComparisonFusionSnapshot } from '../type/pipelineComparison';
+import type { StereoCycleTiming } from '../hooks/useDualMediaPipePose';
+import type { StereoGeometryDiagnostics } from '../hooks/useTriangulation';
+import { StereoGeometryNotice } from './StereoGeometryNotice';
+import { STEREO_GEOMETRY_DESCRIPTION } from '../utils/stereoGeometry';
 /**
  * IMUReconstructionView
  *
@@ -42,6 +51,12 @@ import {
 } from '../hooks/useIMUFusionController';
 
 interface IMUReconstructionViewProps {
+  comparison?: {
+    getFusionSnapshot: () => ComparisonFusionSnapshot;
+    getConfiguration: () => unknown;
+    imuConnected: boolean;
+    imuCalibrationStatus: string;
+  };
   onRuntimeConfiguration?: (report: ReconstructionRuntimeReport) => void;
   camera1Ref: RefObject<HTMLVideoElement | null>;
   camera2Ref: RefObject<HTMLVideoElement | null>;
@@ -66,84 +81,6 @@ interface IMUReconstructionViewProps {
   /** Simulation override state — lets the user inject fake failures for testing. */
   simulatedFailures?: SimulatedFailures;
   onSimulatedFailuresChange?: (f: SimulatedFailures) => void;
-}
-
-const LANDMARK_COLORS: Record<keyof PoseLandmarks, string> = {
-  nose: '#a78bfa',
-  leftShoulder: '#34d399', rightShoulder: '#34d399',
-  leftElbow: '#60a5fa', rightElbow: '#60a5fa',
-  leftWrist: '#f87171', rightWrist: '#f87171',
-  leftHip: '#fbbf24', rightHip: '#fbbf24',
-  leftKnee: '#fb923c', rightKnee: '#fb923c',
-  leftAnkle: '#e879f9', rightAnkle: '#e879f9',
-};
-
-interface Bounds { minX: number; minY: number; rangeX: number; rangeY: number; }
-
-function projectPose(pose3D: TriangulatedPose, view: 'front' | 'side' | 'top') {
-  return LANDMARK_KEYS
-    .map(k => {
-      const pt = pose3D[k];
-      if (!pt) return null;
-      const px = view === 'side' ? pt.z : pt.x;
-      const py = view === 'top'  ? pt.z : -pt.y;
-      return { key: k, px, py };
-    })
-    .filter(Boolean) as { key: keyof PoseLandmarks; px: number; py: number }[];
-}
-
-function computeBounds(points: { px: number; py: number }[]): Bounds | null {
-  if (points.length === 0) return null;
-  const xs = points.map(p => p.px), ys = points.map(p => p.py);
-  return {
-    minX: Math.min(...xs), minY: Math.min(...ys),
-    rangeX: Math.max(...xs) - Math.min(...xs) || 1,
-    rangeY: Math.max(...ys) - Math.min(...ys) || 1,
-  };
-}
-
-function SkeletonView({
-  pose3D, view, width, height, label, labelColor = '#6b7280', sharedBounds,
-}: {
-  pose3D: TriangulatedPose; view: 'front' | 'side' | 'top';
-  width: number; height: number; label?: string; labelColor?: string;
-  sharedBounds?: Bounds | null;
-}) {
-  const PAD = 24;
-  const projected = projectPose(pose3D, view);
-  if (projected.length === 0) {
-    return (
-      <svg width={width} height={height}>
-        {label && <text x={8} y={18} fill={labelColor} fontSize="11" fontWeight="600">{label}</text>}
-        <text x={width/2} y={height/2} textAnchor="middle" fill="#4b5563" fontSize="13">No joints detected</text>
-      </svg>
-    );
-  }
-  const bounds = sharedBounds ?? computeBounds(projected)!;
-  const { minX, minY, rangeX, rangeY } = bounds;
-  const scale = Math.min((width - PAD * 2) / rangeX, (height - PAD * 2) / rangeY);
-  const toSVG = (px: number, py: number) => ({
-    x: PAD + (px - minX) * scale + ((width  - PAD * 2) - rangeX * scale) / 2,
-    y: PAD + (py - minY) * scale + ((height - PAD * 2) - rangeY * scale) / 2,
-  });
-  const ptMap = Object.fromEntries(projected.map(p => [p.key, p]));
-  return (
-    <svg width={width} height={height} style={{ overflow: 'visible' }}>
-      {label && <text x={8} y={18} fill={labelColor} fontSize="11" fontWeight="600">{label}</text>}
-      {SKELETON_CONNECTIONS.map(([a, b]) => {
-        const pa = ptMap[a], pb = ptMap[b];
-        if (!pa || !pb) return null;
-        const A = toSVG(pa.px, pa.py), B = toSVG(pb.px, pb.py);
-        return <line key={`${a}-${b}`} x1={A.x} y1={A.y} x2={B.x} y2={B.y}
-          stroke="rgba(255,255,255,0.5)" strokeWidth="4" strokeLinecap="round" />;
-      })}
-      {projected.map(({ key, px, py }) => {
-        const { x, y } = toSVG(px, py);
-        return <circle key={key} cx={x} cy={y} r={5}
-          fill={LANDMARK_COLORS[key]} stroke="rgba(0,0,0,0.6)" strokeWidth="1.5" />;
-      })}
-    </svg>
-  );
 }
 
 const FAILURE_LABEL: Record<string, string> = {
@@ -271,8 +208,9 @@ function FusionDiagPanel({ diag }: { diag: FusionDiagnostics }) {
           <div className="text-xs text-orange-300 mb-2 leading-tight">{diag.uaFailureReason}</div>
         )}
         {row('Blend α', `${(diag.blendAlphaUA * 100).toFixed(0)}%`)}
-        {row('Length', `${diag.uaOutputLengthMm.toFixed(1)} / ${diag.uaReferenceLengthMm.toFixed(1)} mm`,
-          Math.abs(diag.uaOutputLengthMm - diag.uaReferenceLengthMm) < 1 ? 'text-green-400' : 'text-yellow-400')}
+        {row('Output / FK length', `${diag.uaOutputLengthMm.toFixed(1)} / ${diag.uaReferenceLengthMm.toFixed(1)} mm`)}
+        {row('Stereo length (diag)', diag.segmentLengthDiagnostics?.upperArm.observedStereoMm?.toFixed(1) ?? 'unavailable')}
+        {row('Deviation (diag only)', diag.segmentLengthDiagnostics?.upperArm.deviationFraction != null ? `${(diag.segmentLengthDiagnostics.upperArm.deviationFraction * 100).toFixed(1)}%` : 'unavailable')}
         {diag.uaState === 'IMU_CORRECTION' && row('Active', `${diag.uaCorrectionActiveMs}ms`, 'text-orange-400')}
         {diag.uaState === 'RECOVERY' && diag.uaRecoveryPhase === 'confirming' && row('Confirming', `${diag.uaRecoveryFrame} / frames`, 'text-yellow-400')}
         {diag.uaState === 'RECOVERY' && diag.uaRecoveryPhase === 'blending' && row('Blending →', `${(diag.blendAlphaUA * 100).toFixed(0)}%`, 'text-cyan-400')}
@@ -289,8 +227,9 @@ function FusionDiagPanel({ diag }: { diag: FusionDiagnostics }) {
           <div className="text-xs text-orange-300 mb-2 leading-tight">{diag.faFailureReason}</div>
         )}
         {row('Blend α', `${(diag.blendAlphaFA * 100).toFixed(0)}%`)}
-        {row('Length', `${diag.faOutputLengthMm.toFixed(1)} / ${diag.faReferenceLengthMm.toFixed(1)} mm`,
-          Math.abs(diag.faOutputLengthMm - diag.faReferenceLengthMm) < 1 ? 'text-green-400' : 'text-yellow-400')}
+        {row('Output / FK length', `${diag.faOutputLengthMm.toFixed(1)} / ${diag.faReferenceLengthMm.toFixed(1)} mm`)}
+        {row('Stereo length (diag)', diag.segmentLengthDiagnostics?.forearm.observedStereoMm?.toFixed(1) ?? 'unavailable')}
+        {row('Deviation (diag only)', diag.segmentLengthDiagnostics?.forearm.deviationFraction != null ? `${(diag.segmentLengthDiagnostics.forearm.deviationFraction * 100).toFixed(1)}%` : 'unavailable')}
         {diag.faState === 'IMU_CORRECTION' && row('Active', `${diag.faCorrectionActiveMs}ms`, 'text-orange-400')}
         {diag.faState === 'RECOVERY' && diag.faRecoveryPhase === 'confirming' && row('Confirming', `${diag.faRecoveryFrame} / frames`, 'text-yellow-400')}
         {diag.faState === 'RECOVERY' && diag.faRecoveryPhase === 'blending' && row('Blending →', `${(diag.blendAlphaFA * 100).toFixed(0)}%`, 'text-cyan-400')}
@@ -359,7 +298,7 @@ function SimulationPanel({
 }
 
 export function IMUReconstructionView({
-  camera1Ref, camera2Ref, camera1Stream, camera2Stream,
+  comparison, camera1Ref, camera2Ref, camera1Stream, camera2Stream,
   isBothCamerasActive, preloadedCalibration, onCorrectedPose, onRuntimeConfiguration,
   imuReconstructionPose = null,
   fusedReconstructionPose = null,
@@ -367,6 +306,8 @@ export function IMUReconstructionView({
   simulatedFailures = NO_SIMULATED_FAILURES,
   onSimulatedFailuresChange,
 }: IMUReconstructionViewProps) {
+  const comparisonRecorder = useComparisonRecording();
+  const comparisonCycleId = useRef(0);
   const { loadCalibration, calibrationResult } = useCameraCalibration();
   const calibFileRef = useRef<HTMLInputElement>(null);
   const [loadError, setLoadError]   = useState<string | null>(null);
@@ -413,17 +354,37 @@ export function IMUReconstructionView({
   useEffect(() => { correctRef.current         = correct;           }, [correct]);
   useEffect(() => { onCorrectedPoseRef.current = onCorrectedPose;   }, [onCorrectedPose]);
 
+  const getComparisonConfiguration = () => ({
+    ...comparison?.getConfiguration() as object,
+    stereoCalibration: calibration, correction: config,
+    mediaPipe: {loaded: poseLoaded, running: poseRunning, error: poseError, configuration: runtimeConfiguration},
+    limitations: COMPARISON_LIMITATIONS,
+    stereoGeometry: STEREO_GEOMETRY_DESCRIPTION,
+  });
   const lastStatusUpdateRef = useRef(0);
 
-  const onStereoFrameRef = useRef<((lm1: PoseLandmarks | null, lm2: PoseLandmarks | null) => void) | null>(null);
-  onStereoFrameRef.current = (lm1, lm2) => {
+  const onStereoFrameRef = useRef<((lm1: PoseLandmarks | null, lm2: PoseLandmarks | null, timing: StereoCycleTiming) => void) | null>(null);
+  onStereoFrameRef.current = (lm1, lm2, timing) => {
     debugSummaryRef.current.onStereoFrameCalls += 1;
+    if (comparison) {
+      let geometry: StereoGeometryDiagnostics | null = null;
+      const frame = processComparisonCycle({cycleId: comparisonCycleId.current++, timing, cameraA: lm1, cameraB: lm2, calibrationAvailable: !!calibrationRef.current}, {
+        triangulate: () => triangulateAllLandmarks(calibrationRef.current!, lm1!, lm2!, camera1Ref.current?.videoWidth ?? 0, camera1Ref.current?.videoHeight ?? 0, camera2Ref.current?.videoWidth ?? 0, camera2Ref.current?.videoHeight ?? 0, {onDiagnostics: d => {geometry=d;}}),
+        readGeometry: () => geometry,
+        correct: correctRef.current,
+        advanceLiveFusion: (pose, tracked, statuses) => onCorrectedPoseRef.current?.(pose, tracked, statuses),
+        readFusion: comparison.getFusionSnapshot,
+        now: () => performance.now(),
+      });
+      comparisonRecorder.accept(frame, getComparisonConfiguration());
+      return;
+    }
     if (!lm1 || !lm2 || !calibrationRef.current) return;
 
-    const w1 = camera1Ref.current?.videoWidth  ?? 1280;
-    const h1 = camera1Ref.current?.videoHeight ?? 720;
-    const w2 = camera2Ref.current?.videoWidth  ?? 1280;
-    const h2 = camera2Ref.current?.videoHeight ?? 720;
+    const w1 = camera1Ref.current?.videoWidth  ?? 0;
+    const h1 = camera1Ref.current?.videoHeight ?? 0;
+    const w2 = camera2Ref.current?.videoWidth  ?? 0;
+    const h2 = camera2Ref.current?.videoHeight ?? 0;
 
     debugSummaryRef.current.triangulationCalls += 1;
     const raw = triangulateAllLandmarks(calibrationRef.current, lm1, lm2, w1, h1, w2, h2);
@@ -456,10 +417,10 @@ export function IMUReconstructionView({
       mediaPipe:{loaded:poseLoaded,running:poseRunning,error:poseError,...runtimeConfiguration}});
   }, [calibration,configOverrides,poseLoaded,poseRunning,poseError,onRuntimeConfiguration]);
 
-  const cam1W = camera1Ref.current?.videoWidth  ?? 1280;
-  const cam1H = camera1Ref.current?.videoHeight ?? 720;
-  const cam2W = camera2Ref.current?.videoWidth  ?? 1280;
-  const cam2H = camera2Ref.current?.videoHeight ?? 720;
+  const cam1W = camera1Ref.current?.videoWidth  ?? 0;
+  const cam1H = camera1Ref.current?.videoHeight ?? 0;
+  const cam2W = camera2Ref.current?.videoWidth  ?? 0;
+  const cam2H = camera2Ref.current?.videoHeight ?? 0;
 
   const handleStartRecording = useCallback(() => {
     debugSummaryRef.current = { onStereoFrameCalls: 0, triangulationCalls: 0, correctionCalls: 0 };
@@ -495,8 +456,24 @@ export function IMUReconstructionView({
   const trackedCorrected = LANDMARK_KEYS.filter(k => correctedPose[k] !== null).length;
   const jitterCount      = jointStatuses.filter(s => s.failureType !== 'none' && s.reliable).length;
 
+  if (comparison) return <div className="space-y-4">
+    <StereoGeometryNotice calibration={calibration} dimensions={[cam1W,cam1H,cam2W,cam2H]} />
+    <div className="flex flex-wrap items-center gap-3">
+      <Button variant="outline" onClick={() => calibFileRef.current?.click()}>Load Stereo Calibration</Button>
+      <input ref={calibFileRef} type="file" accept=".json" onChange={handleLoadCalibration} className="hidden" />
+      <span>{calibration ? 'Stereo calibration loaded' : 'No stereo calibration - P2/P3 unavailable'}</span>
+    </div>
+    {loadError && <p role="alert">{loadError}</p>}
+    <p className="text-xs text-gray-400">Camera Setup and Calibration use the existing controls. Open IMU Monitor for the existing right-arm calibration workflow.</p>
+    <LivePipelineComparison recorder={comparisonRecorder} getConfiguration={getComparisonConfiguration} camerasActive={isBothCamerasActive}
+      processing={poseRunning} error={poseError} imuConnected={comparison.imuConnected} imuCalibrationStatus={comparison.imuCalibrationStatus} />
+    <details><summary>P3 correction configuration</summary><ConfigPanel config={config} onChange={handleConfigChange} /></details>
+  </div>;
+
+
   return (
     <div className="space-y-6">
+      <StereoGeometryNotice calibration={calibration} dimensions={[cam1W,cam1H,cam2W,cam2H]} />
       {/* ── Status bar ─────────────────────────────────────────────── */}
       <div className="flex items-center gap-3 flex-wrap">
         <Badge className={poseLoaded ? 'bg-green-700' : 'bg-yellow-700'}>
